@@ -1,0 +1,19 @@
+[package]
+name = "kore-python"
+description = "PyO3 Python bindings for Kore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "kore"
+crate-type = ["cdylib"]
+
+[dependencies]
+kore-core.workspace = true
+kore-autograd.workspace = true
+kore-nn.workspace = true
+kore-optim.workspace = true
+pyo3.workspace = true
+numpy.workspace = true

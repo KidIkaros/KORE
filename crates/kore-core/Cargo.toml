@@ -1,0 +1,18 @@
+[package]
+name = "kore-core"
+description = "Core tensor engine for Kore ML framework"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+num-traits.workspace = true
+half.workspace = true
+smallvec.workspace = true
+bytemuck.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1.4"

@@ -1,0 +1,19 @@
+[package]
+name = "kore-serve"
+description = "Inference server for Kore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kore-core.workspace = true
+kore-nn.workspace = true
+kore-attention.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

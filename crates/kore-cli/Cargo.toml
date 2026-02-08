@@ -1,0 +1,19 @@
+[package]
+name = "kore-cli"
+description = "Command-line interface for Kore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kore"
+path = "src/main.rs"
+
+[dependencies]
+kore-core.workspace = true
+kore-nn.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "kore-autograd"
+description = "Automatic differentiation engine for Kore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kore-core.workspace = true
+parking_lot.workspace = true
+thiserror.workspace = true
+smallvec.workspace = true
+
+[dev-dependencies]
+proptest = "1.4"

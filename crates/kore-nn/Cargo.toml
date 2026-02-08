@@ -1,0 +1,12 @@
+[package]
+name = "kore-nn"
+description = "Neural network layers and modules for Kore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kore-core.workspace = true
+kore-autograd.workspace = true
+thiserror.workspace = true

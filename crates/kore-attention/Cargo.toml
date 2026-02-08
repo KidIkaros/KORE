@@ -1,0 +1,12 @@
+[package]
+name = "kore-attention"
+description = "Attention mechanisms and inference for Kore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kore-core.workspace = true
+kore-kernels.workspace = true
+thiserror.workspace = true

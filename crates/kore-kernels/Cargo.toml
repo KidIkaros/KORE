@@ -1,0 +1,20 @@
+[package]
+name = "kore-kernels"
+description = "CUDA and CPU SIMD kernels for Kore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kore-core.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies.cudarc]
+version = "0.12"
+optional = true
