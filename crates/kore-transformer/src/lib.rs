@@ -14,6 +14,7 @@ pub mod mha;
 pub mod feed_forward;
 pub mod block;
 pub mod model;
+pub mod loader;
 
 pub use embedding::Embedding;
 pub use rms_norm::RMSNorm;

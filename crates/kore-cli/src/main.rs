@@ -20,6 +20,24 @@ enum Commands {
         #[arg(long, default_value = "64,128,256,512,1024")]
         sizes: String,
     },
+    /// Start the inference server
+    Serve {
+        /// Address to bind to
+        #[arg(long, default_value = "0.0.0.0:8080")]
+        addr: String,
+        /// Path to model directory (with config.json + .safetensors)
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Generate text with a tiny random model (demo)
+    Generate {
+        /// Prompt text
+        #[arg(long, default_value = "Hello world")]
+        prompt: String,
+        /// Number of tokens to generate
+        #[arg(long, default_value = "32")]
+        max_tokens: usize,
+    },
 }
 
 fn main() {
@@ -28,6 +46,8 @@ fn main() {
     match cli.command {
         Commands::Info => cmd_info(),
         Commands::Bench { sizes } => cmd_bench(&sizes),
+        Commands::Serve { addr, model } => cmd_serve(&addr, model.as_deref()),
+        Commands::Generate { prompt, max_tokens } => cmd_generate(&prompt, max_tokens),
     }
 }
 
@@ -135,4 +155,77 @@ fn time_it(iters: usize, mut f: impl FnMut()) -> f64 {
         f();
     }
     start.elapsed().as_secs_f64() / iters as f64
+}
+
+fn cmd_serve(addr: &str, model_path: Option<&str>) {
+    tracing_subscriber::fmt::init();
+
+    let state = if let Some(path) = model_path {
+        let model_dir = std::path::Path::new(path);
+        println!("Loading model from {}...", path);
+        match kore_transformer::loader::load_model(model_dir) {
+            Ok(model) => {
+                println!("Model loaded: {} params", model.param_count());
+                kore_serve::state::AppState::with_model(model, path.to_string())
+            }
+            Err(e) => {
+                eprintln!("Failed to load model: {}. Starting in placeholder mode.", e);
+                kore_serve::state::AppState::empty()
+            }
+        }
+    } else {
+        println!("No --model specified. Starting with random tiny model for demo.");
+        let config = kore_transformer::TransformerConfig::tiny();
+        let model = kore_transformer::Transformer::new(config);
+        println!("Tiny model: {} params", model.param_count());
+        kore_serve::state::AppState::with_model(model, "kore-tiny-random".to_string())
+    };
+
+    println!("Starting Kore inference server on {}", addr);
+    println!("  POST /v1/completions");
+    println!("  POST /v1/chat/completions");
+    println!("  GET  /health");
+
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    rt.block_on(async {
+        if let Err(e) = kore_serve::server::serve_with_state(addr, state).await {
+            eprintln!("Server error: {}", e);
+        }
+    });
+}
+
+fn cmd_generate(prompt: &str, max_tokens: usize) {
+    let config = kore_transformer::TransformerConfig::tiny();
+    let mut model = kore_transformer::Transformer::new(config.clone());
+
+    println!("=== Kore Generate (tiny random model) ===");
+    println!("Config: vocab={}, d_model={}, n_heads={}, n_layers={}, params={}",
+        config.vocab_size, config.d_model, config.n_heads, config.n_layers, model.param_count());
+    println!("Prompt: {:?}", prompt);
+    println!();
+
+    // Byte-level tokenization
+    let prompt_ids: Vec<usize> = prompt.bytes().map(|b| b as usize).collect();
+
+    let start = Instant::now();
+    match model.generate(&prompt_ids, max_tokens) {
+        Ok(full_seq) => {
+            let elapsed = start.elapsed();
+            let generated = &full_seq[prompt_ids.len()..];
+            let text: String = generated.iter()
+                .map(|&id| if id < 128 { id as u8 as char } else { '?' })
+                .collect();
+
+            println!("Generated {} tokens in {:.1}ms ({:.1} tok/s)",
+                generated.len(),
+                elapsed.as_secs_f64() * 1000.0,
+                generated.len() as f64 / elapsed.as_secs_f64(),
+            );
+            println!("Output: {:?}", text);
+            println!("Token IDs: {:?}", &generated[..generated.len().min(20)]);
+        }
+        Err(e) => {
+            eprintln!("Generation error: {}", e);
+        }
+    }
 }

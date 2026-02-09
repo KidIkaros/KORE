@@ -71,6 +71,7 @@ kore-kernels = { path = "crates/kore-kernels" }
 kore-clifford = { path = "crates/kore-clifford" }
 kore-attention = { path = "crates/kore-attention" }
 kore-transformer = { path = "crates/kore-transformer" }
+kore-serve = { path = "crates/kore-serve" }
 
 [profile.release]
 opt-level = 3

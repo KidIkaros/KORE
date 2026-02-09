@@ -1,7 +1,10 @@
 //! OpenAI-compatible API types and handlers.
 
+use axum::extract::State;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+
+use crate::state::AppState;
 
 // ============================================================================
 // Request types
@@ -86,7 +89,7 @@ pub struct Usage {
 }
 
 // ============================================================================
-// Handlers (placeholder — real inference requires model loading)
+// Handlers
 // ============================================================================
 
 fn timestamp() -> u64 {
@@ -100,50 +103,99 @@ fn gen_id() -> String {
     format!("kore-{:x}", timestamp())
 }
 
-pub async fn completions(Json(req): Json<CompletionRequest>) -> Json<CompletionResponse> {
-    // Placeholder: echo back the prompt with a note
-    let response_text = format!(
-        "[Kore inference placeholder] Model '{}' received prompt of {} chars. \
-         Real inference requires a loaded model.",
-        req.model,
-        req.prompt.len()
-    );
+/// Simple byte-level tokenizer: each byte is a token ID.
+fn tokenize(text: &str) -> Vec<usize> {
+    text.bytes().map(|b| b as usize).collect()
+}
+
+/// Simple byte-level detokenizer.
+fn detokenize(ids: &[usize]) -> String {
+    ids.iter()
+        .map(|&id| if id < 128 { id as u8 as char } else { '?' })
+        .collect()
+}
+
+pub async fn completions(
+    State(state): State<AppState>,
+    Json(req): Json<CompletionRequest>,
+) -> Json<CompletionResponse> {
+    let prompt_tokens = tokenize(&req.prompt);
+    let prompt_len = prompt_tokens.len();
+
+    let (response_text, gen_count) = {
+        let mut guard = state.model.lock();
+        if let Some(ref mut model) = *guard {
+            let max_gen = req.max_tokens.min(512);
+            match model.generate(&prompt_tokens, max_gen) {
+                Ok(full_seq) => {
+                    let generated = &full_seq[prompt_len..];
+                    (detokenize(generated), generated.len())
+                }
+                Err(e) => (format!("[error: {}]", e), 0),
+            }
+        } else {
+            (format!(
+                "[Kore] No model loaded. Model '{}', prompt {} tokens.",
+                req.model, prompt_len
+            ), 0)
+        }
+    };
 
     Json(CompletionResponse {
         id: gen_id(),
         object: "text_completion".to_string(),
         created: timestamp(),
-        model: req.model,
+        model: state.model_name.clone(),
         choices: vec![CompletionChoice {
             text: response_text,
             index: 0,
             finish_reason: "stop".to_string(),
         }],
         usage: Usage {
-            prompt_tokens: req.prompt.split_whitespace().count(),
-            completion_tokens: 0,
-            total_tokens: req.prompt.split_whitespace().count(),
+            prompt_tokens: prompt_len,
+            completion_tokens: gen_count,
+            total_tokens: prompt_len + gen_count,
         },
     })
 }
 
-pub async fn chat_completions(Json(req): Json<ChatCompletionRequest>) -> Json<ChatCompletionResponse> {
-    let prompt_tokens: usize = req.messages.iter()
-        .map(|m| m.content.split_whitespace().count())
-        .sum();
+pub async fn chat_completions(
+    State(state): State<AppState>,
+    Json(req): Json<ChatCompletionRequest>,
+) -> Json<ChatCompletionResponse> {
+    // Concatenate messages into a single prompt
+    let prompt_text: String = req.messages.iter()
+        .map(|m| format!("<|{}|>{}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("");
 
-    let response_content = format!(
-        "[Kore inference placeholder] Model '{}' received {} messages. \
-         Real inference requires a loaded model.",
-        req.model,
-        req.messages.len()
-    );
+    let prompt_tokens = tokenize(&prompt_text);
+    let prompt_len = prompt_tokens.len();
+
+    let (response_content, gen_count) = {
+        let mut guard = state.model.lock();
+        if let Some(ref mut model) = *guard {
+            let max_gen = req.max_tokens.min(512);
+            match model.generate(&prompt_tokens, max_gen) {
+                Ok(full_seq) => {
+                    let generated = &full_seq[prompt_len..];
+                    (detokenize(generated), generated.len())
+                }
+                Err(e) => (format!("[error: {}]", e), 0),
+            }
+        } else {
+            (format!(
+                "[Kore] No model loaded. Model '{}', {} messages.",
+                req.model, req.messages.len()
+            ), 0)
+        }
+    };
 
     Json(ChatCompletionResponse {
         id: gen_id(),
         object: "chat.completion".to_string(),
         created: timestamp(),
-        model: req.model,
+        model: state.model_name.clone(),
         choices: vec![ChatChoice {
             index: 0,
             message: ChatMessage {
@@ -153,9 +205,9 @@ pub async fn chat_completions(Json(req): Json<ChatCompletionRequest>) -> Json<Ch
             finish_reason: "stop".to_string(),
         }],
         usage: Usage {
-            prompt_tokens,
-            completion_tokens: 0,
-            total_tokens: prompt_tokens,
+            prompt_tokens: prompt_len,
+            completion_tokens: gen_count,
+            total_tokens: prompt_len + gen_count,
         },
     })
 }

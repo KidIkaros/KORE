@@ -11,3 +11,7 @@ kore-core.workspace = true
 kore-nn.workspace = true
 kore-kernels.workspace = true
 kore-attention.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+half.workspace = true
