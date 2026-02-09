@@ -1,0 +1,13 @@
+[package]
+name = "kore-transformer"
+description = "End-to-end transformer blocks for Kore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kore-core.workspace = true
+kore-nn.workspace = true
+kore-kernels.workspace = true
+kore-attention.workspace = true
