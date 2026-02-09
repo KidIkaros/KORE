@@ -1,0 +1,51 @@
+# cargo-make tasks for kore-edge cross-compilation
+# Install: cargo install cargo-make
+# Usage: cargo make build-android
+
+[tasks.build-android]
+description = "Build for Android ARM64"
+command = "cross"
+args = ["build", "--target", "aarch64-linux-android", "-p", "kore-edge", "--release", "--features", "ffi"]
+
+[tasks.build-android-armv7]
+description = "Build for Android ARMv7 (older devices)"
+command = "cross"
+args = ["build", "--target", "armv7-linux-androideabi", "-p", "kore-edge", "--release", "--features", "ffi"]
+
+[tasks.build-ios]
+description = "Build for iOS ARM64"
+command = "cargo"
+args = ["build", "--target", "aarch64-apple-ios", "-p", "kore-edge", "--release", "--features", "ffi"]
+
+[tasks.build-ios-sim]
+description = "Build for iOS Simulator (Apple Silicon)"
+command = "cargo"
+args = ["build", "--target", "aarch64-apple-ios-sim", "-p", "kore-edge", "--release", "--features", "ffi"]
+
+[tasks.build-wasm]
+description = "Build WASM package for browser/Node"
+command = "wasm-pack"
+args = ["build", "crates/kore-edge", "--target", "web", "--release"]
+
+[tasks.build-rpi]
+description = "Build for Raspberry Pi (Linux ARM64)"
+command = "cross"
+args = ["build", "--target", "aarch64-unknown-linux-gnu", "-p", "kore-edge", "--release"]
+
+[tasks.build-all-mobile]
+description = "Build for all mobile targets"
+dependencies = ["build-android", "build-ios"]
+
+[tasks.build-all]
+description = "Build for all targets"
+dependencies = ["build-android", "build-ios", "build-wasm", "build-rpi"]
+
+[tasks.test-edge]
+description = "Run kore-edge tests"
+command = "cargo"
+args = ["test", "-p", "kore-edge"]
+
+[tasks.bench-edge]
+description = "Run kore-edge benchmarks"
+command = "cargo"
+args = ["bench", "-p", "kore-edge"]

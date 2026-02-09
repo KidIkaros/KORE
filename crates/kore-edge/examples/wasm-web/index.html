@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kore Edge — Browser Inference</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: #0a0a0a; color: #e0e0e0; padding: 2rem; max-width: 800px; margin: 0 auto; }
+        h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #60a5fa; }
+        .subtitle { color: #888; margin-bottom: 2rem; }
+        .panel { background: #1a1a1a; border: 1px solid #333; border-radius: 8px; padding: 1.5rem; margin-bottom: 1rem; }
+        label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.5rem; }
+        input[type="file"], input[type="number"] { background: #222; border: 1px solid #444; color: #e0e0e0; padding: 0.5rem; border-radius: 4px; width: 100%; margin-bottom: 1rem; }
+        textarea { background: #222; border: 1px solid #444; color: #e0e0e0; padding: 0.5rem; border-radius: 4px; width: 100%; height: 120px; font-family: monospace; resize: vertical; }
+        button { background: #2563eb; color: white; border: none; padding: 0.6rem 1.5rem; border-radius: 4px; cursor: pointer; font-size: 0.9rem; margin-right: 0.5rem; }
+        button:hover { background: #1d4ed8; }
+        button:disabled { background: #444; cursor: not-allowed; }
+        #status { color: #888; font-size: 0.85rem; margin-top: 0.5rem; }
+        #output { margin-top: 1rem; white-space: pre-wrap; font-family: monospace; font-size: 0.9rem; line-height: 1.5; }
+        .stats { color: #60a5fa; font-size: 0.8rem; margin-top: 0.5rem; }
+    </style>
+</head>
+<body>
+    <h1>Kore Edge</h1>
+    <p class="subtitle">On-device transformer inference in the browser via WASM</p>
+
+    <div class="panel">
+        <label for="model-file">Load .koref model</label>
+        <input type="file" id="model-file" accept=".koref">
+        <div id="status">No model loaded</div>
+    </div>
+
+    <div class="panel">
+        <label for="input-ids">Input token IDs (comma-separated)</label>
+        <input type="text" id="input-ids" value="1,2,3,4,5" style="background:#222;border:1px solid #444;color:#e0e0e0;padding:0.5rem;border-radius:4px;width:100%;margin-bottom:1rem;">
+
+        <label for="max-tokens">Max new tokens</label>
+        <input type="number" id="max-tokens" value="32" min="1" max="512">
+
+        <button id="btn-generate" disabled>Generate</button>
+        <button id="btn-forward" disabled>Forward (logits)</button>
+        <button id="btn-reset" disabled>Reset</button>
+    </div>
+
+    <div class="panel">
+        <label>Output</label>
+        <div id="output">—</div>
+        <div id="stats" class="stats"></div>
+    </div>
+
+    <script type="module">
+        // This assumes kore-edge was built with wasm-pack:
+        //   wasm-pack build crates/kore-edge --target web --release
+        // Then copy pkg/ next to this HTML file.
+        import init, { KoreSession } from './pkg/kore_edge.js';
+
+        let session = null;
+
+        async function loadWasm() {
+            await init();
+            document.getElementById('status').textContent = 'WASM runtime ready. Load a .koref model.';
+        }
+
+        document.getElementById('model-file').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const status = document.getElementById('status');
+            status.textContent = `Loading ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)...`;
+
+            const buffer = await file.arrayBuffer();
+            const bytes = new Uint8Array(buffer);
+
+            try {
+                session = KoreSession.fromBytes(bytes);
+                status.textContent = `Model loaded: ${session.info()}`;
+                document.getElementById('btn-generate').disabled = false;
+                document.getElementById('btn-forward').disabled = false;
+                document.getElementById('btn-reset').disabled = false;
+            } catch (err) {
+                status.textContent = `Error: ${err}`;
+            }
+        });
+
+        document.getElementById('btn-generate').addEventListener('click', () => {
+            if (!session) return;
+            const ids = parseIds();
+            const maxTokens = parseInt(document.getElementById('max-tokens').value);
+
+            const start = performance.now();
+            const tokens = session.generate(ids, maxTokens);
+            const elapsed = performance.now() - start;
+
+            const generated = tokens.slice(ids.length);
+            document.getElementById('output').textContent = `Generated tokens: [${Array.from(generated).join(', ')}]`;
+            document.getElementById('stats').textContent =
+                `${generated.length} tokens in ${elapsed.toFixed(1)}ms (${(generated.length / elapsed * 1000).toFixed(1)} tok/s)`;
+        });
+
+        document.getElementById('btn-forward').addEventListener('click', () => {
+            if (!session) return;
+            const ids = parseIds();
+
+            const start = performance.now();
+            const logits = session.forward(ids);
+            const elapsed = performance.now() - start;
+
+            const topK = Array.from(logits)
+                .map((v, i) => ({ v, i }))
+                .sort((a, b) => b.v - a.v)
+                .slice(0, 10);
+
+            document.getElementById('output').textContent =
+                `Logits (top 10):\n` + topK.map(t => `  [${t.i}] = ${t.v.toFixed(4)}`).join('\n');
+            document.getElementById('stats').textContent = `Forward pass: ${elapsed.toFixed(1)}ms`;
+        });
+
+        document.getElementById('btn-reset').addEventListener('click', () => {
+            if (session) session.reset();
+            document.getElementById('output').textContent = 'Session reset.';
+            document.getElementById('stats').textContent = '';
+        });
+
+        function parseIds() {
+            const text = document.getElementById('input-ids').value;
+            return new Uint32Array(text.split(',').map(s => parseInt(s.trim())).filter(n => !isNaN(n)));
+        }
+
+        loadWasm().catch(err => {
+            document.getElementById('status').textContent = `WASM init failed: ${err}`;
+        });
+    </script>
+</body>
+</html>

@@ -16,6 +16,7 @@ pub mod shape;
 pub mod tensor;
 pub mod ops;
 pub mod error;
+pub mod autograd;
 
 pub use dtype::DType;
 pub use device::Device;
@@ -23,5 +24,6 @@ pub use storage::Storage;
 pub use shape::Shape;
 pub use tensor::Tensor;
 pub use error::KoreError;
+pub use autograd::{GradFn, GradNode, NoGradGuard, backward, is_grad_enabled};
 
 pub type Result<T> = std::result::Result<T, KoreError>;

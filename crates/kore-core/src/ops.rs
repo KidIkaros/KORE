@@ -6,3 +6,7 @@
 pub mod arithmetic;
 pub mod reduction;
 pub mod comparison;
+pub mod manipulation;
+
+#[cfg(feature = "cuda")]
+pub(crate) mod cuda_ops;

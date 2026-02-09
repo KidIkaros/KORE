@@ -19,3 +19,5 @@ serde_json.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
+tokio-stream.workspace = true
+async-stream.workspace = true

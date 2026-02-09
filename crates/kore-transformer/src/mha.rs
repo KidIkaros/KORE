@@ -1,42 +1,75 @@
 //! Multi-Head Self-Attention with optional KV-cache.
+//!
+//! Uses `kore_kernels::cpu_matmul::matmul_f32` for SIMD-accelerated projections.
 
 use kore_core::{KoreError, Tensor};
 use kore_attention::kv_cache::KvCache;
+use kore_kernels::cpu_matmul::matmul_f32;
+use crate::rope::RopeTable;
 
-/// Multi-Head Attention layer.
+/// Multi-Head Attention layer with Grouped-Query Attention (GQA) support.
 ///
 /// Projects input into Q, K, V heads, runs scaled dot-product attention,
-/// then projects back to d_model.
+/// then projects back to d_model. Optionally applies RoPE to Q and K.
+///
+/// When `n_kv_heads < n_heads`, uses GQA: each KV head is shared across
+/// `n_heads / n_kv_heads` query heads. When `n_kv_heads == 1`, this is MQA.
 pub struct MultiHeadAttention {
     pub n_heads: usize,
+    pub n_kv_heads: usize,
     pub d_model: usize,
     pub d_head: usize,
-    /// [d_model, d_model] — Q projection
+    /// Q projection: [d_model, n_heads * d_head]
     pub wq: Tensor,
-    /// [d_model, d_model] — K projection
+    /// K projection: [d_model, n_kv_heads * d_head]
     pub wk: Tensor,
-    /// [d_model, d_model] — V projection
+    /// V projection: [d_model, n_kv_heads * d_head]
     pub wv: Tensor,
-    /// [d_model, d_model] — output projection
+    /// Output projection: [n_heads * d_head, d_model]
     pub wo: Tensor,
-    /// Per-head KV caches (for autoregressive generation)
+    /// Per-KV-head caches (n_kv_heads caches, not n_heads)
     pub kv_caches: Vec<KvCache>,
+    /// RoPE frequency table (None = no RoPE, use sinusoidal from embedding)
+    pub rope: Option<RopeTable>,
+    /// Current sequence offset for KV-cache (tracks how many tokens processed)
+    pub seq_offset: usize,
 }
 
 impl MultiHeadAttention {
+    /// Standard MHA (n_kv_heads == n_heads, no RoPE).
     pub fn new(d_model: usize, n_heads: usize) -> Self {
+        Self::new_full(d_model, n_heads, n_heads, false, 4096, 10000.0)
+    }
+
+    /// MHA with RoPE (n_kv_heads == n_heads).
+    pub fn new_with_rope(d_model: usize, n_heads: usize, use_rope: bool, max_seq_len: usize, rope_base: f32) -> Self {
+        Self::new_full(d_model, n_heads, n_heads, use_rope, max_seq_len, rope_base)
+    }
+
+    /// Full constructor with GQA + RoPE support.
+    pub fn new_full(d_model: usize, n_heads: usize, n_kv_heads: usize, use_rope: bool, max_seq_len: usize, rope_base: f32) -> Self {
         assert!(d_model % n_heads == 0, "d_model must be divisible by n_heads");
+        assert!(n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads");
         let d_head = d_model / n_heads;
         let scale = (1.0 / d_model as f64).sqrt() as f32;
 
-        let wq = random_tensor(d_model, d_model, scale);
-        let wk = random_tensor(d_model, d_model, scale);
-        let wv = random_tensor(d_model, d_model, scale);
-        let wo = random_tensor(d_model, d_model, scale);
+        let q_dim = n_heads * d_head;      // == d_model
+        let kv_dim = n_kv_heads * d_head;
 
-        let kv_caches = (0..n_heads).map(|_| KvCache::new(d_head, d_head, 4096)).collect();
+        let wq = random_tensor(d_model, q_dim, scale);
+        let wk = random_tensor(d_model, kv_dim, scale);
+        let wv = random_tensor(d_model, kv_dim, scale);
+        let wo = random_tensor(q_dim, d_model, scale);
 
-        Self { n_heads, d_model, d_head, wq, wk, wv, wo, kv_caches }
+        let kv_caches = (0..n_kv_heads).map(|_| KvCache::new(d_head, d_head, max_seq_len)).collect();
+
+        let rope = if use_rope {
+            Some(RopeTable::new(d_head, max_seq_len, rope_base))
+        } else {
+            None
+        };
+
+        Self { n_heads, n_kv_heads, d_model, d_head, wq, wk, wv, wo, kv_caches, rope, seq_offset: 0 }
     }
 
     /// Forward pass.
@@ -52,7 +85,6 @@ impl MultiHeadAttention {
         mask: Option<&Tensor>,
         use_cache: bool,
     ) -> Result<Tensor, KoreError> {
-        let x_data = x.as_f32_slice().ok_or(KoreError::StorageError("expected f32 tensor".into()))?;
         let dims = x.shape().dims();
         let seq_len = dims[0];
         let d = dims[1];
@@ -63,110 +95,136 @@ impl MultiHeadAttention {
             ));
         }
 
-        // Project: Q, K, V = x @ W^T  → [seq_len, d_model]
-        let q_all = matmul_2d(x_data, self.wq.as_f32_slice().unwrap(), seq_len, d, d);
-        let k_all = matmul_2d(x_data, self.wk.as_f32_slice().unwrap(), seq_len, d, d);
-        let v_all = matmul_2d(x_data, self.wv.as_f32_slice().unwrap(), seq_len, d, d);
-
         let dh = self.d_head;
         let nh = self.n_heads;
-        let mut head_outputs = vec![0.0f32; seq_len * d];
+        let nkv = self.n_kv_heads;
+        let heads_per_kv = nh / nkv;
+        let q_dim = nh * dh;
+        let kv_dim = nkv * dh;
 
-        for h in 0..nh {
-            // Extract head h: [seq_len, d_head]
-            let q_h = extract_head(&q_all, seq_len, d, h, dh);
-            let k_h = extract_head(&k_all, seq_len, d, h, dh);
-            let v_h = extract_head(&v_all, seq_len, d, h, dh);
+        // Project Q: x @ Wq → [seq_len, q_dim]
+        let q_tensor = matmul_f32(x, &self.wq)?;
+        let q_all = q_tensor.as_f32_slice().unwrap();
 
-            // Optionally use KV cache
-            let (k_full, v_full, kv_seq_len) = if use_cache {
-                let cache = &mut self.kv_caches[h];
-                let k_tensor = Tensor::from_f32(&k_h, &[seq_len, dh]);
-                let v_tensor = Tensor::from_f32(&v_h, &[seq_len, dh]);
-                let (ck, cv) = cache.update(&k_tensor, &v_tensor)?;
-                let ksl = ck.shape().dims()[0];
-                let ck_data = ck.as_f32_slice().unwrap().to_vec();
-                let cv_data = cv.as_f32_slice().unwrap().to_vec();
-                (ck_data, cv_data, ksl)
-            } else {
-                (k_h.clone(), v_h.clone(), seq_len)
-            };
+        // Project K, V: x @ Wk → [seq_len, kv_dim]
+        let k_tensor = matmul_f32(x, &self.wk)?;
+        let v_tensor = matmul_f32(x, &self.wv)?;
+        let k_all = k_tensor.as_f32_slice().unwrap();
+        let v_all = v_tensor.as_f32_slice().unwrap();
 
-            // Scaled dot-product attention for this head
-            // scores = Q @ K^T / sqrt(d_head)  → [seq_len, kv_seq_len]
-            let scale = 1.0 / (dh as f32).sqrt();
-            let mut scores = vec![0.0f32; seq_len * kv_seq_len];
-            for i in 0..seq_len {
-                for j in 0..kv_seq_len {
-                    let mut dot = 0.0f32;
-                    for k in 0..dh {
-                        dot += q_h[i * dh + k] * k_full[j * dh + k];
-                    }
-                    scores[i * kv_seq_len + j] = dot * scale;
-                }
+        let mut head_outputs = vec![0.0f32; seq_len * q_dim];
+
+        // Iterate over KV head groups: update cache once per KV head,
+        // then process all query heads that share this KV head.
+        for kv_h in 0..nkv {
+            // Extract KV head from k_all/v_all [seq_len, kv_dim]
+            let mut k_h = extract_head(k_all, seq_len, kv_dim, kv_h, dh);
+            let v_h = extract_head(v_all, seq_len, kv_dim, kv_h, dh);
+
+            // Apply RoPE to K (Q gets its own per query head below)
+            if let Some(ref rope) = self.rope {
+                rope.apply_single(&mut k_h, self.seq_offset, seq_len);
             }
 
-            // Apply mask (if provided and dimensions match)
-            if let Some(m) = mask {
-                let m_data = m.as_f32_slice().ok_or(KoreError::StorageError("expected f32 mask".into()))?;
-                let m_dims = m.shape().dims();
-                if m_dims[0] >= seq_len && m_dims[1] >= kv_seq_len {
-                    for i in 0..seq_len {
-                        for j in 0..kv_seq_len {
-                            scores[i * kv_seq_len + j] += m_data[i * m_dims[1] + j];
+            // Update KV cache once for this KV head
+            let (k_full_tensor, v_full_tensor) = if use_cache {
+                let cache = &mut self.kv_caches[kv_h];
+                let kt = Tensor::from_f32(&k_h, &[seq_len, dh]);
+                let vt = Tensor::from_f32(&v_h, &[seq_len, dh]);
+                cache.update(&kt, &vt)?
+            } else {
+                (
+                    Tensor::from_f32(&k_h, &[seq_len, dh]),
+                    Tensor::from_f32(&v_h, &[seq_len, dh]),
+                )
+            };
+
+            let kv_seq_len = k_full_tensor.shape().dims()[0];
+            let k_t_transposed = k_full_tensor.transpose()?;
+
+            // Process each query head in this KV group
+            for qh_offset in 0..heads_per_kv {
+                let h = kv_h * heads_per_kv + qh_offset;
+
+                // Extract Q head h from q_all [seq_len, q_dim]
+                let mut q_h = extract_head(q_all, seq_len, q_dim, h, dh);
+
+                // Apply RoPE to Q
+                if let Some(ref rope) = self.rope {
+                    rope.apply_single(&mut q_h, self.seq_offset, seq_len);
+                }
+
+                // scores = Q_h @ K_full^T / sqrt(d_head)  → [seq_len, kv_seq_len]
+                let q_t = Tensor::from_f32(&q_h, &[seq_len, dh]);
+                let scores_tensor = matmul_f32(&q_t, &k_t_transposed)?;
+                let mut scores = scores_tensor.as_f32_slice().unwrap().to_vec();
+
+                let scale = 1.0 / (dh as f32).sqrt();
+                for s in scores.iter_mut() {
+                    *s *= scale;
+                }
+
+                // Apply mask (if provided and dimensions match)
+                if let Some(m) = mask {
+                    let m_data = m.as_f32_slice().ok_or(KoreError::StorageError("expected f32 mask".into()))?;
+                    let m_dims = m.shape().dims();
+                    if m_dims[0] >= seq_len && m_dims[1] >= kv_seq_len {
+                        for i in 0..seq_len {
+                            for j in 0..kv_seq_len {
+                                scores[i * kv_seq_len + j] += m_data[i * m_dims[1] + j];
+                            }
                         }
                     }
                 }
-            }
 
-            // Softmax over last dim
-            for i in 0..seq_len {
-                let row = &mut scores[i * kv_seq_len..(i + 1) * kv_seq_len];
-                let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for v in row.iter_mut() {
-                    *v = (*v - max_val).exp();
-                    sum += *v;
-                }
-                if sum > 0.0 {
+                // Softmax over last dim
+                for i in 0..seq_len {
+                    let row = &mut scores[i * kv_seq_len..(i + 1) * kv_seq_len];
+                    let max_val = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
                     for v in row.iter_mut() {
-                        *v /= sum;
+                        *v = (*v - max_val).exp();
+                        sum += *v;
+                    }
+                    if sum > 0.0 {
+                        for v in row.iter_mut() {
+                            *v /= sum;
+                        }
                     }
                 }
-            }
 
-            // attn_out = scores @ V → [seq_len, d_head]
-            let mut attn_out = vec![0.0f32; seq_len * dh];
-            for i in 0..seq_len {
-                for j in 0..dh {
-                    let mut acc = 0.0f32;
-                    for k in 0..kv_seq_len {
-                        acc += scores[i * kv_seq_len + k] * v_full[k * dh + j];
+                // attn_out = scores @ V_full → [seq_len, d_head]
+                let scores_t = Tensor::from_f32(&scores, &[seq_len, kv_seq_len]);
+                let attn_out_tensor = matmul_f32(&scores_t, &v_full_tensor)?;
+                let attn_out = attn_out_tensor.as_f32_slice().unwrap();
+
+                // Write head output back into concatenated position
+                for i in 0..seq_len {
+                    for j in 0..dh {
+                        head_outputs[i * q_dim + h * dh + j] = attn_out[i * dh + j];
                     }
-                    attn_out[i * dh + j] = acc;
-                }
-            }
-
-            // Write head output back into concatenated position
-            for i in 0..seq_len {
-                for j in 0..dh {
-                    head_outputs[i * d + h * dh + j] = attn_out[i * dh + j];
                 }
             }
         }
 
-        // Output projection: [seq_len, d_model] @ Wo^T → [seq_len, d_model]
-        let wo_data = self.wo.as_f32_slice().unwrap();
-        let final_out = matmul_2d(&head_outputs, wo_data, seq_len, d, d);
+        // Output projection: [seq_len, q_dim] @ Wo → [seq_len, d_model]
+        let head_tensor = Tensor::from_f32(&head_outputs, &[seq_len, q_dim]);
+        let final_out = matmul_f32(&head_tensor, &self.wo)?;
 
-        Ok(Tensor::from_f32(&final_out, &[seq_len, d]))
+        // Advance sequence offset for RoPE
+        if use_cache {
+            self.seq_offset += seq_len;
+        }
+
+        Ok(final_out)
     }
 
-    /// Reset all KV caches (call between sequences).
+    /// Reset all KV caches and sequence offset (call between sequences).
     pub fn reset_cache(&mut self) {
         for cache in &mut self.kv_caches {
             cache.clear();
         }
+        self.seq_offset = 0;
     }
 }
 
@@ -182,21 +240,6 @@ fn random_tensor(rows: usize, cols: usize, scale: f32) -> Tensor {
         })
         .collect();
     Tensor::from_f32(&data, &[rows, cols])
-}
-
-/// C = A @ B^T where A is [m, k], B is [n, k] → C is [m, n]
-fn matmul_2d(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut c = vec![0.0f32; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = 0.0f32;
-            for p in 0..k {
-                acc += a[i * k + p] * b[j * k + p];
-            }
-            c[i * n + j] = acc;
-        }
-    }
-    c
 }
 
 fn extract_head(data: &[f32], seq_len: usize, d_model: usize, head: usize, d_head: usize) -> Vec<f32> {
@@ -247,5 +290,43 @@ mod tests {
         mha.reset_cache();
         let out3 = mha.forward(&x1, None, true).unwrap();
         assert_eq!(out3.shape().dims(), &[1, 32]);
+    }
+
+    #[test]
+    fn test_gqa_shape() {
+        // 8 query heads, 2 KV heads → 4 query heads per KV head
+        let mut mha = MultiHeadAttention::new_full(64, 8, 2, false, 128, 10000.0);
+        assert_eq!(mha.n_heads, 8);
+        assert_eq!(mha.n_kv_heads, 2);
+        assert_eq!(mha.d_head, 8); // 64 / 8
+        assert_eq!(mha.kv_caches.len(), 2);
+
+        let x = Tensor::from_f32(&vec![0.1; 4 * 64], &[4, 64]);
+        let out = mha.forward(&x, None, false).unwrap();
+        assert_eq!(out.shape().dims(), &[4, 64]);
+    }
+
+    #[test]
+    fn test_gqa_with_cache() {
+        // 4 query heads, 2 KV heads
+        let mut mha = MultiHeadAttention::new_full(32, 4, 2, true, 128, 10000.0);
+        let x1 = Tensor::from_f32(&vec![0.1; 1 * 32], &[1, 32]);
+        let out1 = mha.forward(&x1, None, true).unwrap();
+        assert_eq!(out1.shape().dims(), &[1, 32]);
+
+        let x2 = Tensor::from_f32(&vec![0.2; 1 * 32], &[1, 32]);
+        let out2 = mha.forward(&x2, None, true).unwrap();
+        assert_eq!(out2.shape().dims(), &[1, 32]);
+    }
+
+    #[test]
+    fn test_mqa_shape() {
+        // Multi-Query Attention: 8 query heads, 1 KV head
+        let mut mha = MultiHeadAttention::new_full(64, 8, 1, false, 128, 10000.0);
+        assert_eq!(mha.kv_caches.len(), 1);
+
+        let x = Tensor::from_f32(&vec![0.1; 4 * 64], &[4, 64]);
+        let out = mha.forward(&x, None, false).unwrap();
+        assert_eq!(out.shape().dims(), &[4, 64]);
     }
 }

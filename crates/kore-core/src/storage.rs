@@ -2,6 +2,9 @@ use std::sync::Arc;
 
 use crate::{DType, Device, KoreError, Result};
 
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaDevice, CudaSlice, DeviceSlice};
+
 /// Backing storage for tensor data.
 ///
 /// Storage is reference-counted (`Arc`) so multiple tensors can share the same
@@ -10,7 +13,13 @@ use crate::{DType, Device, KoreError, Result};
 pub enum StorageData {
     /// CPU heap-allocated storage (aligned to 64 bytes for SIMD).
     Cpu(Vec<u8>),
-    // Future: Cuda { ptr: DevicePtr, len: usize, device_id: usize }
+    /// CUDA GPU storage with device handle and raw byte buffer.
+    #[cfg(feature = "cuda")]
+    Cuda {
+        device: Arc<CudaDevice>,
+        buffer: Arc<CudaSlice<u8>>,
+        device_idx: usize,
+    },
 }
 
 /// Shared, reference-counted tensor storage.
@@ -117,22 +126,30 @@ impl Storage {
     pub fn nbytes(&self) -> usize {
         match self.data.as_ref() {
             StorageData::Cpu(v) => v.len(),
+            #[cfg(feature = "cuda")]
+            StorageData::Cuda { buffer, .. } => buffer.len(),
         }
     }
 
     /// Get a read-only reference to the raw bytes.
+    /// Panics if storage is on GPU — call `to_cpu()` first.
     pub fn as_bytes(&self) -> &[u8] {
         match self.data.as_ref() {
             StorageData::Cpu(v) => v,
+            #[cfg(feature = "cuda")]
+            StorageData::Cuda { .. } => panic!("Cannot access GPU storage as bytes — transfer to CPU first with .to(Device::Cpu)"),
         }
     }
 
     /// Get a mutable reference to the raw bytes.
     /// This will clone the underlying data if there are other references (copy-on-write).
+    /// Panics if storage is on GPU.
     pub fn as_bytes_mut(&mut self) -> &mut [u8] {
         let data = Arc::make_mut(&mut self.data);
         match data {
             StorageData::Cpu(v) => v,
+            #[cfg(feature = "cuda")]
+            StorageData::Cuda { .. } => panic!("Cannot mutate GPU storage as bytes — transfer to CPU first"),
         }
     }
 
@@ -177,6 +194,127 @@ impl Storage {
     /// Whether this storage is uniquely owned (no other Arc references).
     pub fn is_unique(&self) -> bool {
         Arc::strong_count(&self.data) == 1
+    }
+
+    /// Whether this storage is on CPU.
+    pub fn is_cpu(&self) -> bool {
+        self.device.is_cpu()
+    }
+
+    /// Whether this storage is on a CUDA device.
+    pub fn is_cuda(&self) -> bool {
+        self.device.is_cuda()
+    }
+
+    /// Create GPU storage from host bytes (H2D copy).
+    #[cfg(feature = "cuda")]
+    pub fn to_cuda(&self, device_idx: usize) -> Result<Self> {
+        if let Device::Cuda(idx) = self.device {
+            if idx == device_idx {
+                return Ok(self.clone());
+            }
+        }
+        let host_bytes = self.as_bytes();
+        let cuda_dev = cudarc::driver::CudaDevice::new(device_idx)
+            .map_err(|e| KoreError::StorageError(format!("CUDA device init: {}", e)))?;
+        let gpu_buf = cuda_dev
+            .htod_copy(host_bytes.to_vec())
+            .map_err(|e| KoreError::StorageError(format!("H2D copy: {}", e)))?;
+        Ok(Self {
+            data: Arc::new(StorageData::Cuda {
+                device: cuda_dev,
+                buffer: Arc::new(gpu_buf),
+                device_idx,
+            }),
+            dtype: self.dtype,
+            device: Device::Cuda(device_idx),
+            numel: self.numel,
+        })
+    }
+
+    /// Copy GPU storage back to CPU (D2H copy).
+    #[cfg(feature = "cuda")]
+    pub fn to_cpu(&self) -> Result<Self> {
+        match self.data.as_ref() {
+            StorageData::Cpu(_) => Ok(self.clone()),
+            StorageData::Cuda { device, buffer, .. } => {
+                let host_data: Vec<u8> = device
+                    .dtoh_sync_copy(buffer.as_ref())
+                    .map_err(|e| KoreError::StorageError(format!("D2H copy: {}", e)))?;
+                Ok(Self {
+                    data: Arc::new(StorageData::Cpu(host_data)),
+                    dtype: self.dtype,
+                    device: Device::Cpu,
+                    numel: self.numel,
+                })
+            }
+        }
+    }
+
+    /// Create GPU storage with zeroed memory.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_zeros(dtype: DType, numel: usize, device_idx: usize) -> Result<Self> {
+        let nbytes = dtype.storage_bytes(numel);
+        let cuda_dev = cudarc::driver::CudaDevice::new(device_idx)
+            .map_err(|e| KoreError::StorageError(format!("CUDA device init: {}", e)))?;
+        let gpu_buf = cuda_dev
+            .alloc_zeros::<u8>(nbytes)
+            .map_err(|e| KoreError::StorageError(format!("CUDA alloc_zeros: {}", e)))?;
+        Ok(Self {
+            data: Arc::new(StorageData::Cuda {
+                device: cuda_dev,
+                buffer: Arc::new(gpu_buf),
+                device_idx,
+            }),
+            dtype,
+            device: Device::Cuda(device_idx),
+            numel,
+        })
+    }
+
+    /// Get the underlying CudaSlice for kernel launches.
+    /// Returns None if not on GPU.
+    #[cfg(feature = "cuda")]
+    pub fn as_cuda_slice(&self) -> Option<&CudaSlice<u8>> {
+        match self.data.as_ref() {
+            StorageData::Cuda { buffer, .. } => Some(buffer.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Get the CudaDevice handle. Returns None if not on GPU.
+    #[cfg(feature = "cuda")]
+    pub fn cuda_device(&self) -> Option<Arc<CudaDevice>> {
+        match self.data.as_ref() {
+            StorageData::Cuda { device, .. } => Some(Arc::clone(device)),
+            _ => None,
+        }
+    }
+
+    /// Get the raw StorageData reference (for dispatch).
+    pub fn data(&self) -> &StorageData {
+        self.data.as_ref()
+    }
+
+    /// Create Storage directly from a CUDA buffer (used by kernel dispatch).
+    #[cfg(feature = "cuda")]
+    pub fn from_cuda(
+        device: Arc<CudaDevice>,
+        buffer: CudaSlice<u8>,
+        device_idx: usize,
+        dtype: DType,
+        numel: usize,
+    ) -> Self {
+        Self {
+            data: Arc::new(StorageData::Cuda {
+                device,
+                buffer: Arc::new(buffer),
+                device_idx,
+            }),
+            dtype,
+            device: Device::Cuda(device_idx),
+            numel,
+        }
     }
 }
 

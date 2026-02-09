@@ -1,9 +1,14 @@
 //! Reduction operations: sum, mean, max, min.
 
+use rayon::prelude::*;
+
+use crate::autograd;
 use crate::dtype::DType;
 use crate::error::KoreError;
 use crate::tensor::Tensor;
 use crate::Result;
+
+const PAR_THRESHOLD: usize = 8192;
 
 impl Tensor {
     /// Sum all elements, returning a scalar tensor.
@@ -13,8 +18,21 @@ impl Tensor {
         }
         let data = self.contiguous();
         let slice = data.as_f32_slice().unwrap();
-        let total: f32 = slice.iter().sum();
-        Ok(Tensor::scalar(total))
+        let total: f32 = if slice.len() >= PAR_THRESHOLD {
+            slice.par_iter().sum()
+        } else {
+            slice.iter().sum()
+        };
+        let result = Tensor::scalar(total);
+        if self.tracks_grad() && autograd::is_grad_enabled() {
+            let node = autograd::GradNode::with_grad_fn(
+                Box::new(autograd::SumBackward { input_shape: self.shape().dims().to_vec() }),
+                self.grad_node().into_iter().cloned().collect(),
+            );
+            Ok(result.with_grad_node(node))
+        } else {
+            Ok(result)
+        }
     }
 
     /// Sum along a specific axis, reducing that dimension.
@@ -85,7 +103,11 @@ impl Tensor {
         }
         let data = self.contiguous();
         let slice = data.as_f32_slice().unwrap();
-        let val = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let val = if slice.len() >= PAR_THRESHOLD {
+            slice.par_iter().cloned().reduce(|| f32::NEG_INFINITY, f32::max)
+        } else {
+            slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+        };
         Ok(Tensor::scalar(val))
     }
 
@@ -96,7 +118,11 @@ impl Tensor {
         }
         let data = self.contiguous();
         let slice = data.as_f32_slice().unwrap();
-        let val = slice.iter().cloned().fold(f32::INFINITY, f32::min);
+        let val = if slice.len() >= PAR_THRESHOLD {
+            slice.par_iter().cloned().reduce(|| f32::INFINITY, f32::min)
+        } else {
+            slice.iter().cloned().fold(f32::INFINITY, f32::min)
+        };
         Ok(Tensor::scalar(val))
     }
 

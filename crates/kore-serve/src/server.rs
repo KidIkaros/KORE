@@ -11,6 +11,7 @@ use crate::state::AppState;
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health::health))
+        .route("/v1/models", get(api::list_models))
         .route("/v1/completions", post(api::completions))
         .route("/v1/chat/completions", post(api::chat_completions))
         .layer(CorsLayer::permissive())

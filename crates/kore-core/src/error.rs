@@ -45,4 +45,7 @@ pub enum KoreError {
 
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    #[error("CUDA error: {0}")]
+    CudaError(String),
 }

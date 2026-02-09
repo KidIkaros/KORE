@@ -163,6 +163,382 @@ impl PyTensor {
     fn __matmul__(&self, other: &PyTensor) -> PyResult<PyTensor> {
         self.matmul(other)
     }
+
+    /// Softmax over given axis.
+    #[pyo3(signature = (axis=-1))]
+    fn softmax(&self, axis: isize) -> PyResult<PyTensor> {
+        let result = self.inner.softmax(axis)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    /// Log-softmax over given axis.
+    #[pyo3(signature = (axis=-1))]
+    fn log_softmax(&self, axis: isize) -> PyResult<PyTensor> {
+        let result = self.inner.log_softmax(axis)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    /// Masked fill: replace elements where mask > 0 with value.
+    fn masked_fill(&self, mask: &PyTensor, value: f32) -> PyResult<PyTensor> {
+        let result = self.inner.masked_fill(&mask.inner, value)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    /// Upper triangular.
+    #[pyo3(signature = (k=0))]
+    fn triu(&self, k: isize) -> PyResult<PyTensor> {
+        let result = self.inner.triu(k)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    /// Lower triangular.
+    #[pyo3(signature = (k=0))]
+    fn tril(&self, k: isize) -> PyResult<PyTensor> {
+        let result = self.inner.tril(k)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    /// Gather elements along axis.
+    fn gather(&self, axis: isize, index: &PyTensor) -> PyResult<PyTensor> {
+        let result = self.inner.gather(axis, &index.inner)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    /// Concatenate tensors along axis.
+    #[staticmethod]
+    fn cat(tensors: Vec<PyTensor>, axis: isize) -> PyResult<PyTensor> {
+        let refs: Vec<&kore_core::Tensor> = tensors.iter().map(|t| &t.inner).collect();
+        let result = kore_core::Tensor::cat(&refs, axis)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    /// Stack tensors along new axis.
+    #[staticmethod]
+    fn stack(tensors: Vec<PyTensor>, axis: isize) -> PyResult<PyTensor> {
+        let refs: Vec<&kore_core::Tensor> = tensors.iter().map(|t| &t.inner).collect();
+        let result = kore_core::Tensor::stack(&refs, axis)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    /// Absolute value.
+    fn abs(&self) -> PyResult<PyTensor> {
+        let result = self.inner.abs()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+}
+
+// ============================================================================
+// nn module
+// ============================================================================
+
+#[pyclass(name = "Linear")]
+struct PyLinear {
+    inner: kore_nn::Linear,
+}
+
+#[pymethods]
+impl PyLinear {
+    #[new]
+    #[pyo3(signature = (in_features, out_features, bias=true))]
+    fn new(in_features: usize, out_features: usize, bias: bool) -> Self {
+        Self {
+            inner: kore_nn::Linear::new(in_features, out_features, bias),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn parameters(&self) -> Vec<PyTensor> {
+        kore_nn::Module::parameters(&self.inner)
+            .into_iter()
+            .map(|t| PyTensor { inner: t.clone() })
+            .collect()
+    }
+}
+
+#[pyclass(name = "LayerNorm")]
+struct PyLayerNorm {
+    inner: kore_nn::LayerNorm,
+}
+
+#[pymethods]
+impl PyLayerNorm {
+    #[new]
+    #[pyo3(signature = (normalized_shape, eps=1e-5))]
+    fn new(normalized_shape: usize, eps: f32) -> Self {
+        Self {
+            inner: kore_nn::LayerNorm::new(normalized_shape, eps),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn parameters(&self) -> Vec<PyTensor> {
+        kore_nn::Module::parameters(&self.inner)
+            .into_iter()
+            .map(|t| PyTensor { inner: t.clone() })
+            .collect()
+    }
+}
+
+#[pyclass(name = "Embedding")]
+struct PyEmbedding {
+    inner: kore_nn::Embedding,
+}
+
+#[pymethods]
+impl PyEmbedding {
+    #[new]
+    fn new(num_embeddings: usize, embedding_dim: usize) -> Self {
+        Self {
+            inner: kore_nn::Embedding::new(num_embeddings, embedding_dim),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn lookup(&self, ids: Vec<usize>) -> PyTensor {
+        PyTensor { inner: self.inner.lookup(&ids) }
+    }
+
+    fn parameters(&self) -> Vec<PyTensor> {
+        kore_nn::Module::parameters(&self.inner)
+            .into_iter()
+            .map(|t| PyTensor { inner: t.clone() })
+            .collect()
+    }
+}
+
+#[pyclass(name = "BitLinear")]
+struct PyBitLinear {
+    inner: kore_nn::BitLinear,
+}
+
+#[pymethods]
+impl PyBitLinear {
+    #[new]
+    #[pyo3(signature = (in_features, out_features, bias=false, threshold=0.3))]
+    fn new(in_features: usize, out_features: usize, bias: bool, threshold: f32) -> Self {
+        let linear = kore_nn::Linear::new(in_features, out_features, bias);
+        Self {
+            inner: kore_nn::BitLinear::from_linear(&linear, threshold),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn compression_ratio(&self) -> f32 {
+        self.inner.compression_ratio()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{}", self.inner)
+    }
+}
+
+#[pyclass(name = "QuatLinear")]
+struct PyQuatLinear {
+    inner: kore_nn::QuatLinear,
+}
+
+#[pymethods]
+impl PyQuatLinear {
+    #[new]
+    #[pyo3(signature = (in_features, out_features, bias=false))]
+    fn new(in_features: usize, out_features: usize, bias: bool) -> Self {
+        let linear = kore_nn::Linear::new(in_features, out_features, bias);
+        Self {
+            inner: kore_nn::QuatLinear::from_linear(&linear),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn compression_ratio(&self) -> f32 {
+        self.inner.compression_ratio()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{}", self.inner)
+    }
+}
+
+#[pyclass(name = "LoraLinear")]
+struct PyLoraLinear {
+    inner: kore_nn::LoraLinear,
+}
+
+#[pymethods]
+impl PyLoraLinear {
+    #[new]
+    #[pyo3(signature = (in_features, out_features, rank=8, alpha=8.0, bias=false))]
+    fn new(in_features: usize, out_features: usize, rank: usize, alpha: f32, bias: bool) -> Self {
+        Self {
+            inner: kore_nn::LoraLinear::new(in_features, out_features, rank, alpha, bias),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn trainable_params(&self) -> usize {
+        self.inner.trainable_params()
+    }
+
+    fn total_params(&self) -> usize {
+        self.inner.total_params()
+    }
+
+    fn parameters(&self) -> Vec<PyTensor> {
+        kore_nn::Module::parameters(&self.inner)
+            .into_iter()
+            .map(|t| PyTensor { inner: t.clone() })
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{}", self.inner)
+    }
+}
+
+#[pyclass(name = "Dropout")]
+struct PyDropout {
+    inner: kore_nn::Dropout,
+}
+
+#[pymethods]
+impl PyDropout {
+    #[new]
+    #[pyo3(signature = (p=0.5))]
+    fn new(p: f32) -> Self {
+        Self {
+            inner: kore_nn::Dropout::new(p),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn train(&mut self, mode: bool) {
+        kore_nn::Module::train(&mut self.inner, mode);
+    }
+
+    fn eval(&mut self) {
+        kore_nn::Module::train(&mut self.inner, false);
+    }
+}
+
+// ============================================================================
+// optim module
+// ============================================================================
+
+#[pyclass(name = "Adam")]
+struct PyAdam {
+    inner: kore_optim::Adam,
+}
+
+#[pymethods]
+impl PyAdam {
+    #[new]
+    #[pyo3(signature = (lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0))]
+    fn new(lr: f32, beta1: f32, beta2: f32, eps: f32, weight_decay: f32) -> Self {
+        Self {
+            inner: kore_optim::Adam::new(lr, beta1, beta2, eps, weight_decay),
+        }
+    }
+
+    fn step(&mut self, params: Vec<PyTensor>, grads: Vec<PyTensor>) -> PyResult<Vec<PyTensor>> {
+        let mut p: Vec<kore_core::Tensor> = params.into_iter().map(|t| t.inner).collect();
+        let g: Vec<kore_core::Tensor> = grads.into_iter().map(|t| t.inner).collect();
+        self.inner.step(&mut p, &g);
+        Ok(p.into_iter().map(|t| PyTensor { inner: t }).collect())
+    }
+}
+
+#[pyclass(name = "SGD")]
+struct PySGD {
+    inner: kore_optim::SGD,
+}
+
+#[pymethods]
+impl PySGD {
+    #[new]
+    #[pyo3(signature = (lr=0.01, momentum=0.0, weight_decay=0.0))]
+    fn new(lr: f32, momentum: f32, weight_decay: f32) -> Self {
+        Self {
+            inner: kore_optim::SGD::new(lr, momentum, weight_decay),
+        }
+    }
+
+    fn step(&mut self, params: Vec<PyTensor>, grads: Vec<PyTensor>) -> PyResult<Vec<PyTensor>> {
+        let mut p: Vec<kore_core::Tensor> = params.into_iter().map(|t| t.inner).collect();
+        let g: Vec<kore_core::Tensor> = grads.into_iter().map(|t| t.inner).collect();
+        self.inner.step(&mut p, &g);
+        Ok(p.into_iter().map(|t| PyTensor { inner: t }).collect())
+    }
 }
 
 // ============================================================================
@@ -201,16 +577,78 @@ fn sigmoid(input: &PyTensor) -> PyResult<PyTensor> {
     Ok(PyTensor { inner: result })
 }
 
+/// Cross-entropy loss.
+#[pyfunction]
+fn cross_entropy_loss(logits: &PyTensor, targets: &PyTensor) -> PyResult<PyTensor> {
+    let result = kore_nn::cross_entropy_loss(&logits.inner, &targets.inner)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyTensor { inner: result })
+}
+
+/// MSE loss.
+#[pyfunction]
+fn mse_loss(pred: &PyTensor, target: &PyTensor) -> PyResult<PyTensor> {
+    let result = kore_nn::mse_loss(&pred.inner, &target.inner)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyTensor { inner: result })
+}
+
+/// L1 loss.
+#[pyfunction]
+fn l1_loss(pred: &PyTensor, target: &PyTensor) -> PyResult<PyTensor> {
+    let result = kore_nn::l1_loss(&pred.inner, &target.inner)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyTensor { inner: result })
+}
+
+/// NLL loss.
+#[pyfunction]
+fn nll_loss(log_probs: &PyTensor, targets: &PyTensor) -> PyResult<PyTensor> {
+    let result = kore_nn::nll_loss(&log_probs.inner, &targets.inner)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyTensor { inner: result })
+}
+
 // ============================================================================
 // Module entry point
 // ============================================================================
 
 #[pymodule]
-fn kore(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn kore(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTensor>()?;
     m.add_function(wrap_pyfunction!(relu, m)?)?;
     m.add_function(wrap_pyfunction!(gelu, m)?)?;
     m.add_function(wrap_pyfunction!(softmax, m)?)?;
     m.add_function(wrap_pyfunction!(sigmoid, m)?)?;
+
+    // nn submodule
+    let nn = PyModule::new_bound(py, "nn")?;
+    nn.add_class::<PyLinear>()?;
+    nn.add_class::<PyBitLinear>()?;
+    nn.add_class::<PyLoraLinear>()?;
+    nn.add_class::<PyLayerNorm>()?;
+    nn.add_class::<PyQuatLinear>()?;
+    nn.add_class::<PyEmbedding>()?;
+    nn.add_class::<PyDropout>()?;
+    m.add_submodule(&nn)?;
+
+    // optim submodule
+    let optim = PyModule::new_bound(py, "optim")?;
+    optim.add_class::<PyAdam>()?;
+    optim.add_class::<PySGD>()?;
+    m.add_submodule(&optim)?;
+
+    // functional submodule (loss functions + activations)
+    let functional = PyModule::new_bound(py, "functional")?;
+    functional.add_function(wrap_pyfunction!(relu, &functional)?)?;
+    functional.add_function(wrap_pyfunction!(gelu, &functional)?)?;
+    functional.add_function(wrap_pyfunction!(softmax, &functional)?)?;
+    functional.add_function(wrap_pyfunction!(sigmoid, &functional)?)?;
+    functional.add_function(wrap_pyfunction!(cross_entropy_loss, &functional)?)?;
+    functional.add_function(wrap_pyfunction!(mse_loss, &functional)?)?;
+    functional.add_function(wrap_pyfunction!(l1_loss, &functional)?)?;
+    functional.add_function(wrap_pyfunction!(nll_loss, &functional)?)?;
+    m.add_submodule(&functional)?;
+
     Ok(())
 }

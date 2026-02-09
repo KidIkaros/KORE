@@ -12,6 +12,11 @@
 pub mod simd;
 pub mod cpu_matmul;
 pub mod cpu_quat_matmul;
+pub mod cpu_ternary_matmul;
 pub mod cpu_fused;
+pub mod cpu_fused_backward;
+
+#[cfg(feature = "cuda")]
+pub mod cuda;
 
 pub use simd::SimdCapability;

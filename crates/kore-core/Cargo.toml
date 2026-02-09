@@ -13,6 +13,15 @@ smallvec.workspace = true
 bytemuck.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
+parking_lot.workspace = true
+
+[dependencies.cudarc]
+workspace = true
+optional = true
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
 
 [dev-dependencies]
 proptest = "1.4"

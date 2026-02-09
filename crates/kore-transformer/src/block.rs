@@ -27,6 +27,26 @@ impl TransformerBlock {
         }
     }
 
+    pub fn new_with_rope(
+        d_model: usize, n_heads: usize, d_ff: usize, norm_eps: f32,
+        use_rope: bool, max_seq_len: usize, rope_base: f32,
+    ) -> Self {
+        Self::new_full(d_model, n_heads, n_heads, d_ff, norm_eps, use_rope, max_seq_len, rope_base)
+    }
+
+    pub fn new_full(
+        d_model: usize, n_heads: usize, n_kv_heads: usize, d_ff: usize, norm_eps: f32,
+        use_rope: bool, max_seq_len: usize, rope_base: f32,
+    ) -> Self {
+        Self {
+            attn_norm: RMSNorm::new(d_model, norm_eps),
+            attn: MultiHeadAttention::new_full(d_model, n_heads, n_kv_heads, use_rope, max_seq_len, rope_base),
+            ffn_norm: RMSNorm::new(d_model, norm_eps),
+            ffn: FeedForward::new(d_model, d_ff),
+            d_model,
+        }
+    }
+
     /// Forward pass.
     ///
     /// `x`: [seq_len, d_model]

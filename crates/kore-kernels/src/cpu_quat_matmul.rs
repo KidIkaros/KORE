@@ -66,6 +66,10 @@ pub fn quat_matmul(
 }
 
 /// Scalar fallback for quaternary matmul.
+///
+/// Uses A-stationary accumulation: pre-unpack the entire row of quaternary
+/// values, then iterate over K and scatter weighted B values into N outputs.
+/// This is more cache-friendly for the output vector when N is small.
 fn quat_matmul_scalar(
     a_packed: &[u8],
     a_scales: &[f32],
@@ -79,27 +83,25 @@ fn quat_matmul_scalar(
     for row in 0..m {
         let scale = a_scales[row];
         let a_row = &a_packed[row * k_packed..(row + 1) * k_packed];
+        let c_row = &mut c[row * n..(row + 1) * n];
 
-        for col in 0..n {
-            let mut acc = 0.0f32;
+        // Pre-unpack all quaternary values for this row
+        let mut quats = Vec::with_capacity(k + 3);
+        for &byte in a_row {
+            quats.push(QUAT_VALUES[((byte) & 0x3) as usize]);
+            quats.push(QUAT_VALUES[((byte >> 2) & 0x3) as usize]);
+            quats.push(QUAT_VALUES[((byte >> 4) & 0x3) as usize]);
+            quats.push(QUAT_VALUES[((byte >> 6) & 0x3) as usize]);
+        }
+        quats.truncate(k);
 
-            for kp in 0..k_packed {
-                let packed = a_row[kp];
-                let k_base = kp * 4;
-
-                // Unpack 4 quaternary values from this byte
-                for i in 0..4 {
-                    let ki = k_base + i;
-                    if ki >= k {
-                        break;
-                    }
-                    let idx = ((packed >> (2 * i)) & 0x3) as usize;
-                    let w = QUAT_VALUES[idx] * scale;
-                    acc += w * b[ki * n + col];
-                }
+        // A-stationary: iterate K, scatter into N outputs
+        for ki in 0..k {
+            let w = quats[ki] * scale;
+            let b_row = &b[ki * n..ki * n + n];
+            for col in 0..n {
+                c_row[col] += w * b_row[col];
             }
-
-            c[row * n + col] = acc;
         }
     }
 }
@@ -265,5 +267,36 @@ mod tests {
         // Verify no NaN/Inf
         let c_data = c.as_f32_slice().unwrap();
         assert!(c_data.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_quat_matmul_non_aligned_k() {
+        // K=7 is not a multiple of 4, tests the truncation path
+        let m = 2;
+        let k = 7;
+        let n = 3;
+
+        let weights: Vec<f32> = (0..m * k).map(|i| ((i % 4) as f32 * 2.0 - 3.0)).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.1).collect();
+
+        let (packed, scales) = pack_weights_quaternary(&weights, m, k);
+        let b = Tensor::from_f32(&b_data, &[k, n]);
+
+        let c = quat_matmul(&packed, &scales, &b, m, n, k).unwrap();
+        assert_eq!(c.shape().dims(), &[m, n]);
+        let c_data = c.as_f32_slice().unwrap();
+        assert!(c_data.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_quat_matmul_single_element() {
+        // 1×1 matmul
+        let weights = vec![3.0];
+        let (packed, scales) = pack_weights_quaternary(&weights, 1, 1);
+        let b = Tensor::from_f32(&[2.0], &[1, 1]);
+        let c = quat_matmul(&packed, &scales, &b, 1, 1, 1).unwrap();
+        let c_data = c.as_f32_slice().unwrap();
+        // 3.0 quantized → Pos3 with scale=1.0, so 3.0 * 2.0 = 6.0
+        assert!((c_data[0] - 6.0).abs() < 0.5, "got {}", c_data[0]);
     }
 }

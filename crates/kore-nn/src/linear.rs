@@ -1,3 +1,5 @@
+use rand::Rng;
+
 use kore_core::{DType, Tensor};
 
 use crate::module::Module;
@@ -10,16 +12,13 @@ pub struct Linear {
 }
 
 impl Linear {
-    /// Create a new Linear layer with Xavier initialization.
+    /// Create a new Linear layer with Xavier uniform initialization.
     pub fn new(in_features: usize, out_features: usize, bias: bool) -> Self {
-        // Xavier uniform initialization: U(-sqrt(6/(in+out)), sqrt(6/(in+out)))
+        // Xavier uniform: U(-sqrt(6/(in+out)), sqrt(6/(in+out)))
         let limit = (6.0 / (in_features + out_features) as f32).sqrt();
+        let mut rng = rand::thread_rng();
         let weight_data: Vec<f32> = (0..in_features * out_features)
-            .map(|i| {
-                // Simple deterministic pseudo-random for reproducibility
-                let x = ((i as f32 * 0.618034) % 1.0) * 2.0 - 1.0;
-                x * limit
-            })
+            .map(|_| rng.gen_range(-limit..limit))
             .collect();
 
         let mut weight = Tensor::from_f32(&weight_data, &[out_features, in_features]);
@@ -40,6 +39,11 @@ impl Linear {
         }
     }
 
+    /// Create a Linear layer from existing weight and optional bias tensors.
+    pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Self {
+        Self { weight, bias, training: false }
+    }
+
     /// Get the weight tensor.
     pub fn weight(&self) -> &Tensor {
         &self.weight
@@ -49,20 +53,30 @@ impl Linear {
     pub fn bias(&self) -> Option<&Tensor> {
         self.bias.as_ref()
     }
+
+    /// Input feature dimension.
+    pub fn in_features(&self) -> usize {
+        self.weight.shape().dims()[1]
+    }
+
+    /// Output feature dimension.
+    pub fn out_features(&self) -> usize {
+        self.weight.shape().dims()[0]
+    }
 }
 
 impl Module for Linear {
-    fn forward(&self, input: &Tensor) -> Tensor {
+    fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         // y = x @ W^T
-        let wt = self.weight.transpose().expect("Linear weight transpose failed");
-        let mut output = input.matmul(&wt.contiguous()).expect("Linear matmul failed");
+        let wt = self.weight.transpose()?;
+        let mut output = input.matmul(&wt.contiguous())?;
 
         // + bias
         if let Some(ref bias) = self.bias {
-            output = output.add(bias).expect("Linear bias add failed");
+            output = output.add(bias)?;
         }
 
-        output
+        Ok(output)
     }
 
     fn parameters(&self) -> Vec<&Tensor> {
@@ -106,7 +120,7 @@ mod tests {
     fn test_linear_forward() {
         let layer = Linear::new(3, 2, false);
         let input = Tensor::ones(&[1, 3]);
-        let output = layer.forward(&input);
+        let output = layer.forward(&input).unwrap();
         assert_eq!(output.shape().dims(), &[1, 2]);
     }
 

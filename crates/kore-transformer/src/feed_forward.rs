@@ -2,8 +2,11 @@
 //!
 //! FFN(x) = (swish(x @ W1) * (x @ W3)) @ W2
 //! where swish(x) = x * sigmoid(x)
+//!
+//! Uses `kore_kernels::cpu_matmul::matmul_f32` for SIMD-accelerated projections.
 
 use kore_core::{KoreError, Tensor};
+use kore_kernels::cpu_matmul::matmul_f32;
 
 /// SwiGLU feed-forward block.
 pub struct FeedForward {
@@ -30,22 +33,21 @@ impl FeedForward {
     }
 
     /// Forward pass: x is [seq_len, d_model] → [seq_len, d_model]
+    ///
+    /// W1 is [d_model, d_ff], W2 is [d_ff, d_model], W3 is [d_model, d_ff]
     pub fn forward(&self, x: &Tensor) -> Result<Tensor, KoreError> {
-        let x_data = x.as_f32_slice().ok_or(KoreError::StorageError("expected f32 tensor".into()))?;
         let seq_len = x.shape().dims()[0];
-        let d = self.d_model;
         let ff = self.d_ff;
 
-        let w1 = self.w1.as_f32_slice().unwrap();
-        let w2 = self.w2.as_f32_slice().unwrap();
-        let w3 = self.w3.as_f32_slice().unwrap();
+        // gate = x @ W1 → [seq_len, d_ff]
+        let gate_tensor = matmul_f32(x, &self.w1)?;
 
-        // gate = x @ W1^T → [seq_len, d_ff]
-        let gate = matmul_ab_t(x_data, w1, seq_len, d, ff);
-        // up = x @ W3^T → [seq_len, d_ff]
-        let up = matmul_ab_t(x_data, w3, seq_len, d, ff);
+        // up = x @ W3 → [seq_len, d_ff]
+        let up_tensor = matmul_f32(x, &self.w3)?;
 
         // swiglu = swish(gate) * up
+        let gate = gate_tensor.as_f32_slice().unwrap();
+        let up = up_tensor.as_f32_slice().unwrap();
         let mut hidden = vec![0.0f32; seq_len * ff];
         for i in 0..hidden.len() {
             let g = gate[i];
@@ -53,10 +55,9 @@ impl FeedForward {
             hidden[i] = swish * up[i];
         }
 
-        // out = hidden @ W2^T → [seq_len, d_model]
-        let out = matmul_ab_t(&hidden, w2, seq_len, ff, d);
-
-        Ok(Tensor::from_f32(&out, &[seq_len, d]))
+        // out = hidden @ W2 → [seq_len, d_model]
+        let hidden_tensor = Tensor::from_f32(&hidden, &[seq_len, ff]);
+        matmul_f32(&hidden_tensor, &self.w2)
     }
 }
 
@@ -74,21 +75,6 @@ fn random_tensor(rows: usize, cols: usize, scale: f32, seed: usize) -> Tensor {
         })
         .collect();
     Tensor::from_f32(&data, &[rows, cols])
-}
-
-/// C = A @ B^T where A is [m, k], B is [n, k] → C is [m, n]
-fn matmul_ab_t(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
-    let mut c = vec![0.0f32; m * n];
-    for i in 0..m {
-        for j in 0..n {
-            let mut acc = 0.0f32;
-            for p in 0..k {
-                acc += a[i * k + p] * b[j * k + p];
-            }
-            c[i * n + j] = acc;
-        }
-    }
-    c
 }
 
 #[cfg(test)]

@@ -31,8 +31,12 @@ pub struct HfConfig {
     pub vocab_size: Option<usize>,
     #[serde(alias = "max_position_embeddings", alias = "max_seq_len")]
     pub max_seq_len: Option<usize>,
+    #[serde(alias = "num_key_value_heads")]
+    pub n_kv_heads: Option<usize>,
     #[serde(alias = "rms_norm_eps", alias = "layer_norm_epsilon")]
     pub norm_eps: Option<f64>,
+    #[serde(alias = "rope_theta")]
+    pub rope_base: Option<f64>,
 }
 
 impl HfConfig {
@@ -51,10 +55,13 @@ impl HfConfig {
             vocab_size: self.vocab_size.unwrap_or(32000),
             d_model: self.d_model.unwrap_or(4096),
             n_heads: self.n_heads.unwrap_or(32),
+            n_kv_heads: self.n_kv_heads.unwrap_or_else(|| self.n_heads.unwrap_or(32)),
             n_layers: self.n_layers.unwrap_or(32),
             d_ff: self.d_ff.unwrap_or(11008),
             max_seq_len: self.max_seq_len.unwrap_or(2048),
             norm_eps: self.norm_eps.unwrap_or(1e-5) as f32,
+            use_rope: true,
+            rope_base: self.rope_base.unwrap_or(10000.0) as f32,
         }
     }
 }
@@ -96,39 +103,79 @@ pub enum WeightTarget {
 }
 
 /// Parse a HuggingFace weight name into a `WeightTarget`.
+///
+/// Supports naming conventions from:
+/// - **Llama / Llama-2 / Llama-3**: `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight`
+/// - **Mistral / Mixtral**: Same as Llama
+/// - **Qwen / Qwen2**: Same as Llama
+/// - **Phi-2 / Phi-3**: `model.layers.{i}.self_attn.dense.weight` (output proj),
+///   `model.layers.{i}.mlp.fc1.weight` / `fc2.weight` (2-layer FFN)
+/// - **Gemma / Gemma-2**: `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight`,
+///   `model.layers.{i}.pre_feedforward_layernorm.weight` (ffn norm variant)
 pub fn parse_weight_name(name: &str) -> WeightTarget {
-    if name == "model.embed_tokens.weight" || name == "embed_tokens.weight" {
-        return WeightTarget::EmbedTokens;
-    }
-    if name == "model.norm.weight" || name == "norm.weight" {
-        return WeightTarget::FinalNorm;
-    }
-    if name == "lm_head.weight" {
-        return WeightTarget::LmHead;
+    // ── Global tensors ─────────────────────────────────────────────────
+    match name {
+        "model.embed_tokens.weight" | "embed_tokens.weight"
+        | "transformer.wte.weight" | "wte.weight" => return WeightTarget::EmbedTokens,
+
+        "model.norm.weight" | "norm.weight"
+        | "model.final_layernorm.weight" | "transformer.ln_f.weight" => return WeightTarget::FinalNorm,
+
+        "lm_head.weight" | "output.weight" => return WeightTarget::LmHead,
+
+        _ => {}
     }
 
-    // Try to parse layer index
-    if let Some(rest) = name.strip_prefix("model.layers.").or_else(|| name.strip_prefix("layers.")) {
+    // ── Per-layer tensors ──────────────────────────────────────────────
+    // Strip common prefixes: "model.layers.", "layers.", "transformer.h."
+    let rest = name
+        .strip_prefix("model.layers.")
+        .or_else(|| name.strip_prefix("layers."))
+        .or_else(|| name.strip_prefix("transformer.h."));
+
+    if let Some(rest) = rest {
         if let Some(dot_pos) = rest.find('.') {
             if let Ok(layer_idx) = rest[..dot_pos].parse::<usize>() {
                 let suffix = &rest[dot_pos + 1..];
-                return match suffix {
-                    "self_attn.q_proj.weight" => WeightTarget::LayerQ(layer_idx),
-                    "self_attn.k_proj.weight" => WeightTarget::LayerK(layer_idx),
-                    "self_attn.v_proj.weight" => WeightTarget::LayerV(layer_idx),
-                    "self_attn.o_proj.weight" => WeightTarget::LayerO(layer_idx),
-                    "mlp.gate_proj.weight" => WeightTarget::LayerGate(layer_idx),
-                    "mlp.down_proj.weight" => WeightTarget::LayerDown(layer_idx),
-                    "mlp.up_proj.weight" => WeightTarget::LayerUp(layer_idx),
-                    "input_layernorm.weight" => WeightTarget::LayerAttnNorm(layer_idx),
-                    "post_attention_layernorm.weight" => WeightTarget::LayerFfnNorm(layer_idx),
-                    _ => WeightTarget::Unknown(name.to_string()),
-                };
+                return parse_layer_suffix(layer_idx, suffix, name);
             }
         }
     }
 
     WeightTarget::Unknown(name.to_string())
+}
+
+/// Parse the per-layer suffix after `layers.{i}.`
+fn parse_layer_suffix(i: usize, suffix: &str, full_name: &str) -> WeightTarget {
+    match suffix {
+        // ── Attention projections (Llama/Mistral/Qwen/Gemma) ───────
+        "self_attn.q_proj.weight" | "attention.wq.weight" => WeightTarget::LayerQ(i),
+        "self_attn.k_proj.weight" | "attention.wk.weight" => WeightTarget::LayerK(i),
+        "self_attn.v_proj.weight" | "attention.wv.weight" => WeightTarget::LayerV(i),
+        "self_attn.o_proj.weight" | "attention.wo.weight"
+        | "self_attn.dense.weight" => WeightTarget::LayerO(i),
+
+        // ── FFN: SwiGLU 3-matrix (Llama/Mistral/Qwen/Gemma) ───────
+        "mlp.gate_proj.weight" | "feed_forward.w1.weight" => WeightTarget::LayerGate(i),
+        "mlp.down_proj.weight" | "feed_forward.w2.weight" => WeightTarget::LayerDown(i),
+        "mlp.up_proj.weight"   | "feed_forward.w3.weight" => WeightTarget::LayerUp(i),
+
+        // ── FFN: 2-matrix (Phi) — map fc1→gate, fc2→down ──────────
+        "mlp.fc1.weight" => WeightTarget::LayerGate(i),
+        "mlp.fc2.weight" => WeightTarget::LayerDown(i),
+
+        // ── Layer norms ────────────────────────────────────────────
+        "input_layernorm.weight"
+        | "attention_norm.weight"
+        | "ln_1.weight" => WeightTarget::LayerAttnNorm(i),
+
+        "post_attention_layernorm.weight"
+        | "ffn_norm.weight"
+        | "pre_feedforward_layernorm.weight"
+        | "ln_2.weight" => WeightTarget::LayerFfnNorm(i),
+
+        _ => WeightTarget::Unknown(full_name.to_string()),
+    }
 }
 
 // ============================================================================
@@ -317,35 +364,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_weight_names() {
-        assert!(matches!(
-            parse_weight_name("model.embed_tokens.weight"),
-            WeightTarget::EmbedTokens
-        ));
-        assert!(matches!(
-            parse_weight_name("model.norm.weight"),
-            WeightTarget::FinalNorm
-        ));
-        assert!(matches!(
-            parse_weight_name("lm_head.weight"),
-            WeightTarget::LmHead
-        ));
-        assert!(matches!(
-            parse_weight_name("model.layers.0.self_attn.q_proj.weight"),
-            WeightTarget::LayerQ(0)
-        ));
-        assert!(matches!(
-            parse_weight_name("model.layers.15.mlp.gate_proj.weight"),
-            WeightTarget::LayerGate(15)
-        ));
-        assert!(matches!(
-            parse_weight_name("model.layers.3.post_attention_layernorm.weight"),
-            WeightTarget::LayerFfnNorm(3)
-        ));
-        assert!(matches!(
-            parse_weight_name("some.unknown.weight"),
-            WeightTarget::Unknown(_)
-        ));
+    fn test_parse_weight_names_llama() {
+        assert!(matches!(parse_weight_name("model.embed_tokens.weight"), WeightTarget::EmbedTokens));
+        assert!(matches!(parse_weight_name("model.norm.weight"), WeightTarget::FinalNorm));
+        assert!(matches!(parse_weight_name("lm_head.weight"), WeightTarget::LmHead));
+        assert!(matches!(parse_weight_name("model.layers.0.self_attn.q_proj.weight"), WeightTarget::LayerQ(0)));
+        assert!(matches!(parse_weight_name("model.layers.15.mlp.gate_proj.weight"), WeightTarget::LayerGate(15)));
+        assert!(matches!(parse_weight_name("model.layers.3.post_attention_layernorm.weight"), WeightTarget::LayerFfnNorm(3)));
+        assert!(matches!(parse_weight_name("model.layers.0.self_attn.k_proj.weight"), WeightTarget::LayerK(0)));
+        assert!(matches!(parse_weight_name("model.layers.0.self_attn.v_proj.weight"), WeightTarget::LayerV(0)));
+        assert!(matches!(parse_weight_name("model.layers.0.self_attn.o_proj.weight"), WeightTarget::LayerO(0)));
+        assert!(matches!(parse_weight_name("model.layers.0.mlp.down_proj.weight"), WeightTarget::LayerDown(0)));
+        assert!(matches!(parse_weight_name("model.layers.0.mlp.up_proj.weight"), WeightTarget::LayerUp(0)));
+        assert!(matches!(parse_weight_name("model.layers.0.input_layernorm.weight"), WeightTarget::LayerAttnNorm(0)));
+        assert!(matches!(parse_weight_name("some.unknown.weight"), WeightTarget::Unknown(_)));
+    }
+
+    #[test]
+    fn test_parse_weight_names_phi() {
+        // Phi uses self_attn.dense for output projection
+        assert!(matches!(parse_weight_name("model.layers.0.self_attn.dense.weight"), WeightTarget::LayerO(0)));
+        // Phi uses mlp.fc1/fc2 for FFN
+        assert!(matches!(parse_weight_name("model.layers.2.mlp.fc1.weight"), WeightTarget::LayerGate(2)));
+        assert!(matches!(parse_weight_name("model.layers.2.mlp.fc2.weight"), WeightTarget::LayerDown(2)));
+    }
+
+    #[test]
+    fn test_parse_weight_names_gemma() {
+        // Gemma uses pre_feedforward_layernorm for FFN norm
+        assert!(matches!(parse_weight_name("model.layers.5.pre_feedforward_layernorm.weight"), WeightTarget::LayerFfnNorm(5)));
+    }
+
+    #[test]
+    fn test_parse_weight_names_gpt_style() {
+        // GPT-style prefixes (transformer.h.{i})
+        assert!(matches!(parse_weight_name("transformer.h.0.self_attn.q_proj.weight"), WeightTarget::LayerQ(0)));
+        assert!(matches!(parse_weight_name("transformer.h.1.ln_1.weight"), WeightTarget::LayerAttnNorm(1)));
+        assert!(matches!(parse_weight_name("transformer.h.1.ln_2.weight"), WeightTarget::LayerFfnNorm(1)));
+        // GPT-style global tensors
+        assert!(matches!(parse_weight_name("transformer.wte.weight"), WeightTarget::EmbedTokens));
+        assert!(matches!(parse_weight_name("transformer.ln_f.weight"), WeightTarget::FinalNorm));
+    }
+
+    #[test]
+    fn test_parse_weight_names_alt_global() {
+        // Alternative global names
+        assert!(matches!(parse_weight_name("embed_tokens.weight"), WeightTarget::EmbedTokens));
+        assert!(matches!(parse_weight_name("norm.weight"), WeightTarget::FinalNorm));
+        assert!(matches!(parse_weight_name("output.weight"), WeightTarget::LmHead));
+        assert!(matches!(parse_weight_name("model.final_layernorm.weight"), WeightTarget::FinalNorm));
+    }
+
+    #[test]
+    fn test_parse_weight_names_bare_prefix() {
+        // Without "model." prefix
+        assert!(matches!(parse_weight_name("layers.0.self_attn.q_proj.weight"), WeightTarget::LayerQ(0)));
+        assert!(matches!(parse_weight_name("layers.3.mlp.gate_proj.weight"), WeightTarget::LayerGate(3)));
+        assert!(matches!(parse_weight_name("layers.1.attention_norm.weight"), WeightTarget::LayerAttnNorm(1)));
+        assert!(matches!(parse_weight_name("layers.1.ffn_norm.weight"), WeightTarget::LayerFfnNorm(1)));
     }
 
     #[test]

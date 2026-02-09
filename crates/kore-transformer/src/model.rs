@@ -6,6 +6,7 @@ use kore_core::{KoreError, Tensor};
 use crate::embedding::Embedding;
 use crate::rms_norm::RMSNorm;
 use crate::block::TransformerBlock;
+use crate::sampler::{self, SamplerConfig, Rng};
 
 /// Configuration for a transformer model.
 #[derive(Clone, Debug)]
@@ -13,10 +14,16 @@ pub struct TransformerConfig {
     pub vocab_size: usize,
     pub d_model: usize,
     pub n_heads: usize,
+    /// Number of KV heads for Grouped-Query Attention. Equal to n_heads for MHA.
+    pub n_kv_heads: usize,
     pub n_layers: usize,
     pub d_ff: usize,
     pub max_seq_len: usize,
     pub norm_eps: f32,
+    /// Enable Rotary Position Embeddings (RoPE). Default: true.
+    pub use_rope: bool,
+    /// RoPE base frequency. Default: 10000.0.
+    pub rope_base: f32,
 }
 
 impl TransformerConfig {
@@ -26,10 +33,13 @@ impl TransformerConfig {
             vocab_size: 256,
             d_model: 64,
             n_heads: 4,
+            n_kv_heads: 4,
             n_layers: 2,
             d_ff: 128,
             max_seq_len: 128,
             norm_eps: 1e-5,
+            use_rope: true,
+            rope_base: 10000.0,
         }
     }
 
@@ -39,10 +49,13 @@ impl TransformerConfig {
             vocab_size: 32000,
             d_model: 256,
             n_heads: 8,
+            n_kv_heads: 4,
             n_layers: 4,
             d_ff: 512,
             max_seq_len: 512,
             norm_eps: 1e-5,
+            use_rope: true,
+            rope_base: 10000.0,
         }
     }
 }
@@ -63,7 +76,10 @@ impl Transformer {
         let embedding = Embedding::new(config.vocab_size, config.d_model, Some(config.max_seq_len));
 
         let layers: Vec<TransformerBlock> = (0..config.n_layers)
-            .map(|_| TransformerBlock::new(config.d_model, config.n_heads, config.d_ff, config.norm_eps))
+            .map(|_| TransformerBlock::new_full(
+                config.d_model, config.n_heads, config.n_kv_heads, config.d_ff, config.norm_eps,
+                config.use_rope, config.max_seq_len, config.rope_base,
+            ))
             .collect();
 
         let final_norm = RMSNorm::new(config.d_model, config.norm_eps);
@@ -131,27 +147,54 @@ impl Transformer {
     ///
     /// Returns: full sequence including prompt
     pub fn generate(&mut self, prompt: &[usize], max_new_tokens: usize) -> Result<Vec<usize>, KoreError> {
+        self.generate_with_config(prompt, max_new_tokens, &SamplerConfig::greedy(), &mut Rng::new(42))
+    }
+
+    /// Generate tokens autoregressively with configurable sampling.
+    ///
+    /// `prompt`: initial token IDs
+    /// `max_new_tokens`: how many tokens to generate
+    /// `sampler_config`: sampling parameters (temperature, top-k, top-p, etc.)
+    /// `rng`: random number generator for stochastic sampling
+    ///
+    /// Returns: full sequence including prompt
+    pub fn generate_with_config(
+        &mut self,
+        prompt: &[usize],
+        max_new_tokens: usize,
+        sampler_config: &SamplerConfig,
+        rng: &mut Rng,
+    ) -> Result<Vec<usize>, KoreError> {
         self.reset_cache();
 
         let mut tokens = prompt.to_vec();
+        let v = self.config.vocab_size;
 
         // Prefill: process entire prompt
         let logits = self.forward(&tokens, true)?;
         let logits_data = logits.as_f32_slice().ok_or(KoreError::StorageError("expected f32 logits".into()))?;
-        let v = self.config.vocab_size;
 
-        // Get next token from last position
+        // Sample next token from last position
         let last_row = &logits_data[(tokens.len() - 1) * v..tokens.len() * v];
-        let next = argmax(last_row);
+        let next = sampler::sample(last_row, &tokens, sampler_config, rng);
         tokens.push(next);
+
+        // Check EOS
+        if sampler_config.eos_token_id == Some(next) {
+            return Ok(tokens);
+        }
 
         // Decode: one token at a time
         for _ in 1..max_new_tokens {
             let last_token = *tokens.last().unwrap();
             let logits = self.forward(&[last_token], true)?;
             let logits_data = logits.as_f32_slice().ok_or(KoreError::StorageError("expected f32 logits".into()))?;
-            let next = argmax(logits_data);
+            let next = sampler::sample(logits_data, &tokens, sampler_config, rng);
             tokens.push(next);
+
+            if sampler_config.eos_token_id == Some(next) {
+                break;
+            }
         }
 
         Ok(tokens)
@@ -180,13 +223,6 @@ impl Transformer {
     }
 }
 
-fn argmax(data: &[f32]) -> usize {
-    data.iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i)
-        .unwrap_or(0)
-}
 
 #[cfg(test)]
 mod tests {

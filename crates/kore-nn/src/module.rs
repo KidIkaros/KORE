@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use kore_core::Tensor;
+use kore_core::{Tensor, Result};
 
 /// Base trait for all neural network modules.
 ///
@@ -8,7 +8,7 @@ use kore_core::Tensor;
 /// Use `#[derive(Module)]` (future) for automatic parameter collection.
 pub trait Module: Send + Sync {
     /// Forward pass.
-    fn forward(&self, input: &Tensor) -> Tensor;
+    fn forward(&self, input: &Tensor) -> Result<Tensor>;
 
     /// Get all trainable parameters.
     fn parameters(&self) -> Vec<&Tensor>;

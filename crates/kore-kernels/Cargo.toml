@@ -8,13 +8,15 @@ license.workspace = true
 
 [dependencies]
 kore-core.workspace = true
+kore-btes.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
+parking_lot.workspace = true
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "kore-core/cuda"]
 
 [dependencies.cudarc]
-version = "0.12"
+workspace = true
 optional = true

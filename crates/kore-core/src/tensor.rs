@@ -1,7 +1,9 @@
 use std::fmt;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
+use crate::autograd::GradNode;
 use crate::dtype::DType;
 use crate::device::Device;
 use crate::error::KoreError;
@@ -38,6 +40,7 @@ pub struct Tensor {
     strides: SmallVec<[usize; 4]>,
     offset: usize,
     requires_grad: bool,
+    grad_node: Option<Arc<GradNode>>,
 }
 
 impl Tensor {
@@ -63,6 +66,7 @@ impl Tensor {
             strides,
             offset: 0,
             requires_grad: false,
+            grad_node: None,
         }
     }
 
@@ -77,6 +81,7 @@ impl Tensor {
             strides,
             offset: 0,
             requires_grad: false,
+            grad_node: None,
         }
     }
 
@@ -90,6 +95,7 @@ impl Tensor {
             strides,
             offset: 0,
             requires_grad: false,
+            grad_node: None,
         }
     }
 
@@ -121,7 +127,27 @@ impl Tensor {
             strides: SmallVec::new(),
             offset: 0,
             requires_grad: false,
+            grad_node: None,
         }
+    }
+
+    /// Create a tensor from pre-built Storage and shape.
+    pub fn from_storage(storage: Storage, shape: &[usize]) -> Self {
+        let s = Shape::new(shape);
+        let strides = s.contiguous_strides();
+        Self {
+            storage,
+            shape: s,
+            strides,
+            offset: 0,
+            requires_grad: false,
+            grad_node: None,
+        }
+    }
+
+    /// Get a reference to the underlying storage (for CUDA dispatch).
+    pub fn storage_ref(&self) -> &Storage {
+        &self.storage
     }
 
     // =========================================================================
@@ -164,8 +190,64 @@ impl Tensor {
     }
 
     /// Set whether this tensor requires gradient computation.
+    /// When enabled, creates a leaf GradNode for this tensor.
     pub fn set_requires_grad(&mut self, requires_grad: bool) {
         self.requires_grad = requires_grad;
+        if requires_grad && self.grad_node.is_none() {
+            self.grad_node = Some(GradNode::leaf());
+        }
+        if !requires_grad {
+            self.grad_node = None;
+        }
+    }
+
+    // =========================================================================
+    // Autograd
+    // =========================================================================
+
+    /// Get the GradNode for this tensor (if tracking gradients).
+    pub fn grad_node(&self) -> Option<&Arc<GradNode>> {
+        self.grad_node.as_ref()
+    }
+
+    /// Attach a GradNode to this tensor (used by op dispatch).
+    /// Also sets requires_grad=true since this tensor is part of the computation graph.
+    pub fn with_grad_node(mut self, node: Arc<GradNode>) -> Self {
+        self.grad_node = Some(node);
+        self.requires_grad = true;
+        self
+    }
+
+    /// Get the accumulated gradient for this tensor.
+    pub fn grad(&self) -> Option<Tensor> {
+        self.grad_node.as_ref().and_then(|n| n.get_grad())
+    }
+
+    /// Clear accumulated gradients.
+    pub fn zero_grad(&self) {
+        if let Some(ref node) = self.grad_node {
+            node.zero_grad();
+        }
+    }
+
+    /// Run backward pass from this tensor (must be scalar).
+    pub fn backward(&self) -> Result<()> {
+        if self.numel() != 1 {
+            return Err(KoreError::ShapeMismatch {
+                expected: vec![1],
+                got: self.shape().dims().to_vec(),
+            });
+        }
+        let node = self.grad_node.as_ref().ok_or_else(|| {
+            KoreError::StorageError("backward() called on tensor without grad tracking".into())
+        })?;
+        crate::autograd::backward(node, Tensor::scalar(1.0));
+        Ok(())
+    }
+
+    /// Check if any input requires grad (used by op dispatch to decide whether to build graph).
+    pub fn tracks_grad(&self) -> bool {
+        self.requires_grad && self.grad_node.is_some() && crate::autograd::is_grad_enabled()
     }
 
     /// Whether this tensor is contiguous in memory (row-major).
@@ -254,6 +336,7 @@ impl Tensor {
             strides,
             offset: self.offset,
             requires_grad: self.requires_grad,
+            grad_node: self.grad_node.clone(),
         })
     }
 
@@ -276,7 +359,73 @@ impl Tensor {
             strides: new_strides,
             offset: self.offset,
             requires_grad: self.requires_grad,
+            grad_node: self.grad_node.clone(),
         })
+    }
+
+    // =========================================================================
+    // Device transfer
+    // =========================================================================
+
+    /// Whether this tensor is on CPU.
+    pub fn is_cpu(&self) -> bool {
+        self.storage.is_cpu()
+    }
+
+    /// Whether this tensor is on a CUDA device.
+    pub fn is_cuda(&self) -> bool {
+        self.storage.is_cuda()
+    }
+
+    /// Move tensor to the specified device. No-op if already there.
+    #[cfg(feature = "cuda")]
+    pub fn to(&self, device: Device) -> Result<Tensor> {
+        match device {
+            Device::Cpu => {
+                if self.device().is_cpu() {
+                    return Ok(self.clone());
+                }
+                let cpu_storage = self.storage.to_cpu()?;
+                Ok(Tensor {
+                    storage: cpu_storage,
+                    shape: self.shape.clone(),
+                    strides: self.strides.clone(),
+                    offset: self.offset,
+                    requires_grad: self.requires_grad,
+                    grad_node: self.grad_node.clone(),
+                })
+            }
+            Device::Cuda(idx) => {
+                if let Device::Cuda(cur) = self.device() {
+                    if cur == idx {
+                        return Ok(self.clone());
+                    }
+                }
+                // Must be contiguous before transfer
+                let cont = self.contiguous();
+                let cuda_storage = cont.storage.to_cuda(idx)?;
+                Ok(Tensor {
+                    storage: cuda_storage,
+                    shape: cont.shape.clone(),
+                    strides: cont.strides.clone(),
+                    offset: 0,
+                    requires_grad: cont.requires_grad,
+                    grad_node: cont.grad_node.clone(),
+                })
+            }
+        }
+    }
+
+    /// Move tensor to CUDA device (convenience for `.to(Device::Cuda(idx))`).
+    #[cfg(feature = "cuda")]
+    pub fn cuda(&self, device_idx: usize) -> Result<Tensor> {
+        self.to(Device::Cuda(device_idx))
+    }
+
+    /// Move tensor to CPU (convenience for `.to(Device::Cpu)`).
+    #[cfg(feature = "cuda")]
+    pub fn cpu(&self) -> Result<Tensor> {
+        self.to(Device::Cpu)
     }
 
     /// Return a contiguous copy of this tensor if it isn't already contiguous.
@@ -294,6 +443,7 @@ impl Tensor {
             }
             let mut t = Tensor::from_f32(&data, self.shape.dims());
             t.requires_grad = self.requires_grad;
+            t.grad_node = self.grad_node.clone();
             t
         } else {
             // Fallback: clone (already contiguous for fresh tensors)

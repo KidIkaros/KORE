@@ -1,0 +1,22 @@
+[package]
+name = "kore-edge"
+description = "Lightweight on-device inference runtime for mobile, WASM, and embedded"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kore-btes.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror.workspace = true
+safetensors = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
+
+[features]
+default = ["std", "serde", "loader"]
+std = []
+serde = ["dep:serde", "dep:serde_json"]
+ffi = []
+loader = ["dep:safetensors", "dep:half"]

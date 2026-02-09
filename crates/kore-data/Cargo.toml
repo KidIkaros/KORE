@@ -1,0 +1,13 @@
+[package]
+name = "kore-data"
+description = "Data loading and batching utilities for Kore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kore-core.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
