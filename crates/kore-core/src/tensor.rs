@@ -116,7 +116,7 @@ impl Tensor {
         // Box-Muller transform for normal distribution
         let data: Vec<f32> = (0..numel)
             .map(|_| {
-                let u1: f32 = rng.gen_range(1e-7f32..1.0f32);
+                let u1: f32 = rng.gen_range(1e-5f32..1.0f32);
                 let u2: f32 = rng.gen_range(0.0f32..std::f32::consts::TAU);
                 (-2.0 * u1.ln()).sqrt() * u2.cos()
             })

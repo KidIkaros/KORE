@@ -136,7 +136,12 @@ impl Mamba {
                 // Inverse softplus: x + log(-expm1(-x)), clamped for numerical safety
                 let neg_expm1 = (-(-dt).exp_m1()).max(1e-20);
                 let inv_sp = dt + neg_expm1.ln();
-                if inv_sp.is_nan() || inv_sp.is_infinite() { dt } else { inv_sp }
+                if inv_sp.is_nan() || inv_sp.is_infinite() {
+                    debug_assert!(false, "inverse softplus produced NaN/Inf for dt={}", dt);
+                    dt
+                } else {
+                    inv_sp
+                }
             })
             .collect();
 

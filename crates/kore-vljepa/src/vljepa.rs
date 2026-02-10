@@ -219,8 +219,10 @@ fn embed_tokens(
             let src = tid * d_model;
             let dst = i * d_model;
             out[dst..dst + d_model].copy_from_slice(&embedding_table[src..src + d_model]);
+        } else {
+            debug_assert!(false, "embed_tokens: OOV token id {} >= vocab_size {}", tid, vocab_size);
+            // Out-of-vocab IDs get zero vectors in release builds
         }
-        // Out-of-vocab IDs silently get zero vectors (already initialized)
     }
     out
 }
