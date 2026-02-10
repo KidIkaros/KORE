@@ -154,6 +154,48 @@ impl Mamba3Predictor {
         l2_normalize(&projected, batch, self.config.embed_dim)
     }
 
+    /// Text-only forward pass — skips visual token projection entirely.
+    ///
+    /// # Arguments
+    /// - `query_embeds`: shape (batch * n_qry, query_embed_dim) — embedded query tokens
+    /// - `batch`: batch size
+    /// - `n_qry`: number of query tokens per sample
+    ///
+    /// # Returns
+    /// Predicted embedding: shape (batch, embed_dim), L2-normalized.
+    pub fn forward_text_only(
+        &mut self,
+        query_embeds: &[f32],
+        batch: usize,
+        n_qry: usize,
+    ) -> Vec<f32> {
+        let dm = self.config.d_model;
+
+        // Project query embeddings only: (batch * n_qry, query_embed_dim) → (batch * n_qry, d_model)
+        let qry_proj = self.query_proj.forward(query_embeds, batch * n_qry);
+
+        // Feed through Mamba-3 backbone (query tokens only, no visual tokens)
+        let hidden = self.forward_backbone(&qry_proj, batch, n_qry);
+
+        // Average pool → (batch, d_model)
+        let mut pooled = vec![0.0f32; batch * dm];
+        for b in 0..batch {
+            for pos in 0..n_qry {
+                for d in 0..dm {
+                    pooled[b * dm + d] += hidden[b * n_qry * dm + pos * dm + d];
+                }
+            }
+            let inv_len = 1.0 / n_qry as f32;
+            for d in 0..dm {
+                pooled[b * dm + d] *= inv_len;
+            }
+        }
+
+        // Prediction head → L2-normalize
+        let projected = self.pred_head.forward(&pooled, batch);
+        l2_normalize(&projected, batch, self.config.embed_dim)
+    }
+
     /// Run the Mamba-3 backbone layers directly on hidden states (bypassing embedding).
     fn forward_backbone(&mut self, hidden: &[f32], batch: usize, seq_len: usize) -> Vec<f32> {
         let n = batch * seq_len;

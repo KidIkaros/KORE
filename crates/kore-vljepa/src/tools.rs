@@ -87,18 +87,27 @@ impl fmt::Debug for dyn Tool {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Registry of available tools for the agent.
+///
+/// Tool selection uses cosine similarity between the query embedding
+/// and each tool's signature embedding. The signature is derived from
+/// the tool's `knowledge_dim` and description hash, producing a
+/// deterministic fingerprint that can be matched against query state.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    /// Cached signature embeddings per tool, shape (n_tools, max_dim).
+    signatures: Vec<Vec<f32>>,
 }
 
 impl ToolRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
-        Self { tools: Vec::new() }
+        Self { tools: Vec::new(), signatures: Vec::new() }
     }
 
-    /// Register a tool.
+    /// Register a tool. Computes and caches its signature embedding.
     pub fn register(&mut self, tool: Box<dyn Tool>) {
+        let sig = Self::compute_signature(&*tool);
+        self.signatures.push(sig);
         self.tools.push(tool);
     }
 
@@ -122,15 +131,65 @@ impl ToolRegistry {
         self.tools.is_empty()
     }
 
-    /// Select the best tool for a query based on cosine similarity
-    /// between the query embedding and each tool's name embedding.
+    /// Select the best tool for a query using cosine similarity.
     ///
-    /// This is a simple heuristic; in production you'd use the model's
-    /// own tool-selection head.
-    pub fn select_tool(&self, _query_embedding: &[f32]) -> Option<&dyn Tool> {
-        // For now, return the first tool. A real implementation would
-        // use a learned tool-selection head or cosine similarity.
-        self.tools.first().map(|t| &**t)
+    /// Compares the query embedding against each tool's cached signature
+    /// embedding and returns the tool with highest similarity.
+    pub fn select_tool(&self, query_embedding: &[f32]) -> Option<&dyn Tool> {
+        if self.tools.is_empty() {
+            return None;
+        }
+        if self.tools.len() == 1 {
+            return Some(&*self.tools[0]);
+        }
+
+        let mut best_sim = f32::NEG_INFINITY;
+        let mut best_idx = 0;
+
+        for (i, sig) in self.signatures.iter().enumerate() {
+            let sim = cosine_sim(query_embedding, sig);
+            if sim > best_sim {
+                best_sim = sim;
+                best_idx = i;
+            }
+        }
+
+        Some(&*self.tools[best_idx])
+    }
+
+    /// Compute a deterministic signature embedding for a tool.
+    ///
+    /// Uses a hash of the tool's name and description to seed a
+    /// pseudo-random embedding in the tool's knowledge_dim space.
+    /// This gives each tool a unique, stable fingerprint that the
+    /// query embedding can be compared against.
+    fn compute_signature(tool: &dyn Tool) -> Vec<f32> {
+        let dim = tool.knowledge_dim().max(1);
+        let mut sig = vec![0.0f32; dim];
+
+        // Simple deterministic hash → embedding
+        let name = tool.name();
+        let desc = tool.description();
+        let mut hash: u64 = 5381;
+        for b in name.bytes().chain(desc.bytes()) {
+            hash = hash.wrapping_mul(33).wrapping_add(b as u64);
+        }
+
+        for d in 0..dim {
+            // LCG-style deterministic pseudo-random from hash
+            hash = hash.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            sig[d] = ((hash >> 33) as f32 / (1u64 << 31) as f32) - 1.0;
+        }
+
+        // L2-normalize the signature
+        let norm: f32 = sig.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-12 {
+            for v in &mut sig {
+                *v /= norm;
+            }
+        }
+
+        sig
     }
 }
 

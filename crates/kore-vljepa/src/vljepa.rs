@@ -176,6 +176,48 @@ impl Mamba3Jepa {
         }
     }
 
+    /// Text-only inference — skips the ViT X-Encoder entirely.
+    ///
+    /// This is a fast-path for when the agent has no visual input.
+    /// Query tokens are embedded and fed directly to the Mamba-3 Predictor
+    /// without any visual token concatenation.
+    ///
+    /// # Arguments
+    /// - `query_tokens`: query token IDs, shape (n_qry,)
+    /// - `mode`: inference mode (embedding only or decode to text)
+    pub fn infer_text_only(
+        &mut self,
+        query_tokens: &[usize],
+        mode: InferenceMode,
+    ) -> InferenceOutput {
+        let batch = 1;
+        let n_qry = query_tokens.len();
+
+        // Embed query tokens (no ViT call)
+        let qry_dm = self.config.y_encoder.d_model;
+        let query_embeds = embed_tokens(
+            query_tokens,
+            &self.y_encoder.backbone.embedding,
+            qry_dm,
+            n_qry,
+        );
+
+        // Predictor text-only path (no visual tokens)
+        let predicted = self.predictor.forward_text_only(
+            &query_embeds,
+            batch,
+            n_qry,
+        );
+
+        match mode {
+            InferenceMode::Embedding => InferenceOutput::Embedding(predicted),
+            InferenceMode::Decode { max_tokens, bos_token } => {
+                let tokens = self.y_decoder.generate(&predicted, max_tokens, bos_token);
+                InferenceOutput::Tokens(tokens)
+            }
+        }
+    }
+
     /// Classify by comparing predicted embedding against candidate embeddings.
     ///
     /// # Arguments

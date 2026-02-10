@@ -7,6 +7,8 @@
 //! - **StateInjector**: h_new = h + W_inject · V_knowledge
 //! - **RecursionLayer**: assembles monitor + tool + injector
 
+use std::any::Any;
+
 use rand::Rng;
 
 use crate::config::RecursionConfig;
@@ -122,6 +124,7 @@ fn sigmoid(x: f32) -> f32 {
 /// (derived from the hidden state) and returns a compressed knowledge vector.
 ///
 /// The trait is object-safe for use with `Box<dyn MemoryTool>`.
+/// Supports safe downcasting via `as_any()` / `as_any_mut()`.
 pub trait MemoryTool: Send + Sync {
     /// Perform recursive search and return a knowledge vector.
     ///
@@ -132,6 +135,12 @@ pub trait MemoryTool: Send + Sync {
     /// # Returns
     /// Knowledge vector of shape (knowledge_dim,).
     fn recursive_search(&self, query: &[f32], depth: u8) -> Vec<f32>;
+
+    /// Downcast to `&dyn Any` for safe type-specific access.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Downcast to `&mut dyn Any` for safe mutable type-specific access.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -195,6 +204,9 @@ impl LocalMemoryTool {
 }
 
 impl MemoryTool for LocalMemoryTool {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
     fn recursive_search(&self, query: &[f32], depth: u8) -> Vec<f32> {
         if self.entries.is_empty() {
             return vec![0.0f32; self.knowledge_dim];
@@ -354,13 +366,12 @@ impl RecursionLayer {
         self.tool = tool;
     }
 
-    /// Get a mutable reference to the memory tool (for adding entries, etc.).
+    /// Get a mutable reference to the underlying tool as `LocalMemoryTool`.
     ///
-    /// Users should construct a `LocalMemoryTool`, populate it, and pass it
-    /// via `set_memory_tool()`. This placeholder returns `None` because
-    /// trait-object downcasting requires `Any` which conflicts with `Send + Sync`.
+    /// Returns `Some` if the current tool is a `LocalMemoryTool`, `None` otherwise.
+    /// Uses `Any`-based downcasting for safe type-specific access.
     pub fn local_memory_tool_mut(&mut self) -> Option<&mut LocalMemoryTool> {
-        None
+        self.tool.as_any_mut().downcast_mut::<LocalMemoryTool>()
     }
 
     /// Check hidden state for confusion, optionally delegate, inject result.
@@ -598,6 +609,29 @@ mod tests {
         assert_eq!(out.len(), hidden.len());
         // Knowledge was injected, so output should differ from input
         assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_local_memory_tool_mut_downcast() {
+        let config = RecursionConfig {
+            enabled: true,
+            knowledge_dim: 4,
+            confusion_threshold: 0.5,
+            confusion_dims: 4,
+            inject_after_layer: 0,
+            max_depth: 0,
+            smoothing: 0.5,
+        };
+        let mut layer = RecursionLayer::new(config, 4);
+
+        // Default tool is LocalMemoryTool, so downcast should succeed
+        let tool = layer.local_memory_tool_mut();
+        assert!(tool.is_some());
+
+        // Should be able to add entries via the downcast reference
+        let tool = tool.unwrap();
+        tool.add_entry(vec![1.0, 0.0, 0.0, 0.0], vec![2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(tool.len(), 1);
     }
 
     #[test]

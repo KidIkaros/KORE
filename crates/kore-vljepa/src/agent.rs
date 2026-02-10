@@ -289,15 +289,14 @@ impl Mamba3Agent {
     // ─── Internal methods ────────────────────────────────────────────
 
     /// Perceive: encode input through Mamba-JEPA.
+    ///
+    /// Uses the text-only fast-path when no image is provided,
+    /// skipping the ViT X-Encoder entirely to avoid unnecessary compute.
     fn perceive(&mut self, input: &AgentInput) -> (Vec<f32>, bool) {
-        // Extract config values before mutable borrow
         let embed_dim = self.model.config.shared_embed_dim;
-        let img_h = self.model.config.vit.image_size;
-        let img_w = self.model.config.vit.image_size;
-        let in_channels = self.model.config.vit.in_channels;
 
-        // If we have an image, do full vision-language inference
         if let Some(ref image) = input.image {
+            // Vision + text: full VLJEPA path (ViT → Predictor)
             let output = self.model.infer(
                 image,
                 &input.query_tokens,
@@ -310,16 +309,9 @@ impl Mamba3Agent {
                 _ => (vec![0.0f32; embed_dim], false),
             }
         } else {
-            // Text-only: use a blank image (zeros) with the default image size.
-            // The ViT will produce near-zero visual tokens, and the query tokens
-            // drive the predictor.
-            let blank_image = vec![0.0f32; in_channels * img_h * img_w];
-
-            let output = self.model.infer(
-                &blank_image,
+            // Text-only fast-path: skip ViT, feed query tokens directly to Predictor
+            let output = self.model.infer_text_only(
                 &input.query_tokens,
-                img_h,
-                img_w,
                 InferenceMode::Embedding,
             );
             match output {
