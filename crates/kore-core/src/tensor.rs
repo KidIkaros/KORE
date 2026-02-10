@@ -107,6 +107,33 @@ impl Tensor {
         Self::from_f32(&data, shape)
     }
 
+    /// Create a tensor with random values from standard normal distribution N(0,1).
+    pub fn randn(shape: &[usize]) -> Self {
+        use rand::Rng;
+        let s = Shape::new(shape);
+        let numel = s.numel();
+        let mut rng = rand::thread_rng();
+        // Box-Muller transform for normal distribution
+        let data: Vec<f32> = (0..numel)
+            .map(|_| {
+                let u1: f32 = rng.gen_range(1e-7f32..1.0f32);
+                let u2: f32 = rng.gen_range(0.0f32..std::f32::consts::TAU);
+                (-2.0 * u1.ln()).sqrt() * u2.cos()
+            })
+            .collect();
+        Self::from_f32(&data, shape)
+    }
+
+    /// Create a tensor with random values uniformly distributed in [low, high).
+    pub fn rand_uniform(shape: &[usize], low: f32, high: f32) -> Self {
+        use rand::Rng;
+        let s = Shape::new(shape);
+        let numel = s.numel();
+        let mut rng = rand::thread_rng();
+        let data: Vec<f32> = (0..numel).map(|_| rng.gen_range(low..high)).collect();
+        Self::from_f32(&data, shape)
+    }
+
     /// Create a 1-D tensor with values from `start` to `end` (exclusive), step 1.
     pub fn arange(start: f32, end: f32, step: f32) -> Self {
         let mut data = Vec::new();
