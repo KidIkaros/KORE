@@ -54,7 +54,8 @@ impl Embedding {
     /// Returns tensor of shape [ids.len(), embedding_dim].
     pub fn lookup(&self, ids: &[usize]) -> Tensor {
         let w = self.weight.contiguous();
-        let w_data = w.as_f32_slice().unwrap();
+        let w_data = w.as_f32_slice()
+            .expect("Embedding: weight tensor must be F32");
         let dim = self.embedding_dim;
 
         let mut result = vec![0.0f32; ids.len() * dim];

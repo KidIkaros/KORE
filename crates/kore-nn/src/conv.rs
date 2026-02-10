@@ -117,7 +117,9 @@ impl Module for Conv1d {
                     }
 
                     if let Some(ref bias) = self.bias {
-                        acc += bias.as_f32_slice().unwrap()[oc];
+                        let b_data = bias.as_f32_slice()
+                            .ok_or_else(|| kore_core::KoreError::UnsupportedDType(bias.dtype()))?;
+                        acc += b_data[oc];
                     }
 
                     output[b * self.out_channels * out_len + oc * out_len + ol] = acc;
@@ -267,9 +269,11 @@ impl Module for Conv2d {
         let in_h = dims[2];
         let in_w = dims[3];
         let (out_h, out_w) = self.output_size(in_h, in_w);
-        let x = data.as_f32_slice().unwrap();
+        let x = data.as_f32_slice()
+            .ok_or_else(|| kore_core::KoreError::UnsupportedDType(data.dtype()))?;
         let w = self.weight.contiguous();
-        let w_data = w.as_f32_slice().unwrap();
+        let w_data = w.as_f32_slice()
+            .ok_or_else(|| kore_core::KoreError::UnsupportedDType(self.weight.dtype()))?;
 
         let mut output = vec![0.0f32; batch * self.out_channels * out_h * out_w];
 
@@ -303,7 +307,9 @@ impl Module for Conv2d {
                         }
 
                         if let Some(ref bias) = self.bias {
-                            acc += bias.as_f32_slice().unwrap()[oc];
+                            let b_data = bias.as_f32_slice()
+                                .ok_or_else(|| kore_core::KoreError::UnsupportedDType(bias.dtype()))?;
+                            acc += b_data[oc];
                         }
 
                         let o_idx = b * self.out_channels * out_h * out_w

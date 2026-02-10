@@ -86,7 +86,8 @@ impl EquivariantLinear {
         let in_slice = in_data.as_f32_slice()
             .ok_or_else(|| KoreError::UnsupportedDType(input.data.dtype()))?;
         let w_data = self.weights.contiguous();
-        let w_slice = w_data.as_f32_slice().unwrap();
+        let w_slice = w_data.as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(self.weights.dtype()))?;
 
         let mut out = vec![0.0f32; batch * d];
 
@@ -131,7 +132,8 @@ impl EquivariantLinear {
 
         // Add bias (scalar multivector)
         if let Some(ref bias) = self.bias {
-            let b_slice = bias.as_f32_slice().unwrap();
+            let b_slice = bias.as_f32_slice()
+                .ok_or_else(|| KoreError::UnsupportedDType(bias.dtype()))?;
             for b in 0..batch {
                 for i in 0..d {
                     out[b * d + i] += b_slice[i];
@@ -217,7 +219,8 @@ impl GeometricMLP {
         let d = self.algebra.dim;
         let batch = input.batch_size();
         let data = input.data.contiguous();
-        let slice = data.as_f32_slice().unwrap();
+        let slice = data.as_f32_slice()
+            .expect("grade_activation: input must be F32");
 
         let mut out = vec![0.0f32; batch * d];
 
@@ -251,7 +254,8 @@ impl GeometricMLP {
         }
 
         let out_tensor = Tensor::from_f32(&out, &[batch, d]);
-        MultivectorTensor::from_tensor(&self.algebra, out_tensor).unwrap()
+        MultivectorTensor::from_tensor(&self.algebra, out_tensor)
+            .expect("grade_activation: output shape must match algebra dim")
     }
 
     /// Get all trainable parameters.
