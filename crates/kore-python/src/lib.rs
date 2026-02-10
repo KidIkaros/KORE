@@ -81,7 +81,8 @@ impl PyTensor {
             .ok_or_else(|| PyValueError::new_err("Cannot convert non-f32 tensor to numpy"))?;
         let shape: Vec<usize> = data.shape().dims().to_vec();
         let flat = PyArray1::from_vec_bound(py, slice.to_vec());
-        Ok(flat.reshape(shape).unwrap())
+        Ok(flat.reshape(shape)
+            .map_err(|e| PyValueError::new_err(format!("numpy reshape failed: {}", e)))?)
     }
 
     /// Element-wise addition.
