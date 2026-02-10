@@ -201,18 +201,26 @@ impl Mamba3Jepa {
 
 /// Look up token embeddings from an embedding table.
 /// Returns flat f32 of shape (n, d_model).
+///
+/// Token IDs that are out of range get zero embeddings (no panic).
 fn embed_tokens(
     token_ids: &[usize],
     embedding_table: &[f32],
     d_model: usize,
     n: usize,
 ) -> Vec<f32> {
+    assert!(n <= token_ids.len(),
+        "embed_tokens: n ({}) exceeds token_ids length ({})", n, token_ids.len());
+    let vocab_size = embedding_table.len() / d_model;
     let mut out = vec![0.0f32; n * d_model];
     for i in 0..n {
         let tid = token_ids[i];
-        let src = tid * d_model;
-        let dst = i * d_model;
-        out[dst..dst + d_model].copy_from_slice(&embedding_table[src..src + d_model]);
+        if tid < vocab_size {
+            let src = tid * d_model;
+            let dst = i * d_model;
+            out[dst..dst + d_model].copy_from_slice(&embedding_table[src..src + d_model]);
+        }
+        // Out-of-vocab IDs silently get zero vectors (already initialized)
     }
     out
 }

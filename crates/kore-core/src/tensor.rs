@@ -134,13 +134,26 @@ impl Tensor {
         Self::from_f32(&data, shape)
     }
 
-    /// Create a 1-D tensor with values from `start` to `end` (exclusive), step 1.
+    /// Create a 1-D tensor with values from `start` to `end` (exclusive).
+    ///
+    /// # Panics
+    /// Panics if `step` is zero or if `step` direction doesn't match `start`→`end`.
     pub fn arange(start: f32, end: f32, step: f32) -> Self {
+        assert!(step != 0.0, "arange: step must be non-zero");
+        assert!((end - start) * step > 0.0 || (end - start).abs() < f32::EPSILON,
+            "arange: step direction ({}) does not match start ({}) → end ({})", step, start, end);
         let mut data = Vec::new();
         let mut v = start;
-        while v < end {
-            data.push(v);
-            v += step;
+        if step > 0.0 {
+            while v < end {
+                data.push(v);
+                v += step;
+            }
+        } else {
+            while v > end {
+                data.push(v);
+                v += step;
+            }
         }
         let len = data.len();
         Self::from_f32(&data, &[len])
