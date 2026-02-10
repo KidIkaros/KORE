@@ -32,6 +32,8 @@ impl RMSNormGated {
     /// - `norm_before_gate`: if true, norm then gate; if false, gate then norm
     /// - `group_size`: group size for normalization (usually d / ngroups)
     pub fn new(d: usize, eps: f32, norm_before_gate: bool, group_size: usize) -> Self {
+        assert!(group_size > 0, "RMSNormGated: group_size must be > 0");
+        assert!(d % group_size == 0, "RMSNormGated: d ({}) must be divisible by group_size ({})", d, group_size);
         Self {
             weight: vec![1.0f32; d],
             eps,

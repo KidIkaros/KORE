@@ -226,7 +226,13 @@ fn sample_token(logits: &[f32], _context: &[usize], config: &SamplerConfig) -> u
     let max_val = scaled.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exps: Vec<f32> = scaled.iter().map(|&x| (x - max_val).exp()).collect();
     let sum: f32 = exps.iter().sum();
-    let probs: Vec<f32> = exps.iter().map(|&x| x / sum).collect();
+    let probs: Vec<f32> = if sum > 0.0 {
+        exps.iter().map(|&x| x / sum).collect()
+    } else {
+        // Fallback: uniform distribution if all exps underflowed to 0
+        let uniform = 1.0 / exps.len() as f32;
+        vec![uniform; exps.len()]
+    };
 
     // Top-k filtering
     let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();

@@ -88,6 +88,7 @@ pub fn causal_conv1d_update(
     bias: Option<&[f32]>,
     activation: bool,
 ) -> Vec<f32> {
+    assert!(kernel_size > 0, "causal_conv1d_update: kernel_size must be > 0");
     let mut output = vec![0.0f32; batch * channels];
 
     for b in 0..batch {

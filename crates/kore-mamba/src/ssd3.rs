@@ -29,6 +29,7 @@ fn softplus(x: f32) -> f32 {
 /// `theta`: rotation angle (derived from imaginary part of A and dt)
 #[inline]
 fn apply_rope_inplace(v: &mut [f32], theta: f32) {
+    debug_assert!(v.len() % 2 == 0, "apply_rope_inplace: vector length must be even, got {}", v.len());
     let cos_t = theta.cos();
     let sin_t = theta.sin();
     let pairs = v.len() / 2;
