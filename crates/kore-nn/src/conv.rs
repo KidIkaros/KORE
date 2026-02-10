@@ -64,8 +64,15 @@ impl Conv1d {
     }
 
     /// Compute output length.
-    pub fn output_length(&self, input_length: usize) -> usize {
-        (input_length + 2 * self.padding - self.kernel_size) / self.stride + 1
+    pub fn output_length(&self, input_length: usize) -> kore_core::Result<usize> {
+        let padded = input_length + 2 * self.padding;
+        if padded < self.kernel_size {
+            return Err(kore_core::KoreError::ShapeMismatch {
+                expected: vec![self.kernel_size],
+                got: vec![padded],
+            });
+        }
+        Ok((padded - self.kernel_size) / self.stride + 1)
     }
 }
 
@@ -83,10 +90,12 @@ impl Module for Conv1d {
         let batch = dims[0];
         let _in_ch = dims[1];
         let in_len = dims[2];
-        let out_len = self.output_length(in_len);
-        let x = data.as_f32_slice().unwrap();
+        let out_len = self.output_length(in_len)?;
+        let x = data.as_f32_slice()
+            .ok_or_else(|| kore_core::KoreError::UnsupportedDType(data.dtype()))?;
         let w = self.weight.contiguous();
-        let w_data = w.as_f32_slice().unwrap();
+        let w_data = w.as_f32_slice()
+            .ok_or_else(|| kore_core::KoreError::UnsupportedDType(self.weight.dtype()))?;
 
         let mut output = vec![0.0f32; batch * self.out_channels * out_len];
 
@@ -247,10 +256,18 @@ impl Conv2d {
     }
 
     /// Compute output dimensions.
-    pub fn output_size(&self, in_h: usize, in_w: usize) -> (usize, usize) {
-        let out_h = (in_h + 2 * self.padding - self.kernel_h) / self.stride + 1;
-        let out_w = (in_w + 2 * self.padding - self.kernel_w) / self.stride + 1;
-        (out_h, out_w)
+    pub fn output_size(&self, in_h: usize, in_w: usize) -> kore_core::Result<(usize, usize)> {
+        let padded_h = in_h + 2 * self.padding;
+        let padded_w = in_w + 2 * self.padding;
+        if padded_h < self.kernel_h || padded_w < self.kernel_w {
+            return Err(kore_core::KoreError::ShapeMismatch {
+                expected: vec![self.kernel_h, self.kernel_w],
+                got: vec![padded_h, padded_w],
+            });
+        }
+        let out_h = (padded_h - self.kernel_h) / self.stride + 1;
+        let out_w = (padded_w - self.kernel_w) / self.stride + 1;
+        Ok((out_h, out_w))
     }
 }
 
@@ -268,7 +285,7 @@ impl Module for Conv2d {
         let batch = dims[0];
         let in_h = dims[2];
         let in_w = dims[3];
-        let (out_h, out_w) = self.output_size(in_h, in_w);
+        let (out_h, out_w) = self.output_size(in_h, in_w)?;
         let x = data.as_f32_slice()
             .ok_or_else(|| kore_core::KoreError::UnsupportedDType(data.dtype()))?;
         let w = self.weight.contiguous();

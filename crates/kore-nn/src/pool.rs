@@ -29,10 +29,18 @@ impl MaxPool2d {
     }
 
     /// Compute output dimensions.
-    pub fn output_size(&self, in_h: usize, in_w: usize) -> (usize, usize) {
-        let out_h = (in_h + 2 * self.padding - self.kernel_size) / self.stride + 1;
-        let out_w = (in_w + 2 * self.padding - self.kernel_size) / self.stride + 1;
-        (out_h, out_w)
+    pub fn output_size(&self, in_h: usize, in_w: usize) -> kore_core::Result<(usize, usize)> {
+        let padded_h = in_h + 2 * self.padding;
+        let padded_w = in_w + 2 * self.padding;
+        if padded_h < self.kernel_size || padded_w < self.kernel_size {
+            return Err(KoreError::ShapeMismatch {
+                expected: vec![self.kernel_size, self.kernel_size],
+                got: vec![padded_h, padded_w],
+            });
+        }
+        let out_h = (padded_h - self.kernel_size) / self.stride + 1;
+        let out_w = (padded_w - self.kernel_size) / self.stride + 1;
+        Ok((out_h, out_w))
     }
 }
 
@@ -51,8 +59,9 @@ impl Module for MaxPool2d {
         let channels = dims[1];
         let in_h = dims[2];
         let in_w = dims[3];
-        let (out_h, out_w) = self.output_size(in_h, in_w);
-        let x = data.as_f32_slice().unwrap();
+        let (out_h, out_w) = self.output_size(in_h, in_w)?;
+        let x = data.as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(data.dtype()))?;
 
         let mut output = vec![f32::NEG_INFINITY; batch * channels * out_h * out_w];
 
@@ -118,10 +127,18 @@ impl AvgPool2d {
     }
 
     /// Compute output dimensions.
-    pub fn output_size(&self, in_h: usize, in_w: usize) -> (usize, usize) {
-        let out_h = (in_h + 2 * self.padding - self.kernel_size) / self.stride + 1;
-        let out_w = (in_w + 2 * self.padding - self.kernel_size) / self.stride + 1;
-        (out_h, out_w)
+    pub fn output_size(&self, in_h: usize, in_w: usize) -> kore_core::Result<(usize, usize)> {
+        let padded_h = in_h + 2 * self.padding;
+        let padded_w = in_w + 2 * self.padding;
+        if padded_h < self.kernel_size || padded_w < self.kernel_size {
+            return Err(KoreError::ShapeMismatch {
+                expected: vec![self.kernel_size, self.kernel_size],
+                got: vec![padded_h, padded_w],
+            });
+        }
+        let out_h = (padded_h - self.kernel_size) / self.stride + 1;
+        let out_w = (padded_w - self.kernel_size) / self.stride + 1;
+        Ok((out_h, out_w))
     }
 }
 
@@ -140,8 +157,9 @@ impl Module for AvgPool2d {
         let channels = dims[1];
         let in_h = dims[2];
         let in_w = dims[3];
-        let (out_h, out_w) = self.output_size(in_h, in_w);
-        let x = data.as_f32_slice().unwrap();
+        let (out_h, out_w) = self.output_size(in_h, in_w)?;
+        let x = data.as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(data.dtype()))?;
 
         let mut output = vec![0.0f32; batch * channels * out_h * out_w];
 
@@ -226,7 +244,8 @@ impl Module for AdaptiveAvgPool2d {
         let channels = dims[1];
         let in_h = dims[2];
         let in_w = dims[3];
-        let x = data.as_f32_slice().unwrap();
+        let x = data.as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(data.dtype()))?;
 
         let mut output = vec![0.0f32; batch * channels * self.output_h * self.output_w];
 
