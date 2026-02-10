@@ -255,6 +255,21 @@ impl Conv2d {
         }
     }
 
+    /// Input channels.
+    pub fn in_channels(&self) -> usize { self.in_channels }
+
+    /// Output channels.
+    pub fn out_channels(&self) -> usize { self.out_channels }
+
+    /// Kernel size (square kernels return kernel_h).
+    pub fn kernel_size(&self) -> usize { self.kernel_h }
+
+    /// Stride.
+    pub fn stride(&self) -> usize { self.stride }
+
+    /// Padding.
+    pub fn padding(&self) -> usize { self.padding }
+
     /// Compute output dimensions.
     pub fn output_size(&self, in_h: usize, in_w: usize) -> kore_core::Result<(usize, usize)> {
         let padded_h = in_h + 2 * self.padding;

@@ -63,6 +63,11 @@ impl Linear {
     pub fn out_features(&self) -> usize {
         self.weight.shape().dims()[0]
     }
+
+    /// Whether this layer has a bias term.
+    pub fn has_bias(&self) -> bool {
+        self.bias.is_some()
+    }
 }
 
 impl Module for Linear {

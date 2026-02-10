@@ -28,6 +28,21 @@ impl Adam {
         }
     }
 
+    /// Learning rate.
+    pub fn lr(&self) -> f32 { self.lr }
+
+    /// First moment decay rate.
+    pub fn beta1(&self) -> f32 { self.beta1 }
+
+    /// Second moment decay rate.
+    pub fn beta2(&self) -> f32 { self.beta2 }
+
+    /// Epsilon for numerical stability.
+    pub fn eps(&self) -> f32 { self.eps }
+
+    /// Weight decay coefficient.
+    pub fn weight_decay(&self) -> f32 { self.weight_decay }
+
     /// Create with default hyperparameters (lr=1e-3, betas=(0.9, 0.999), eps=1e-8).
     pub fn default_with_lr(lr: f32) -> Self {
         Self::new(lr, 0.9, 0.999, 1e-8, 0.0)

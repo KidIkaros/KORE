@@ -27,6 +27,10 @@ impl Dropout {
         self.seed = seed;
     }
 
+    /// Drop probability.
+    pub fn p(&self) -> f32 {
+        self.p
+    }
 }
 
 impl Module for Dropout {

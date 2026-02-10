@@ -317,6 +317,11 @@ impl PyLinear {
             .map(|t| PyTensor { inner: t.clone() })
             .collect()
     }
+
+    fn __repr__(&self) -> String {
+        format!("Linear(in_features={}, out_features={}, bias={})",
+            self.inner.in_features(), self.inner.out_features(), self.inner.has_bias())
+    }
 }
 
 #[pyclass(name = "LayerNorm")]
@@ -349,6 +354,11 @@ impl PyLayerNorm {
             .into_iter()
             .map(|t| PyTensor { inner: t.clone() })
             .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("LayerNorm(normalized_shape={}, eps={})",
+            self.inner.normalized_shape(), self.inner.eps())
     }
 }
 
@@ -385,6 +395,11 @@ impl PyEmbedding {
             .into_iter()
             .map(|t| PyTensor { inner: t.clone() })
             .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Embedding(num_embeddings={}, embedding_dim={})",
+            self.inner.num_embeddings(), self.inner.embedding_dim())
     }
 }
 
@@ -535,6 +550,10 @@ impl PyDropout {
     fn eval(&mut self) {
         kore_nn::Module::train(&mut self.inner, false);
     }
+
+    fn __repr__(&self) -> String {
+        format!("Dropout(p={})", self.inner.p())
+    }
 }
 
 #[pyclass(name = "Conv2d")]
@@ -568,6 +587,12 @@ impl PyConv2d {
             .map(|t| PyTensor { inner: t.clone() })
             .collect()
     }
+
+    fn __repr__(&self) -> String {
+        format!("Conv2d(in_channels={}, out_channels={}, kernel_size={}, stride={}, padding={})",
+            self.inner.in_channels(), self.inner.out_channels(),
+            self.inner.kernel_size(), self.inner.stride(), self.inner.padding())
+    }
 }
 
 #[pyclass(name = "MaxPool2d")]
@@ -593,6 +618,11 @@ impl PyMaxPool2d {
 
     fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
         self.forward(input)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("MaxPool2d(kernel_size={}, stride={}, padding={})",
+            self.inner.kernel_size(), self.inner.stride(), self.inner.padding())
     }
 }
 
@@ -620,6 +650,11 @@ impl PyAvgPool2d {
     fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
         self.forward(input)
     }
+
+    fn __repr__(&self) -> String {
+        format!("AvgPool2d(kernel_size={}, stride={}, padding={})",
+            self.inner.kernel_size(), self.inner.stride(), self.inner.padding())
+    }
 }
 
 #[pyclass(name = "AdaptiveAvgPool2d")]
@@ -645,6 +680,11 @@ impl PyAdaptiveAvgPool2d {
 
     fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
         self.forward(input)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("AdaptiveAvgPool2d(output_size=({}, {}))",
+            self.inner.output_h(), self.inner.output_w())
     }
 }
 
@@ -691,6 +731,12 @@ impl PyAdam {
         }
         Ok(())
     }
+
+    fn __repr__(&self) -> String {
+        format!("Adam(lr={}, betas=({}, {}), eps={}, weight_decay={})",
+            self.inner.lr(), self.inner.beta1(), self.inner.beta2(),
+            self.inner.eps(), self.inner.weight_decay())
+    }
 }
 
 #[pyclass(name = "SGD")]
@@ -725,6 +771,11 @@ impl PySGD {
             t.inner = p.remove(0);
         }
         Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("SGD(lr={}, momentum={}, weight_decay={})",
+            self.inner.lr(), self.inner.momentum(), self.inner.weight_decay())
     }
 }
 

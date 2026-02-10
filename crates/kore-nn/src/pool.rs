@@ -28,6 +28,15 @@ impl MaxPool2d {
         Self::new(kernel_size, kernel_size, 0)
     }
 
+    /// Kernel size.
+    pub fn kernel_size(&self) -> usize { self.kernel_size }
+
+    /// Stride.
+    pub fn stride(&self) -> usize { self.stride }
+
+    /// Padding.
+    pub fn padding(&self) -> usize { self.padding }
+
     /// Compute output dimensions.
     pub fn output_size(&self, in_h: usize, in_w: usize) -> kore_core::Result<(usize, usize)> {
         let padded_h = in_h + 2 * self.padding;
@@ -125,6 +134,15 @@ impl AvgPool2d {
     pub fn simple(kernel_size: usize) -> Self {
         Self::new(kernel_size, kernel_size, 0)
     }
+
+    /// Kernel size.
+    pub fn kernel_size(&self) -> usize { self.kernel_size }
+
+    /// Stride.
+    pub fn stride(&self) -> usize { self.stride }
+
+    /// Padding.
+    pub fn padding(&self) -> usize { self.padding }
 
     /// Compute output dimensions.
     pub fn output_size(&self, in_h: usize, in_w: usize) -> kore_core::Result<(usize, usize)> {
@@ -227,6 +245,12 @@ impl AdaptiveAvgPool2d {
     pub fn global() -> Self {
         Self::new(1, 1)
     }
+
+    /// Target output height.
+    pub fn output_h(&self) -> usize { self.output_h }
+
+    /// Target output width.
+    pub fn output_w(&self) -> usize { self.output_w }
 }
 
 impl Module for AdaptiveAvgPool2d {

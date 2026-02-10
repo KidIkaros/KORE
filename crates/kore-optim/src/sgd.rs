@@ -20,6 +20,15 @@ impl SGD {
         }
     }
 
+    /// Learning rate.
+    pub fn lr(&self) -> f32 { self.lr }
+
+    /// Momentum coefficient.
+    pub fn momentum(&self) -> f32 { self.momentum }
+
+    /// Weight decay coefficient.
+    pub fn weight_decay(&self) -> f32 { self.weight_decay }
+
     /// Perform one optimization step.
     ///
     /// `params` and `grads` must be the same length and correspond 1:1.

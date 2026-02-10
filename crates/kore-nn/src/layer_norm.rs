@@ -45,6 +45,16 @@ impl LayerNorm {
     pub fn beta(&self) -> &Tensor {
         &self.beta
     }
+
+    /// Normalized shape dimension.
+    pub fn normalized_shape(&self) -> usize {
+        self.normalized_shape
+    }
+
+    /// Epsilon value.
+    pub fn eps(&self) -> f32 {
+        self.eps
+    }
 }
 
 impl Module for LayerNorm {
