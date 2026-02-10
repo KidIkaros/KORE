@@ -94,4 +94,6 @@ loaded = kore.load_state_dict("model.safetensors")
 
 ## License
 
-MIT
+Apache License 2.0 — see [LICENSE](LICENSE) for details.
+
+Copyright 2025 Ikaros Digital LLC
