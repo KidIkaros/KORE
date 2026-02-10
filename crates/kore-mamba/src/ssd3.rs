@@ -29,7 +29,7 @@ fn softplus(x: f32) -> f32 {
 /// `theta`: rotation angle (derived from imaginary part of A and dt)
 #[inline]
 fn apply_rope_inplace(v: &mut [f32], theta: f32) {
-    debug_assert!(v.len() % 2 == 0, "apply_rope_inplace: vector length must be even, got {}", v.len());
+    assert!(v.len() % 2 == 0, "apply_rope_inplace: vector length must be even, got {}", v.len());
     let cos_t = theta.cos();
     let sin_t = theta.sin();
     let pairs = v.len() / 2;
@@ -103,6 +103,8 @@ pub fn mamba3_scan_combined(
     alpha: f32,
     use_rope: bool,
 ) -> Mamba3ScanOutput {
+    assert!(ngroups > 0, "mamba3_scan_combined: ngroups must be > 0");
+    assert!(nheads % ngroups == 0, "mamba3_scan_combined: nheads ({}) must be divisible by ngroups ({})", nheads, ngroups);
     let heads_per_group = nheads / ngroups;
     let mut output = vec![0.0f32; batch * seq_len * nheads * headdim];
     // State: (batch, nheads, d_state, headdim)
@@ -264,6 +266,8 @@ pub fn mamba3_ssm_step(
     alpha: f32,
     use_rope: bool,
 ) -> Vec<f32> {
+    assert!(ngroups > 0, "mamba3_ssm_step: ngroups must be > 0");
+    assert!(nheads % ngroups == 0, "mamba3_ssm_step: nheads ({}) must be divisible by ngroups ({})", nheads, ngroups);
     let heads_per_group = nheads / ngroups;
     let mut output = vec![0.0f32; batch * nheads * headdim];
 

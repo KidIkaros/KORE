@@ -139,9 +139,15 @@ impl MambaLMHeadModel {
         max_new_tokens: usize,
         sampler: &SamplerConfig,
     ) -> Vec<usize> {
+        assert!(!prompt.is_empty(), "generate: prompt must not be empty");
         let batch = 1;
         let v = self.backbone.vocab_size;
         let mut tokens = prompt.to_vec();
+
+        if max_new_tokens == 0 {
+            return tokens;
+        }
+
         let mut inference_params = InferenceParams::new();
 
         // Prefill: process entire prompt
@@ -149,6 +155,10 @@ impl MambaLMHeadModel {
         let last_logits = &logits[(tokens.len() - 1) * v..tokens.len() * v];
         let next = sample_token(last_logits, &tokens, sampler);
         tokens.push(next);
+
+        if max_new_tokens == 1 {
+            return tokens;
+        }
 
         // Advance offset so decode path is used
         inference_params.advance(prompt.len());
