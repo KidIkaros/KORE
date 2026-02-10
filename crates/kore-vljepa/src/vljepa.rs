@@ -50,9 +50,10 @@ impl Mamba3Jepa {
     /// Build a new Mamba3-JEPA model from config with random weights.
     pub fn new(config: Mamba3JepaConfig) -> Self {
         let x_encoder = VisionEncoder::new(config.vit.clone());
-        let predictor = Mamba3Predictor::new_with_recursion(
+        let predictor = Mamba3Predictor::new_with_features(
             config.predictor.clone(),
             config.recursion.clone(),
+            config.angn.clone(),
         );
         let y_encoder = Mamba3TextEncoder::new(config.y_encoder.clone());
         let y_decoder = Mamba3Decoder::new(config.y_decoder.clone());

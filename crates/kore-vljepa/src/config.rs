@@ -408,6 +408,8 @@ pub struct Mamba3JepaConfig {
     pub shared_embed_dim: usize,
     /// Recursion layer config (disabled by default).
     pub recursion: RecursionConfig,
+    /// Adaptive Neural Gating Network config (disabled by default).
+    pub angn: super::angn::ANGNConfig,
 }
 
 impl Mamba3JepaConfig {
@@ -420,6 +422,7 @@ impl Mamba3JepaConfig {
             y_decoder: Mamba3DecoderConfig::small(),
             shared_embed_dim: 1536,
             recursion: RecursionConfig::default(),
+            angn: super::angn::ANGNConfig::default(),
         }
     }
 
@@ -432,6 +435,7 @@ impl Mamba3JepaConfig {
             y_decoder: Mamba3DecoderConfig::tiny(),
             shared_embed_dim: 32,
             recursion: RecursionConfig::default(),
+            angn: super::angn::ANGNConfig::default(),
         }
     }
 }

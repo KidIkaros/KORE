@@ -38,6 +38,7 @@ pub mod y_decoder;
 pub mod vljepa;
 pub mod selective_decode;
 pub mod recursion;
+pub mod angn;
 pub mod tools;
 pub mod agent;
 pub mod loader;
@@ -61,6 +62,7 @@ pub use loader::{load_safetensors, load_vit_weights, LoadError};
 pub use recursion::{
     RecursionLayer, ConfusionMonitor, MemoryTool, LocalMemoryTool, StateInjector,
 };
+pub use angn::{AdaptiveNeuralGate, ANGNConfig};
 pub use config::AgentConfig;
 pub use tools::{Tool, ToolRegistry, ToolRequest, ToolResult, MemorySearchTool, EchoTool};
 pub use agent::{Mamba3Agent, AgentInput, AgentOutput, ToolCallRecord};

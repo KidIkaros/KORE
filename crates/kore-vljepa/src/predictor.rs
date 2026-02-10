@@ -8,6 +8,7 @@ use rand::Rng;
 
 use kore_mamba::MixerModel;
 
+use crate::angn::{AdaptiveNeuralGate, ANGNConfig};
 use crate::config::{Mamba3PredictorConfig, RecursionConfig};
 use crate::recursion::RecursionLayer;
 
@@ -64,6 +65,8 @@ pub struct Mamba3Predictor {
     pred_head: Linear,
     /// Optional recursion layer for State-Space Delegation.
     pub recursion: Option<RecursionLayer>,
+    /// Optional Adaptive Neural Gating Network for input filtering.
+    pub angn: Option<AdaptiveNeuralGate>,
 }
 
 impl Mamba3Predictor {
@@ -77,7 +80,7 @@ impl Mamba3Predictor {
 
         let pred_head = Linear::new(config.d_model, config.embed_dim);
 
-        Self { config, vision_proj, query_proj, backbone_layers, pred_head, recursion: None }
+        Self { config, vision_proj, query_proj, backbone_layers, pred_head, recursion: None, angn: None }
     }
 
     /// Build a predictor with recursion layer enabled.
@@ -99,6 +102,40 @@ impl Mamba3Predictor {
             }
             predictor.recursion = Some(RecursionLayer::new(rec_config, config.d_model));
         }
+        predictor
+    }
+
+    /// Build a predictor with both recursion and ANGN.
+    ///
+    /// This is the full-featured constructor. Both subsystems are optional
+    /// (controlled by their `enabled` flags).
+    pub fn new_with_features(
+        config: Mamba3PredictorConfig,
+        mut rec_config: RecursionConfig,
+        angn_config: ANGNConfig,
+    ) -> Self {
+        let mut predictor = Self::new(config.clone());
+        let n_layers = predictor.backbone_layers.layers.len();
+
+        // Wire recursion
+        if rec_config.enabled {
+            if n_layers > 0 && rec_config.inject_after_layer >= n_layers {
+                let clamped = n_layers - 1;
+                debug_assert!(
+                    false,
+                    "inject_after_layer ({}) >= n_layers ({}), clamping to {}",
+                    rec_config.inject_after_layer, n_layers, clamped,
+                );
+                rec_config.inject_after_layer = clamped;
+            }
+            predictor.recursion = Some(RecursionLayer::new(rec_config, config.d_model));
+        }
+
+        // Wire ANGN
+        if angn_config.enabled {
+            predictor.angn = Some(AdaptiveNeuralGate::new(angn_config, n_layers));
+        }
+
         predictor
     }
 
@@ -210,6 +247,13 @@ impl Mamba3Predictor {
     }
 
     /// Run the Mamba-3 backbone layers directly on hidden states (bypassing embedding).
+    ///
+    /// Pipeline per layer:
+    /// 1. ANGN gate (multiplicative filter — removes noise before SSM update)
+    /// 2. Pre-norm (RMSNorm)
+    /// 3. Mamba-3 mixer (SSM state update)
+    /// 4. Residual connection
+    /// 5. Recursion injection (if configured for this layer)
     fn forward_backbone(&mut self, hidden: &[f32], batch: usize, seq_len: usize) -> Vec<f32> {
         let n = batch * seq_len;
         let dm = self.config.d_model;
@@ -217,16 +261,21 @@ impl Mamba3Predictor {
         let mut h = hidden.to_vec();
 
         for i in 0..n_layers {
-            // Pre-norm
+            // 1) ANGN gate: multiplicative filtering before SSM update
+            if let Some(ref mut angn) = self.angn {
+                h = angn.gate_layer(&h, i, n);
+            }
+
+            // 2) Pre-norm
             let normed = self.backbone_layers.norms[i].forward(&h, n);
-            // Mixer
+            // 3) Mixer
             let mixed = self.backbone_layers.layers[i].forward_train(&normed, batch, seq_len);
-            // Residual
+            // 4) Residual
             for j in 0..h.len() {
                 h[j] += mixed[j];
             }
 
-            // Recursion injection point: after the configured layer
+            // 5) Recursion injection point: after the configured layer
             if let Some(ref mut recursion) = self.recursion {
                 if i == recursion.config.inject_after_layer {
                     let (h_new, _delegated, _score) =
