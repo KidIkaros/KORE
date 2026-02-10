@@ -273,6 +273,131 @@ impl Mamba3DecoderConfig {
     }
 }
 
+/// Recursion layer (State-Space Delegation) configuration.
+///
+/// When enabled, a learned confusion probe monitors the predictor's hidden state.
+/// If confusion exceeds the threshold, the model delegates to an external memory
+/// tool, then injects the resulting knowledge vector back into the residual stream:
+///   h_new = h + W_inject · V_knowledge
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecursionConfig {
+    /// Whether the recursion layer is active.
+    pub enabled: bool,
+    /// Dimensionality of knowledge vectors returned by the memory tool.
+    pub knowledge_dim: usize,
+    /// Confusion score threshold to trigger delegation.
+    pub confusion_threshold: f32,
+    /// Number of hidden-state dimensions the confusion probe reads.
+    pub confusion_dims: usize,
+    /// Inject knowledge after this backbone layer index (0-based).
+    pub inject_after_layer: usize,
+    /// Maximum recursive search depth passed to the memory tool.
+    pub max_depth: u8,
+    /// EMA smoothing factor for the confusion signal (0..1).
+    pub smoothing: f32,
+}
+
+impl Default for RecursionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            knowledge_dim: 64,
+            confusion_threshold: 0.5,
+            confusion_dims: 64,
+            inject_after_layer: 0,
+            max_depth: 2,
+            smoothing: 0.3,
+        }
+    }
+}
+
+impl RecursionConfig {
+    /// Tiny preset for unit tests (enabled).
+    pub fn tiny() -> Self {
+        Self {
+            enabled: true,
+            knowledge_dim: 16,
+            confusion_threshold: 0.3,
+            confusion_dims: 16,
+            inject_after_layer: 0,
+            max_depth: 1,
+            smoothing: 0.5,
+        }
+    }
+
+    /// Small preset for production (enabled).
+    pub fn small() -> Self {
+        Self {
+            enabled: true,
+            knowledge_dim: 256,
+            confusion_threshold: 0.5,
+            confusion_dims: 256,
+            inject_after_layer: 5,
+            max_depth: 3,
+            smoothing: 0.3,
+        }
+    }
+}
+
+/// Agent configuration for the SSD (State-Space Delegation) loop.
+///
+/// Controls the full agent perception → delegation → action cycle:
+/// 1. Perceive: encode visual/text input via Mamba-JEPA
+/// 2. Monitor: check confusion probe on hidden state
+/// 3. Delegate: if confused, call tools for external knowledge
+/// 4. Inject: blend knowledge back into state
+/// 5. Act: decode response or emit tool call
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Maximum tool calls per single `step()` invocation.
+    pub max_tool_calls_per_step: usize,
+    /// Maximum tokens to generate per response.
+    pub max_response_tokens: usize,
+    /// BOS token ID for the decoder.
+    pub bos_token: usize,
+    /// EOS token ID — generation stops if this token is produced.
+    pub eos_token: usize,
+    /// Whether to use selective decoding (only decode on state drift).
+    pub selective_decoding: bool,
+    /// Selective decode config (used if selective_decoding is true).
+    pub selective_decode: super::selective_decode::SelectiveDecodeConfig,
+    /// Temperature for InfoNCE during online learning (0 = no online learning).
+    pub online_learning_temperature: f32,
+    /// Whether to persist state across step() calls (true = never reset Mamba state).
+    pub persistent_state: bool,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_tool_calls_per_step: 5,
+            max_response_tokens: 64,
+            bos_token: 0,
+            eos_token: 1,
+            selective_decoding: false,
+            selective_decode: super::selective_decode::SelectiveDecodeConfig::default(),
+            online_learning_temperature: 0.0,
+            persistent_state: true,
+        }
+    }
+}
+
+impl AgentConfig {
+    /// Tiny preset for unit tests.
+    pub fn tiny() -> Self {
+        Self {
+            max_tool_calls_per_step: 3,
+            max_response_tokens: 16,
+            bos_token: 0,
+            eos_token: 1,
+            selective_decoding: false,
+            selective_decode: super::selective_decode::SelectiveDecodeConfig::default(),
+            online_learning_temperature: 0.0,
+            persistent_state: true,
+        }
+    }
+}
+
 /// Top-level Mamba3-JEPA configuration.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mamba3JepaConfig {
@@ -281,6 +406,8 @@ pub struct Mamba3JepaConfig {
     pub y_encoder: Mamba3TextEncoderConfig,
     pub y_decoder: Mamba3DecoderConfig,
     pub shared_embed_dim: usize,
+    /// Recursion layer config (disabled by default).
+    pub recursion: RecursionConfig,
 }
 
 impl Mamba3JepaConfig {
@@ -292,6 +419,7 @@ impl Mamba3JepaConfig {
             y_encoder: Mamba3TextEncoderConfig::small(),
             y_decoder: Mamba3DecoderConfig::small(),
             shared_embed_dim: 1536,
+            recursion: RecursionConfig::default(),
         }
     }
 
@@ -303,6 +431,7 @@ impl Mamba3JepaConfig {
             y_encoder: Mamba3TextEncoderConfig::tiny(),
             y_decoder: Mamba3DecoderConfig::tiny(),
             shared_embed_dim: 32,
+            recursion: RecursionConfig::default(),
         }
     }
 }

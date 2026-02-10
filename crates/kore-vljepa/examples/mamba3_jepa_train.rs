@@ -39,6 +39,7 @@ use kore_vljepa::{
     Mamba3Jepa, Mamba3JepaConfig, TrainOutput,
     InferenceMode, InferenceOutput,
     SelectiveDecoder, SelectiveDecodeConfig,
+    RecursionConfig, LocalMemoryTool,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -160,7 +161,7 @@ fn main() {
     // ── 2. Build Model ─────────────────────────────────────────────────────
 
     let t0 = Instant::now();
-    let model = Mamba3Jepa::new(config.clone());
+    let mut model = Mamba3Jepa::new(config.clone());
     println!("Model built in {:.1}ms", t0.elapsed().as_secs_f64() * 1000.0);
     println!();
 
@@ -404,7 +405,67 @@ fn main() {
     }
     println!();
 
-    // ── 8. Training Summary ────────────────────────────────────────────────
+    // ── 8. Recursion Layer Demo (State-Space Delegation) ─────────────────
+    //
+    // The recursion layer monitors the predictor's hidden state for "confusion"
+    // via a learned probe. When confusion exceeds a threshold, it delegates to
+    // an external memory tool (here: a local vector store), retrieves compressed
+    // knowledge, and injects it back into the residual stream:
+    //   h_new = h + W_inject · V_knowledge
+
+    println!("── Recursion Layer (State-Space Delegation) ──");
+
+    // Build a model with recursion enabled
+    let mut rec_config = config.clone();
+    rec_config.recursion = RecursionConfig {
+        enabled: true,
+        knowledge_dim: config.shared_embed_dim, // match embed dim for demo
+        confusion_threshold: 0.0,               // always trigger for demo
+        confusion_dims: config.predictor.d_model.min(16),
+        inject_after_layer: 0,                  // inject after first layer
+        max_depth: 1,
+        smoothing: 1.0,                         // instant response
+    };
+
+    let mut rec_model = Mamba3Jepa::new(rec_config.clone());
+
+    // Populate the local knowledge base with synthetic entries
+    let mut memory = LocalMemoryTool::new(config.shared_embed_dim);
+    for i in 0..5 {
+        let mut key = vec![0.0f32; dim];
+        let mut val = vec![0.0f32; dim];
+        key[i % dim] = 1.0;
+        for d in 0..dim {
+            val[d] = (i as f32 + 1.0) * 0.1;
+        }
+        memory.add_entry(key, val);
+    }
+    println!("  Knowledge base: {} entries, dim={}", memory.len(), dim);
+    rec_model.set_memory_tool(Box::new(memory));
+
+    // Generate synthetic data for the recursion forward pass
+    let rec_n_qry = 4;
+    let rec_n_tgt = 4;
+    let (rec_images, rec_query, rec_target) = generate_batch(
+        &mut rng, 1, config.vit.in_channels, h, w, rec_n_qry, rec_n_tgt, vocab_size,
+    );
+
+    // Run a forward pass with recursion active
+    let rec_output = rec_model.train_forward(
+        &rec_images, &rec_query, &rec_target,
+        1, h, w, rec_n_qry, rec_n_tgt, temperature,
+    );
+    println!("  Recursion forward pass: loss={:.4}", rec_output.loss);
+    assert!(rec_output.loss.is_finite(), "recursion loss should be finite");
+
+    // Check delegation count
+    if let Some(ref rec) = rec_model.predictor.recursion {
+        println!("  Delegations performed: {}", rec.delegation_count());
+        println!("  Confusion score: {:.4}", rec.monitor.current_score());
+    }
+    println!();
+
+    // ── 9. Training Summary ────────────────────────────────────────────────
 
     let total_time = stage1_time + stage2_time;
     println!("╔══════════════════════════════════════════════════════════════╗");
@@ -420,6 +481,7 @@ fn main() {
     println!("║  • Complex-valued state tracks rotational dynamics         ║");
     println!("║  • Trapezoidal discretization for 2nd-order accuracy       ║");
     println!("║  • Selective decoding via SSM state drift monitoring       ║");
+    println!("║  • Recursion layer: external memory via State-Space Deleg.  ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("Next steps:");
@@ -428,6 +490,7 @@ fn main() {
     println!("  3. Use AdamW optimizer from kore-optim with cosine LR schedule");
     println!("  4. Scale to Mamba3JepaConfig::small() for production training");
     println!("  5. Add kore-autograd for automatic differentiation");
+    println!("  6. Plug in vector DB backend via MemoryTool trait for recursion");
 }
 
 /// Compute average L2 norm of the first vector in a batch.
