@@ -72,11 +72,16 @@ impl Module for RMSNorm {
         }
 
         let data = input.contiguous();
-        let x = data.as_f32_slice().unwrap();
-        let gamma = self.gamma.as_f32_slice().unwrap();
+        let x = data.as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
+        let gamma = self.gamma.as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(self.gamma.dtype()))?;
 
         let batch: usize = dims[..ndim - 1].iter().product();
         let d = self.dim;
+        if d == 0 {
+            return Ok(Tensor::from_f32(&[], dims));
+        }
         let mut output = vec![0.0f32; x.len()];
 
         for b in 0..batch {

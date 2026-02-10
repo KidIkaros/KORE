@@ -14,12 +14,12 @@ use crate::complex_utils::C32;
 /// Compute HiPPO transition matrices (A, B) for the given measure.
 ///
 /// Returns: (A, B) where A is (N, N) row-major and B is (N,).
-pub fn transition(measure: &str, n: usize) -> (Vec<f32>, Vec<f32>) {
+pub fn transition(measure: &str, n: usize) -> Result<(Vec<f32>, Vec<f32>), String> {
     match measure {
-        "legs" => transition_legs(n),
-        "legt" => transition_legt(n),
-        "fourier" | "fout" => transition_fourier(n),
-        _ => panic!("Unknown HiPPO measure: {}", measure),
+        "legs" => Ok(transition_legs(n)),
+        "legt" => Ok(transition_legt(n)),
+        "fourier" | "fout" => Ok(transition_fourier(n)),
+        _ => Err(format!("Unknown HiPPO measure: {}", measure)),
     }
 }
 
@@ -179,7 +179,7 @@ fn transition_fourier(n: usize) -> (Vec<f32>, Vec<f32>) {
 /// Rank correction matrix P such that A + PP* is normal.
 ///
 /// Returns P of shape (rank, N).
-pub fn rank_correction(measure: &str, n: usize, rank: usize) -> Vec<f32> {
+pub fn rank_correction(measure: &str, n: usize, rank: usize) -> Result<Vec<f32>, String> {
     match measure {
         "legs" => {
             assert!(rank >= 1);
@@ -189,7 +189,7 @@ pub fn rank_correction(measure: &str, n: usize, rank: usize) -> Vec<f32> {
                 p[i] = (0.5 + i as f32).sqrt();
             }
             // Pad remaining ranks with zeros
-            p
+            Ok(p)
         }
         "legt" => {
             assert!(rank >= 2);
@@ -210,7 +210,7 @@ pub fn rank_correction(measure: &str, n: usize, rank: usize) -> Vec<f32> {
             for v in p.iter_mut() {
                 *v *= scale;
             }
-            p
+            Ok(p)
         }
         "fourier" | "fout" => {
             let mut p = vec![0.0f32; rank * n];
@@ -218,9 +218,9 @@ pub fn rank_correction(measure: &str, n: usize, rank: usize) -> Vec<f32> {
                 p[i] = 2.0f32.sqrt();
             }
             p[0] = 1.0;
-            p
+            Ok(p)
         }
-        _ => panic!("Unknown measure: {}", measure),
+        _ => Err(format!("Unknown HiPPO measure: {}", measure)),
     }
 }
 
@@ -257,9 +257,9 @@ fn transpose_nn(a: &[f32], n: usize) -> Vec<f32> {
 /// - P_out: projected P, shape (rank, N/2) complex
 /// - B_out: projected B, shape (N/2,) complex
 /// - V: eigenvectors, shape (N, N/2) complex
-pub fn nplr(measure: &str, n: usize, rank: usize, b_clip: Option<f32>) -> (Vec<C32>, Vec<C32>, Vec<C32>, Vec<C32>) {
-    let (a_flat, b_vec) = transition(measure, n);
-    let p_flat = rank_correction(measure, n, rank);
+pub fn nplr(measure: &str, n: usize, rank: usize, b_clip: Option<f32>) -> Result<(Vec<C32>, Vec<C32>, Vec<C32>, Vec<C32>), String> {
+    let (a_flat, b_vec) = transition(measure, n)?;
+    let p_flat = rank_correction(measure, n, rank)?;
 
     // AP = A + P^T P (sum over rank dimension)
     let mut ap = a_flat.clone();
@@ -368,7 +368,7 @@ pub fn nplr(measure: &str, n: usize, rank: usize, b_clip: Option<f32>) -> (Vec<C
         }
     }
 
-    (w_half, p_out, b_out, v_half)
+    Ok((w_half, p_out, b_out, v_half))
 }
 
 /// Eigendecomposition of a real matrix via QR iteration (simplified).
@@ -522,35 +522,35 @@ mod tests {
 
     #[test]
     fn test_transition_legs_shape() {
-        let (a, b) = transition("legs", 8);
+        let (a, b) = transition("legs", 8).unwrap();
         assert_eq!(a.len(), 64); // 8x8
         assert_eq!(b.len(), 8);
     }
 
     #[test]
     fn test_transition_legt_shape() {
-        let (a, b) = transition("legt", 8);
+        let (a, b) = transition("legt", 8).unwrap();
         assert_eq!(a.len(), 64);
         assert_eq!(b.len(), 8);
     }
 
     #[test]
     fn test_transition_fourier_shape() {
-        let (a, b) = transition("fourier", 8);
+        let (a, b) = transition("fourier", 8).unwrap();
         assert_eq!(a.len(), 64);
         assert_eq!(b.len(), 8);
     }
 
     #[test]
     fn test_rank_correction_legs() {
-        let p = rank_correction("legs", 8, 1);
+        let p = rank_correction("legs", 8, 1).unwrap();
         assert_eq!(p.len(), 8); // rank=1, N=8
         assert!((p[0] - 0.5f32.sqrt()).abs() < 1e-4);
     }
 
     #[test]
     fn test_nplr_shape() {
-        let (w, p, b, v) = nplr("legs", 8, 1, Some(2.0));
+        let (w, p, b, v) = nplr("legs", 8, 1, Some(2.0)).unwrap();
         assert_eq!(w.len(), 4); // N/2
         assert_eq!(b.len(), 4);
         assert_eq!(p.len(), 4); // rank=1, N/2=4
@@ -559,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_nplr_eigenvalues_negative_real() {
-        let (w, _, _, _) = nplr("legs", 16, 1, Some(2.0));
+        let (w, _, _, _) = nplr("legs", 16, 1, Some(2.0)).unwrap();
         // All eigenvalues should have negative real part
         for &wi in &w {
             assert!(wi.re < 0.1, "eigenvalue real part should be negative, got {}", wi.re);

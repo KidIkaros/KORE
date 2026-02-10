@@ -48,7 +48,8 @@ pub fn dplr(
     match init {
         "hippo" | "legs" => {
             // Use HiPPO eigenvalues
-            let (w, p_nplr, b_nplr, _v) = hippo::nplr("legs", n, rank, Some(2.0));
+            let (w, p_nplr, b_nplr, _v) = hippo::nplr("legs", n, rank, Some(2.0))
+                .expect("HiPPO NPLR initialization failed");
             // Broadcast to H copies
             for hi in 0..h {
                 for ni in 0..half_n {

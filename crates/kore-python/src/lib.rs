@@ -74,7 +74,7 @@ impl PyTensor {
         format!("{}", self.inner.dtype())
     }
 
-    /// Convert to NumPy array (zero-copy when possible).
+    /// Convert to NumPy array (copies data).
     fn numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         let data = self.inner.contiguous();
         let slice = data.as_f32_slice()

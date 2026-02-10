@@ -133,8 +133,9 @@ impl Mamba {
                 let dt = (rng.gen::<f32>() * (dt_max.ln() - dt_min.ln()) + dt_min.ln())
                     .exp()
                     .max(dt_init_floor);
-                // Inverse softplus: x + log(-expm1(-x))
-                dt + (-(-dt).exp_m1()).ln()
+                // Inverse softplus: x + log(-expm1(-x)), clamped for numerical safety
+                let neg_expm1 = (-(-dt).exp_m1()).max(1e-20);
+                dt + neg_expm1.ln()
             })
             .collect();
 

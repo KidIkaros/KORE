@@ -61,6 +61,17 @@ pub fn selective_scan_ref(
     delta_bias: Option<&[f32]>,
     delta_softplus: bool,
 ) -> SelectiveScanOutput {
+    // Shape validation
+    let bdl = batch * dim * seq_len;
+    assert_eq!(u.len(), bdl, "u shape mismatch: expected {} (batch*dim*seq_len), got {}", bdl, u.len());
+    assert_eq!(delta.len(), bdl, "delta shape mismatch: expected {}, got {}", bdl, delta.len());
+    assert_eq!(a.len(), dim * d_state, "a shape mismatch: expected {} (dim*d_state), got {}", dim * d_state, a.len());
+    assert_eq!(b.len(), batch * d_state * seq_len, "b shape mismatch: expected {}, got {}", batch * d_state * seq_len, b.len());
+    assert_eq!(c.len(), batch * d_state * seq_len, "c shape mismatch: expected {}, got {}", batch * d_state * seq_len, c.len());
+    if let Some(d_skip) = d { assert_eq!(d_skip.len(), dim, "d shape mismatch: expected {}, got {}", dim, d_skip.len()); }
+    if let Some(z_data) = z { assert_eq!(z_data.len(), bdl, "z shape mismatch: expected {}, got {}", bdl, z_data.len()); }
+    if let Some(bias) = delta_bias { assert_eq!(bias.len(), dim, "delta_bias shape mismatch: expected {}, got {}", dim, bias.len()); }
+
     // Prepare delta with bias and softplus
     let mut dt = delta.to_vec();
     if let Some(bias) = delta_bias {
@@ -172,6 +183,18 @@ pub fn selective_state_update(
     dt_softplus: bool,
     ssm_state: &mut [f32],
 ) -> Vec<f32> {
+    // Shape validation
+    let bd = batch * dim;
+    assert_eq!(x.len(), bd, "x shape mismatch: expected {} (batch*dim), got {}", bd, x.len());
+    assert_eq!(dt.len(), bd, "dt shape mismatch: expected {}, got {}", bd, dt.len());
+    assert_eq!(a.len(), dim * d_state, "a shape mismatch: expected {}, got {}", dim * d_state, a.len());
+    assert_eq!(b.len(), batch * d_state, "b shape mismatch: expected {}, got {}", batch * d_state, b.len());
+    assert_eq!(c.len(), batch * d_state, "c shape mismatch: expected {}, got {}", batch * d_state, c.len());
+    assert_eq!(ssm_state.len(), batch * dim * d_state, "ssm_state shape mismatch: expected {}, got {}", batch * dim * d_state, ssm_state.len());
+    if let Some(d_skip) = d { assert_eq!(d_skip.len(), dim, "d shape mismatch: expected {}, got {}", dim, d_skip.len()); }
+    if let Some(z_data) = z { assert_eq!(z_data.len(), bd, "z shape mismatch: expected {}, got {}", bd, z_data.len()); }
+    if let Some(bias) = dt_bias { assert_eq!(bias.len(), dim, "dt_bias shape mismatch: expected {}, got {}", dim, bias.len()); }
+
     let mut output = vec![0.0f32; batch * dim];
 
     for b_idx in 0..batch {

@@ -14,23 +14,25 @@ use kore_core::Tensor;
 /// * `grads` - Mutable slice of gradient tensors
 /// * `max_norm` - Maximum allowed L2 norm
 pub fn clip_grad_norm_(grads: &mut [Tensor], max_norm: f32) -> f32 {
-    // Compute total L2 norm across all gradients
+    // Force contiguous and compute total L2 norm across all gradients
     let mut total_norm_sq = 0.0f32;
-    for g in grads.iter() {
-        if let Some(data) = g.as_f32_slice() {
-            total_norm_sq += data.iter().map(|v| v * v).sum::<f32>();
-        }
+    for g in grads.iter_mut() {
+        let c = g.contiguous();
+        let data = c.as_f32_slice()
+            .expect("clip_grad_norm_: all gradient tensors must be F32");
+        total_norm_sq += data.iter().map(|v| v * v).sum::<f32>();
     }
     let total_norm = total_norm_sq.sqrt();
 
     if total_norm > max_norm {
         let scale = max_norm / (total_norm + 1e-6);
         for g in grads.iter_mut() {
-            if let Some(data) = g.as_f32_slice() {
-                let scaled: Vec<f32> = data.iter().map(|v| v * scale).collect();
-                let shape = g.shape().dims().to_vec();
-                *g = Tensor::from_f32(&scaled, &shape);
-            }
+            let c = g.contiguous();
+            let data = c.as_f32_slice()
+                .expect("clip_grad_norm_: all gradient tensors must be F32");
+            let scaled: Vec<f32> = data.iter().map(|v| v * scale).collect();
+            let shape = g.shape().dims().to_vec();
+            *g = Tensor::from_f32(&scaled, &shape);
         }
     }
 
@@ -44,11 +46,12 @@ pub fn clip_grad_norm_(grads: &mut [Tensor], max_norm: f32) -> f32 {
 /// * `clip_value` - Maximum absolute value for each gradient element
 pub fn clip_grad_value_(grads: &mut [Tensor], clip_value: f32) {
     for g in grads.iter_mut() {
-        if let Some(data) = g.as_f32_slice() {
-            let clipped: Vec<f32> = data.iter().map(|v| v.clamp(-clip_value, clip_value)).collect();
-            let shape = g.shape().dims().to_vec();
-            *g = Tensor::from_f32(&clipped, &shape);
-        }
+        let c = g.contiguous();
+        let data = c.as_f32_slice()
+            .expect("clip_grad_value_: all gradient tensors must be F32");
+        let clipped: Vec<f32> = data.iter().map(|v| v.clamp(-clip_value, clip_value)).collect();
+        let shape = g.shape().dims().to_vec();
+        *g = Tensor::from_f32(&clipped, &shape);
     }
 }
 
