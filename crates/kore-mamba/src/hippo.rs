@@ -182,7 +182,9 @@ fn transition_fourier(n: usize) -> (Vec<f32>, Vec<f32>) {
 pub fn rank_correction(measure: &str, n: usize, rank: usize) -> Result<Vec<f32>, String> {
     match measure {
         "legs" => {
-            assert!(rank >= 1);
+            if rank < 1 {
+                return Err("rank must be >= 1 for legs measure".to_string());
+            }
             // P = sqrt(0.5 + arange(N)), shape (1, N)
             let mut p = vec![0.0f32; rank * n];
             for i in 0..n {
@@ -192,7 +194,9 @@ pub fn rank_correction(measure: &str, n: usize, rank: usize) -> Result<Vec<f32>,
             Ok(p)
         }
         "legt" => {
-            assert!(rank >= 2);
+            if rank < 2 {
+                return Err("rank must be >= 2 for legt measure".to_string());
+            }
             let mut p = vec![0.0f32; rank * n];
             let base: Vec<f32> = (0..n).map(|i| (1.0 + 2.0 * i as f32).sqrt()).collect();
             // P0: base with odd indices zeroed

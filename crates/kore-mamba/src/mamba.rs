@@ -135,7 +135,8 @@ impl Mamba {
                     .max(dt_init_floor);
                 // Inverse softplus: x + log(-expm1(-x)), clamped for numerical safety
                 let neg_expm1 = (-(-dt).exp_m1()).max(1e-20);
-                dt + neg_expm1.ln()
+                let inv_sp = dt + neg_expm1.ln();
+                if inv_sp.is_nan() || inv_sp.is_infinite() { dt } else { inv_sp }
             })
             .collect();
 
@@ -312,7 +313,7 @@ impl Mamba {
             Some(&z_bdl),
             Some(&self.dt_proj_bias),
             true, // delta_softplus
-        );
+        ).expect("selective_scan: shape mismatch in Mamba forward");
 
         // 10) Rearrange scan output from (B, d_inner, L) to (B, L, d_inner)
         //     Then out_proj: (B, L, d_inner) @ out_proj_weight^T -> (B, L, d_model)
@@ -446,7 +447,7 @@ impl Mamba {
             Some(&self.dt_proj_bias),
             true,
             ssm_state,
-        );
+        ).expect("selective_state_update: shape mismatch in Mamba step");
 
         // 9) out_proj: (B, d_inner) @ out_proj_weight^T -> (B, d_model)
         let mut output = vec![0.0f32; batch * d];

@@ -60,17 +60,17 @@ pub fn selective_scan_ref(
     z: Option<&[f32]>,
     delta_bias: Option<&[f32]>,
     delta_softplus: bool,
-) -> SelectiveScanOutput {
+) -> Result<SelectiveScanOutput, String> {
     // Shape validation
     let bdl = batch * dim * seq_len;
-    assert_eq!(u.len(), bdl, "u shape mismatch: expected {} (batch*dim*seq_len), got {}", bdl, u.len());
-    assert_eq!(delta.len(), bdl, "delta shape mismatch: expected {}, got {}", bdl, delta.len());
-    assert_eq!(a.len(), dim * d_state, "a shape mismatch: expected {} (dim*d_state), got {}", dim * d_state, a.len());
-    assert_eq!(b.len(), batch * d_state * seq_len, "b shape mismatch: expected {}, got {}", batch * d_state * seq_len, b.len());
-    assert_eq!(c.len(), batch * d_state * seq_len, "c shape mismatch: expected {}, got {}", batch * d_state * seq_len, c.len());
-    if let Some(d_skip) = d { assert_eq!(d_skip.len(), dim, "d shape mismatch: expected {}, got {}", dim, d_skip.len()); }
-    if let Some(z_data) = z { assert_eq!(z_data.len(), bdl, "z shape mismatch: expected {}, got {}", bdl, z_data.len()); }
-    if let Some(bias) = delta_bias { assert_eq!(bias.len(), dim, "delta_bias shape mismatch: expected {}, got {}", dim, bias.len()); }
+    if u.len() != bdl { return Err(format!("u shape mismatch: expected {} (batch*dim*seq_len), got {}", bdl, u.len())); }
+    if delta.len() != bdl { return Err(format!("delta shape mismatch: expected {}, got {}", bdl, delta.len())); }
+    if a.len() != dim * d_state { return Err(format!("a shape mismatch: expected {} (dim*d_state), got {}", dim * d_state, a.len())); }
+    if b.len() != batch * d_state * seq_len { return Err(format!("b shape mismatch: expected {}, got {}", batch * d_state * seq_len, b.len())); }
+    if c.len() != batch * d_state * seq_len { return Err(format!("c shape mismatch: expected {}, got {}", batch * d_state * seq_len, c.len())); }
+    if let Some(d_skip) = d { if d_skip.len() != dim { return Err(format!("d shape mismatch: expected {}, got {}", dim, d_skip.len())); } }
+    if let Some(z_data) = z { if z_data.len() != bdl { return Err(format!("z shape mismatch: expected {}, got {}", bdl, z_data.len())); } }
+    if let Some(bias) = delta_bias { if bias.len() != dim { return Err(format!("delta_bias shape mismatch: expected {}, got {}", dim, bias.len())); } }
 
     // Prepare delta with bias and softplus
     let mut dt = delta.to_vec();
@@ -148,7 +148,7 @@ pub fn selective_scan_ref(
         }
     }
 
-    SelectiveScanOutput { output, last_state }
+    Ok(SelectiveScanOutput { output, last_state })
 }
 
 /// Single-step selective scan update for autoregressive decoding.
@@ -182,18 +182,18 @@ pub fn selective_state_update(
     dt_bias: Option<&[f32]>,
     dt_softplus: bool,
     ssm_state: &mut [f32],
-) -> Vec<f32> {
+) -> Result<Vec<f32>, String> {
     // Shape validation
     let bd = batch * dim;
-    assert_eq!(x.len(), bd, "x shape mismatch: expected {} (batch*dim), got {}", bd, x.len());
-    assert_eq!(dt.len(), bd, "dt shape mismatch: expected {}, got {}", bd, dt.len());
-    assert_eq!(a.len(), dim * d_state, "a shape mismatch: expected {}, got {}", dim * d_state, a.len());
-    assert_eq!(b.len(), batch * d_state, "b shape mismatch: expected {}, got {}", batch * d_state, b.len());
-    assert_eq!(c.len(), batch * d_state, "c shape mismatch: expected {}, got {}", batch * d_state, c.len());
-    assert_eq!(ssm_state.len(), batch * dim * d_state, "ssm_state shape mismatch: expected {}, got {}", batch * dim * d_state, ssm_state.len());
-    if let Some(d_skip) = d { assert_eq!(d_skip.len(), dim, "d shape mismatch: expected {}, got {}", dim, d_skip.len()); }
-    if let Some(z_data) = z { assert_eq!(z_data.len(), bd, "z shape mismatch: expected {}, got {}", bd, z_data.len()); }
-    if let Some(bias) = dt_bias { assert_eq!(bias.len(), dim, "dt_bias shape mismatch: expected {}, got {}", dim, bias.len()); }
+    if x.len() != bd { return Err(format!("x shape mismatch: expected {} (batch*dim), got {}", bd, x.len())); }
+    if dt.len() != bd { return Err(format!("dt shape mismatch: expected {}, got {}", bd, dt.len())); }
+    if a.len() != dim * d_state { return Err(format!("a shape mismatch: expected {}, got {}", dim * d_state, a.len())); }
+    if b.len() != batch * d_state { return Err(format!("b shape mismatch: expected {}, got {}", batch * d_state, b.len())); }
+    if c.len() != batch * d_state { return Err(format!("c shape mismatch: expected {}, got {}", batch * d_state, c.len())); }
+    if ssm_state.len() != batch * dim * d_state { return Err(format!("ssm_state shape mismatch: expected {}, got {}", batch * dim * d_state, ssm_state.len())); }
+    if let Some(d_skip) = d { if d_skip.len() != dim { return Err(format!("d shape mismatch: expected {}, got {}", dim, d_skip.len())); } }
+    if let Some(z_data) = z { if z_data.len() != bd { return Err(format!("z shape mismatch: expected {}, got {}", bd, z_data.len())); } }
+    if let Some(bias) = dt_bias { if bias.len() != dim { return Err(format!("dt_bias shape mismatch: expected {}, got {}", dim, bias.len())); } }
 
     let mut output = vec![0.0f32; batch * dim];
 
@@ -239,7 +239,7 @@ pub fn selective_state_update(
         }
     }
 
-    output
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -264,7 +264,7 @@ mod tests {
             &u, batch, dim, seq_len,
             &delta, &a, d_state, &b, &c,
             Some(&d_skip), None, None, false,
-        );
+        ).unwrap();
 
         assert_eq!(result.output.len(), batch * dim * seq_len);
         assert_eq!(result.last_state.len(), batch * dim * d_state);
@@ -289,7 +289,7 @@ mod tests {
             &u, batch, dim, seq_len,
             &delta, &a, d_state, &b, &c,
             Some(&d_skip), None, None, false,
-        );
+        ).unwrap();
 
         // output[d=0] = 2 * [1, 2, 3] = [2, 4, 6]
         assert!((result.output[0] - 2.0).abs() < 1e-5);
@@ -318,7 +318,7 @@ mod tests {
             &u, batch, dim, seq_len,
             &delta, &a, d_state, &b, &c,
             None, None, None, true,
-        );
+        ).unwrap();
 
         let dt = softplus(0.0);
         let expected_state = dt * 1.0 * 1.0; // da * 0 + dt * b * u
@@ -343,7 +343,7 @@ mod tests {
         let out = selective_state_update(
             &x, batch, dim, &dt, &a, d_state, &b, &c,
             Some(&d_skip), None, None, false, &mut ssm_state,
-        );
+        ).unwrap();
 
         assert_eq!(out.len(), batch * dim);
         // State should be non-zero now

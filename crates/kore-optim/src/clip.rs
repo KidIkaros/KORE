@@ -28,7 +28,7 @@ pub fn clip_grad_norm_(grads: &mut [Tensor], max_norm: f32) -> kore_core::Result
     let total_norm = total_norm_sq.sqrt();
 
     if total_norm > max_norm {
-        let scale = max_norm / (total_norm + 1e-6);
+        let scale = max_norm / total_norm;
         for g in grads.iter_mut() {
             let c = g.contiguous();
             let data = c.as_f32_slice()

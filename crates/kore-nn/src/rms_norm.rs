@@ -80,7 +80,10 @@ impl Module for RMSNorm {
         let batch: usize = dims[..ndim - 1].iter().product();
         let d = self.dim;
         if d == 0 {
-            return Ok(Tensor::from_f32(&[], dims));
+            return Err(KoreError::ShapeMismatch {
+                expected: vec![1],  // dim must be >= 1
+                got: vec![0],
+            });
         }
         let mut output = vec![0.0f32; x.len()];
 
