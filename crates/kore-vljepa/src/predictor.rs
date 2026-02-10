@@ -81,9 +81,22 @@ impl Mamba3Predictor {
     }
 
     /// Build a predictor with recursion layer enabled.
-    pub fn new_with_recursion(config: Mamba3PredictorConfig, rec_config: RecursionConfig) -> Self {
+    ///
+    /// Validates `inject_after_layer` against `n_layers` — if out of bounds,
+    /// clamps to the last valid layer index and emits a debug warning.
+    pub fn new_with_recursion(config: Mamba3PredictorConfig, mut rec_config: RecursionConfig) -> Self {
         let mut predictor = Self::new(config.clone());
         if rec_config.enabled {
+            let n_layers = predictor.backbone_layers.layers.len();
+            if n_layers > 0 && rec_config.inject_after_layer >= n_layers {
+                let clamped = n_layers - 1;
+                debug_assert!(
+                    false,
+                    "inject_after_layer ({}) >= n_layers ({}), clamping to {}",
+                    rec_config.inject_after_layer, n_layers, clamped,
+                );
+                rec_config.inject_after_layer = clamped;
+            }
             predictor.recursion = Some(RecursionLayer::new(rec_config, config.d_model));
         }
         predictor
