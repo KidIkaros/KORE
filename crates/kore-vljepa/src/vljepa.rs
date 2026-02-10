@@ -9,6 +9,7 @@ use crate::predictor::Mamba3Predictor;
 use crate::vit::VisionEncoder;
 use crate::y_decoder::Mamba3Decoder;
 use crate::y_encoder::Mamba3TextEncoder;
+use crate::recursion::MemoryTool;
 
 /// Training output from a forward pass.
 pub struct TrainOutput {
@@ -49,11 +50,22 @@ impl Mamba3Jepa {
     /// Build a new Mamba3-JEPA model from config with random weights.
     pub fn new(config: Mamba3JepaConfig) -> Self {
         let x_encoder = VisionEncoder::new(config.vit.clone());
-        let predictor = Mamba3Predictor::new(config.predictor.clone());
+        let predictor = Mamba3Predictor::new_with_features(
+            config.predictor.clone(),
+            config.recursion.clone(),
+            config.angn.clone(),
+        );
         let y_encoder = Mamba3TextEncoder::new(config.y_encoder.clone());
         let y_decoder = Mamba3Decoder::new(config.y_decoder.clone());
 
         Self { config, x_encoder, predictor, y_encoder, y_decoder }
+    }
+
+    /// Replace the memory tool used by the recursion layer.
+    pub fn set_memory_tool(&mut self, tool: Box<dyn MemoryTool>) {
+        if let Some(ref mut rec) = self.predictor.recursion {
+            rec.set_memory_tool(tool);
+        }
     }
 
     /// Training forward pass.
@@ -71,7 +83,7 @@ impl Mamba3Jepa {
     /// # Returns
     /// `TrainOutput` with loss, predicted embeddings, and target embeddings.
     pub fn train_forward(
-        &self,
+        &mut self,
         images: &[f32],
         query_tokens: &[usize],
         target_tokens: &[usize],
@@ -124,7 +136,7 @@ impl Mamba3Jepa {
     /// - `h`, `w`: image dimensions
     /// - `mode`: inference mode (embedding only or decode to text)
     pub fn infer(
-        &self,
+        &mut self,
         image: &[f32],
         query_tokens: &[usize],
         h: usize,
@@ -153,6 +165,48 @@ impl Mamba3Jepa {
             &query_embeds,
             batch,
             num_patches,
+            n_qry,
+        );
+
+        match mode {
+            InferenceMode::Embedding => InferenceOutput::Embedding(predicted),
+            InferenceMode::Decode { max_tokens, bos_token } => {
+                let tokens = self.y_decoder.generate(&predicted, max_tokens, bos_token);
+                InferenceOutput::Tokens(tokens)
+            }
+        }
+    }
+
+    /// Text-only inference — skips the ViT X-Encoder entirely.
+    ///
+    /// This is a fast-path for when the agent has no visual input.
+    /// Query tokens are embedded and fed directly to the Mamba-3 Predictor
+    /// without any visual token concatenation.
+    ///
+    /// # Arguments
+    /// - `query_tokens`: query token IDs, shape (n_qry,)
+    /// - `mode`: inference mode (embedding only or decode to text)
+    pub fn infer_text_only(
+        &mut self,
+        query_tokens: &[usize],
+        mode: InferenceMode,
+    ) -> InferenceOutput {
+        let batch = 1;
+        let n_qry = query_tokens.len();
+
+        // Embed query tokens (no ViT call)
+        let qry_dm = self.config.y_encoder.d_model;
+        let query_embeds = embed_tokens(
+            query_tokens,
+            &self.y_encoder.backbone.embedding,
+            qry_dm,
+            n_qry,
+        );
+
+        // Predictor text-only path (no visual tokens)
+        let predicted = self.predictor.forward_text_only(
+            &query_embeds,
+            batch,
             n_qry,
         );
 
@@ -242,7 +296,7 @@ mod tests {
     #[test]
     fn test_mamba3_jepa_train_forward() {
         let config = Mamba3JepaConfig::tiny();
-        let model = Mamba3Jepa::new(config.clone());
+        let mut model = Mamba3Jepa::new(config.clone());
 
         let batch = 2;
         let h = config.vit.image_size;
@@ -267,7 +321,7 @@ mod tests {
     #[test]
     fn test_mamba3_jepa_infer_embedding() {
         let config = Mamba3JepaConfig::tiny();
-        let model = Mamba3Jepa::new(config.clone());
+        let mut model = Mamba3Jepa::new(config.clone());
 
         let h = config.vit.image_size;
         let w = config.vit.image_size;
@@ -286,7 +340,7 @@ mod tests {
     #[test]
     fn test_mamba3_jepa_infer_decode() {
         let config = Mamba3JepaConfig::tiny();
-        let model = Mamba3Jepa::new(config.clone());
+        let mut model = Mamba3Jepa::new(config.clone());
 
         let h = config.vit.image_size;
         let w = config.vit.image_size;

@@ -20,7 +20,7 @@
 //! use kore_vljepa::{Mamba3Jepa, Mamba3JepaConfig, InferenceMode, InferenceOutput};
 //!
 //! let config = Mamba3JepaConfig::tiny();
-//! let model = Mamba3Jepa::new(config.clone());
+//! let mut model = Mamba3Jepa::new(config.clone());
 //!
 //! // Inference: image + query → embedding
 //! let h = config.vit.image_size;
@@ -37,6 +37,10 @@ pub mod y_encoder;
 pub mod y_decoder;
 pub mod vljepa;
 pub mod selective_decode;
+pub mod recursion;
+pub mod angn;
+pub mod tools;
+pub mod agent;
 pub mod loader;
 
 pub use config::{
@@ -45,6 +49,7 @@ pub use config::{
     Mamba3TextEncoderConfig,
     Mamba3DecoderConfig,
     Mamba3JepaConfig,
+    RecursionConfig,
 };
 pub use loss::info_nce_loss;
 pub use vit::VisionEncoder;
@@ -54,3 +59,10 @@ pub use y_decoder::Mamba3Decoder;
 pub use vljepa::{Mamba3Jepa, TrainOutput, InferenceMode, InferenceOutput};
 pub use selective_decode::{SelectiveDecoder, SelectiveDecodeConfig};
 pub use loader::{load_safetensors, load_vit_weights, LoadError};
+pub use recursion::{
+    RecursionLayer, ConfusionMonitor, MemoryTool, LocalMemoryTool, StateInjector,
+};
+pub use angn::{AdaptiveNeuralGate, ANGNConfig};
+pub use config::AgentConfig;
+pub use tools::{Tool, ToolRegistry, ToolRequest, ToolResult, MemorySearchTool, EchoTool};
+pub use agent::{Mamba3Agent, AgentInput, AgentOutput, ToolCallRecord};

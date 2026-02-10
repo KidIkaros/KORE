@@ -5,6 +5,7 @@
 //! when to invoke the expensive Y-Decoder.
 
 /// Selective decoder configuration.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SelectiveDecodeConfig {
     /// Number of recent states to keep in the window.
     pub window_size: usize,

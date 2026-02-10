@@ -8,7 +8,9 @@ use rand::Rng;
 
 use kore_mamba::MixerModel;
 
-use crate::config::Mamba3PredictorConfig;
+use crate::angn::{AdaptiveNeuralGate, ANGNConfig};
+use crate::config::{Mamba3PredictorConfig, RecursionConfig};
+use crate::recursion::RecursionLayer;
 
 /// Linear projection layer (weight + bias).
 struct Linear {
@@ -61,6 +63,10 @@ pub struct Mamba3Predictor {
     backbone_layers: MixerModel,
     /// Prediction head: d_model → embed_dim.
     pred_head: Linear,
+    /// Optional recursion layer for State-Space Delegation.
+    pub recursion: Option<RecursionLayer>,
+    /// Optional Adaptive Neural Gating Network for input filtering.
+    pub angn: Option<AdaptiveNeuralGate>,
 }
 
 impl Mamba3Predictor {
@@ -74,7 +80,63 @@ impl Mamba3Predictor {
 
         let pred_head = Linear::new(config.d_model, config.embed_dim);
 
-        Self { config, vision_proj, query_proj, backbone_layers, pred_head }
+        Self { config, vision_proj, query_proj, backbone_layers, pred_head, recursion: None, angn: None }
+    }
+
+    /// Build a predictor with recursion layer enabled.
+    ///
+    /// Validates `inject_after_layer` against `n_layers` — if out of bounds,
+    /// clamps to the last valid layer index and emits a debug warning.
+    pub fn new_with_recursion(config: Mamba3PredictorConfig, mut rec_config: RecursionConfig) -> Self {
+        let mut predictor = Self::new(config.clone());
+        if rec_config.enabled {
+            let n_layers = predictor.backbone_layers.layers.len();
+            if n_layers > 0 && rec_config.inject_after_layer >= n_layers {
+                let clamped = n_layers - 1;
+                debug_assert!(
+                    false,
+                    "inject_after_layer ({}) >= n_layers ({}), clamping to {}",
+                    rec_config.inject_after_layer, n_layers, clamped,
+                );
+                rec_config.inject_after_layer = clamped;
+            }
+            predictor.recursion = Some(RecursionLayer::new(rec_config, config.d_model));
+        }
+        predictor
+    }
+
+    /// Build a predictor with both recursion and ANGN.
+    ///
+    /// This is the full-featured constructor. Both subsystems are optional
+    /// (controlled by their `enabled` flags).
+    pub fn new_with_features(
+        config: Mamba3PredictorConfig,
+        mut rec_config: RecursionConfig,
+        angn_config: ANGNConfig,
+    ) -> Self {
+        let mut predictor = Self::new(config.clone());
+        let n_layers = predictor.backbone_layers.layers.len();
+
+        // Wire recursion
+        if rec_config.enabled {
+            if n_layers > 0 && rec_config.inject_after_layer >= n_layers {
+                let clamped = n_layers - 1;
+                debug_assert!(
+                    false,
+                    "inject_after_layer ({}) >= n_layers ({}), clamping to {}",
+                    rec_config.inject_after_layer, n_layers, clamped,
+                );
+                rec_config.inject_after_layer = clamped;
+            }
+            predictor.recursion = Some(RecursionLayer::new(rec_config, config.d_model));
+        }
+
+        // Wire ANGN
+        if angn_config.enabled {
+            predictor.angn = Some(AdaptiveNeuralGate::new(angn_config, n_layers));
+        }
+
+        predictor
     }
 
     /// Forward pass.
@@ -89,7 +151,7 @@ impl Mamba3Predictor {
     /// # Returns
     /// Predicted embedding: shape (batch, embed_dim), L2-normalized.
     pub fn forward(
-        &self,
+        &mut self,
         visual_tokens: &[f32],
         query_embeds: &[f32],
         batch: usize,
@@ -142,19 +204,84 @@ impl Mamba3Predictor {
         l2_normalize(&projected, batch, self.config.embed_dim)
     }
 
+    /// Text-only forward pass — skips visual token projection entirely.
+    ///
+    /// # Arguments
+    /// - `query_embeds`: shape (batch * n_qry, query_embed_dim) — embedded query tokens
+    /// - `batch`: batch size
+    /// - `n_qry`: number of query tokens per sample
+    ///
+    /// # Returns
+    /// Predicted embedding: shape (batch, embed_dim), L2-normalized.
+    pub fn forward_text_only(
+        &mut self,
+        query_embeds: &[f32],
+        batch: usize,
+        n_qry: usize,
+    ) -> Vec<f32> {
+        let dm = self.config.d_model;
+
+        // Project query embeddings only: (batch * n_qry, query_embed_dim) → (batch * n_qry, d_model)
+        let qry_proj = self.query_proj.forward(query_embeds, batch * n_qry);
+
+        // Feed through Mamba-3 backbone (query tokens only, no visual tokens)
+        let hidden = self.forward_backbone(&qry_proj, batch, n_qry);
+
+        // Average pool → (batch, d_model)
+        let mut pooled = vec![0.0f32; batch * dm];
+        for b in 0..batch {
+            for pos in 0..n_qry {
+                for d in 0..dm {
+                    pooled[b * dm + d] += hidden[b * n_qry * dm + pos * dm + d];
+                }
+            }
+            let inv_len = 1.0 / n_qry as f32;
+            for d in 0..dm {
+                pooled[b * dm + d] *= inv_len;
+            }
+        }
+
+        // Prediction head → L2-normalize
+        let projected = self.pred_head.forward(&pooled, batch);
+        l2_normalize(&projected, batch, self.config.embed_dim)
+    }
+
     /// Run the Mamba-3 backbone layers directly on hidden states (bypassing embedding).
-    fn forward_backbone(&self, hidden: &[f32], batch: usize, seq_len: usize) -> Vec<f32> {
+    ///
+    /// Pipeline per layer:
+    /// 1. ANGN gate (multiplicative filter — removes noise before SSM update)
+    /// 2. Pre-norm (RMSNorm)
+    /// 3. Mamba-3 mixer (SSM state update)
+    /// 4. Residual connection
+    /// 5. Recursion injection (if configured for this layer)
+    fn forward_backbone(&mut self, hidden: &[f32], batch: usize, seq_len: usize) -> Vec<f32> {
         let n = batch * seq_len;
+        let dm = self.config.d_model;
+        let n_layers = self.backbone_layers.layers.len();
         let mut h = hidden.to_vec();
 
-        for (i, layer) in self.backbone_layers.layers.iter().enumerate() {
-            // Pre-norm
+        for i in 0..n_layers {
+            // 1) ANGN gate: multiplicative filtering before SSM update
+            if let Some(ref mut angn) = self.angn {
+                h = angn.gate_layer(&h, i, n);
+            }
+
+            // 2) Pre-norm
             let normed = self.backbone_layers.norms[i].forward(&h, n);
-            // Mixer
-            let mixed = layer.forward_train(&normed, batch, seq_len);
-            // Residual
+            // 3) Mixer
+            let mixed = self.backbone_layers.layers[i].forward_train(&normed, batch, seq_len);
+            // 4) Residual
             for j in 0..h.len() {
                 h[j] += mixed[j];
+            }
+
+            // 5) Recursion injection point: after the configured layer
+            if let Some(ref mut recursion) = self.recursion {
+                if i == recursion.config.inject_after_layer {
+                    let (h_new, _delegated, _score) =
+                        recursion.maybe_delegate(&h, batch, seq_len, dm);
+                    h = h_new;
+                }
             }
         }
 
@@ -188,7 +315,7 @@ mod tests {
     #[test]
     fn test_predictor_forward_shape() {
         let config = Mamba3PredictorConfig::tiny();
-        let predictor = Mamba3Predictor::new(config.clone());
+        let mut predictor = Mamba3Predictor::new(config.clone());
 
         let batch = 2;
         let n_vis = 4;
@@ -203,7 +330,7 @@ mod tests {
     #[test]
     fn test_predictor_output_normalized() {
         let config = Mamba3PredictorConfig::tiny();
-        let predictor = Mamba3Predictor::new(config.clone());
+        let mut predictor = Mamba3Predictor::new(config.clone());
 
         let batch = 1;
         let n_vis = 4;
