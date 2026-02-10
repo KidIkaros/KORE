@@ -79,18 +79,15 @@ class Mamba3Predictor(nn.Module):
         self,
         visual_tokens: torch.Tensor,
         query_embeds: torch.Tensor,
-        collect_state_norms: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[float]]:
+    ) -> torch.Tensor:
         """Forward pass.
 
         Args:
             visual_tokens: (batch, n_vis, vision_dim) from X-Encoder
             query_embeds: (batch, n_qry, query_embed_dim) embedded query tokens
-            collect_state_norms: If True, also return per-layer SSM state norms.
 
         Returns:
-            (batch, embed_dim) L2-normalized predicted embedding, or
-            (embedding, state_norms) if collect_state_norms is True.
+            (batch, embed_dim) — L2-normalized predicted embedding
         """
         # Project inputs to d_model
         vis = self.vision_proj(visual_tokens)   # (B, n_vis, d_model)
@@ -101,56 +98,32 @@ class Mamba3Predictor(nn.Module):
 
         # Backbone with optional ANGN gating
         gate_fn = self.angn.get_gate_fn() if self.angn is not None else None
-        backbone_out = self.backbone(hidden, gate_fn=gate_fn, collect_state_norms=collect_state_norms)
-
-        if collect_state_norms:
-            hidden, state_norms = backbone_out
-        else:
-            hidden = backbone_out
+        hidden = self.backbone(hidden, gate_fn=gate_fn)
 
         # Mean pool over sequence
         pooled = hidden.mean(dim=1)             # (B, d_model)
 
         # Prediction head → L2 normalize
         projected = self.pred_head(pooled)      # (B, embed_dim)
-        result = F.normalize(projected, p=2, dim=-1)
+        return F.normalize(projected, p=2, dim=-1)
 
-        if collect_state_norms:
-            return result, state_norms
-        return result
-
-    def forward_text_only(
-        self,
-        query_embeds: torch.Tensor,
-        collect_state_norms: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[float]]:
+    def forward_text_only(self, query_embeds: torch.Tensor) -> torch.Tensor:
         """Text-only forward (skips vision projection).
 
         Args:
             query_embeds: (batch, n_qry, query_embed_dim)
-            collect_state_norms: If True, also return per-layer SSM state norms.
 
         Returns:
-            (batch, embed_dim) L2-normalized predicted embedding, or
-            (embedding, state_norms) if collect_state_norms is True.
+            (batch, embed_dim) — L2-normalized predicted embedding
         """
         qry = self.query_proj(query_embeds)
 
         gate_fn = self.angn.get_gate_fn() if self.angn is not None else None
-        backbone_out = self.backbone(qry, gate_fn=gate_fn, collect_state_norms=collect_state_norms)
-
-        if collect_state_norms:
-            hidden, state_norms = backbone_out
-        else:
-            hidden = backbone_out
+        hidden = self.backbone(qry, gate_fn=gate_fn)
 
         pooled = hidden.mean(dim=1)
         projected = self.pred_head(pooled)
-        result = F.normalize(projected, p=2, dim=-1)
-
-        if collect_state_norms:
-            return result, state_norms
-        return result
+        return F.normalize(projected, p=2, dim=-1)
 
     @classmethod
     def from_config(cls, config: dict) -> "Mamba3Predictor":

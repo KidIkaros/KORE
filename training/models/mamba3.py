@@ -129,15 +129,14 @@ class Mamba3Layer(nn.Module):
 
         self.trapezoidal_alpha = config.trapezoidal_alpha
 
-    def forward(self, x: torch.Tensor, collect_state_norm: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x: (batch, seq_len, d_model)
-            collect_state_norm: If True, compute and return L2 norm of final hidden state.
 
         Returns:
-            (output, state_norm_tensor) where state_norm_tensor is None when not collected.
+            (batch, seq_len, d_model)
         """
         batch, seq_len, _ = x.shape
 
@@ -205,11 +204,6 @@ class Mamba3Layer(nn.Module):
             y_t = y_t + self.D.unsqueeze(0) * x_t.mean(dim=-1)  # D skip connection
             outputs.append(y_t)
 
-        # Capture final state norm for diagnostics (stays on GPU, no .item() here)
-        state_norm = None
-        if collect_state_norm:
-            state_norm = h.norm()
-
         y = torch.stack(outputs, dim=1)  # (B, L, nheads)
         # Expand back to d_inner via repeat
         y = y.unsqueeze(-1).expand(-1, -1, -1, self.headdim)
@@ -219,7 +213,7 @@ class Mamba3Layer(nn.Module):
         y = y * F.silu(z)
 
         # Output projection
-        return self.out_proj(y), state_norm
+        return self.out_proj(y)
 
 
 class Mamba3Backbone(nn.Module):
@@ -243,20 +237,17 @@ class Mamba3Backbone(nn.Module):
         self,
         hidden: torch.Tensor,
         gate_fn=None,
-        collect_state_norms: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[float]]:
+    ) -> torch.Tensor:
         """Forward through backbone with optional per-layer gating.
 
         Args:
             hidden: (batch, seq_len, d_model)
             gate_fn: Optional callable(hidden, layer_idx) → gated_hidden
-            collect_state_norms: If True, return per-layer SSM state norms.
+                     Used by ANGN for pre-layer multiplicative filtering.
 
         Returns:
-            (batch, seq_len, d_model) if collect_state_norms is False,
-            else (output, state_norms) where state_norms is a list of floats.
+            (batch, seq_len, d_model)
         """
-        state_norm_tensors: list[torch.Tensor] | None = [] if collect_state_norms else None
         for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
             # 1) ANGN gate (if provided)
             if gate_fn is not None:
@@ -265,15 +256,8 @@ class Mamba3Backbone(nn.Module):
             # 2) Pre-norm
             normed = norm(hidden)
             # 3) Mixer
-            mixed, s_norm = layer(normed, collect_state_norm=collect_state_norms)
+            mixed = layer(normed)
             # 4) Residual
             hidden = hidden + mixed
-            if state_norm_tensors is not None and s_norm is not None:
-                state_norm_tensors.append(s_norm)
 
-        output = self.final_norm(hidden)
-        if collect_state_norms and state_norm_tensors is not None:
-            # Single CPU sync: convert all GPU norm tensors to floats at once
-            state_norms = [t.item() for t in state_norm_tensors]
-            return output, state_norms
-        return output
+        return self.final_norm(hidden)

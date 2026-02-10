@@ -118,7 +118,6 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     log_interval: int = 50,
-    autocast_ctx=None,
 ) -> dict:
     """Train decoder for one epoch."""
     # Only decoder trains
@@ -154,21 +153,12 @@ def train_one_epoch(
         input_tokens = target_tokens[:, :-1]
         target_labels = target_tokens[:, 1:]
 
-        if autocast_ctx is not None:
-            with autocast_ctx:
-                logits = model.y_decoder(pred_embed, input_tokens)
-                loss = F.cross_entropy(
-                    logits.reshape(-1, logits.shape[-1]),
-                    target_labels.reshape(-1),
-                    ignore_index=-100,
-                )
-        else:
-            logits = model.y_decoder(pred_embed, input_tokens)
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                target_labels.reshape(-1),
-                ignore_index=-100,
-            )
+        logits = model.y_decoder(pred_embed, input_tokens)
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            target_labels.reshape(-1),
+            ignore_index=0,  # Ignore padding
+        )
 
         optimizer.zero_grad()
         loss.backward()
@@ -208,8 +198,6 @@ def main():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--tiny", action="store_true")
-    parser.add_argument("--bf16", action="store_true",
-                        help="Enable BF16 mixed precision (CUDA only)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -230,15 +218,6 @@ def main():
     print(f"[Phase 2] Loaded Phase 1: {len(missing)} missing, {len(unexpected)} unexpected keys")
 
     model = model.to(device)
-
-    # BF16 mixed precision setup (no GradScaler — BF16 has same dynamic range as FP32)
-    autocast_ctx = None
-    if args.bf16:
-        if device.type == "cuda" and torch.cuda.is_bf16_supported():
-            print("[Phase 2] BF16 mixed precision enabled")
-            autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-        else:
-            print("[Phase 2] BF16 requested but not supported — falling back to FP32")
 
     # Freeze everything except decoder
     for name, param in model.named_parameters():
@@ -269,10 +248,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"Phase 2 — Epoch {epoch}/{args.epochs}")
 
-        metrics = train_one_epoch(
-            model, dataloader, optimizer, device, epoch,
-            autocast_ctx=autocast_ctx,
-        )
+        metrics = train_one_epoch(model, dataloader, optimizer, device, epoch)
         print(f"  Loss: {metrics['loss']:.4f}")
 
         if epoch % args.save_every == 0 or epoch == args.epochs:
