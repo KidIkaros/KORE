@@ -62,6 +62,27 @@ pub fn mamba_chunk_scan_combined(
     dt_softplus: bool,
     d_has_hdim: bool,
 ) -> ChunkedScanOutput {
+    // Shape validation
+    assert_eq!(x.len(), batch * seq_len * nheads * headdim,
+        "x shape mismatch: expected {}, got {}", batch * seq_len * nheads * headdim, x.len());
+    assert_eq!(dt.len(), batch * seq_len * nheads,
+        "dt shape mismatch: expected {}, got {}", batch * seq_len * nheads, dt.len());
+    assert_eq!(a.len(), nheads, "a shape mismatch: expected {}, got {}", nheads, a.len());
+    assert_eq!(b.len(), batch * seq_len * ngroups * d_state,
+        "b shape mismatch: expected {}, got {}", batch * seq_len * ngroups * d_state, b.len());
+    assert_eq!(c.len(), batch * seq_len * ngroups * d_state,
+        "c shape mismatch: expected {}, got {}", batch * seq_len * ngroups * d_state, c.len());
+    assert!(nheads % ngroups == 0, "nheads ({}) must be divisible by ngroups ({})", nheads, ngroups);
+    if let Some(d_skip) = d {
+        if d_has_hdim {
+            assert_eq!(d_skip.len(), nheads * headdim, "D shape mismatch (hdim)");
+        } else {
+            assert_eq!(d_skip.len(), nheads, "D shape mismatch");
+        }
+    }
+    if let Some(z_data) = z { assert_eq!(z_data.len(), batch * seq_len * nheads * headdim, "z shape mismatch"); }
+    if let Some(bias) = dt_bias { assert_eq!(bias.len(), nheads, "dt_bias shape mismatch"); }
+
     let heads_per_group = nheads / ngroups;
     let mut output = vec![0.0f32; batch * seq_len * nheads * headdim];
     // State: (batch, nheads, headdim, d_state)
@@ -190,6 +211,20 @@ pub fn mamba2_ssm_step(
     dt_softplus: bool,
     ssm_state: &mut [f32],
 ) -> Vec<f32> {
+    // Shape validation
+    let bhd = batch * nheads * headdim;
+    assert_eq!(x.len(), bhd, "x shape mismatch: expected {}, got {}", bhd, x.len());
+    assert_eq!(dt.len(), batch * nheads, "dt shape mismatch: expected {}, got {}", batch * nheads, dt.len());
+    assert_eq!(a.len(), nheads, "a shape mismatch: expected {}, got {}", nheads, a.len());
+    assert_eq!(b.len(), batch * ngroups * d_state, "b shape mismatch: expected {}, got {}", batch * ngroups * d_state, b.len());
+    assert_eq!(c.len(), batch * ngroups * d_state, "c shape mismatch: expected {}, got {}", batch * ngroups * d_state, c.len());
+    assert_eq!(ssm_state.len(), batch * nheads * headdim * d_state,
+        "ssm_state shape mismatch: expected {}, got {}", batch * nheads * headdim * d_state, ssm_state.len());
+    assert!(nheads % ngroups == 0, "nheads must be divisible by ngroups");
+    if let Some(d_skip) = d { assert_eq!(d_skip.len(), nheads, "d shape mismatch"); }
+    if let Some(z_data) = z { assert_eq!(z_data.len(), bhd, "z shape mismatch"); }
+    if let Some(bias) = dt_bias { assert_eq!(bias.len(), nheads, "dt_bias shape mismatch"); }
+
     let heads_per_group = nheads / ngroups;
     let mut output = vec![0.0f32; batch * nheads * headdim];
 

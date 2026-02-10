@@ -275,7 +275,8 @@ impl MixerModel {
             let normed = self.norms[i].forward(&hidden, batch);
 
             // Get mutable state
-            let state = inference_params.get_state_mut(i).unwrap();
+            let state = inference_params.get_state_mut(i)
+                .expect("mixer: inference state not found for layer index");
             let mixed = layer.forward_step(
                 &normed, batch,
                 &mut state.conv_state,

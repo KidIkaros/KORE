@@ -318,7 +318,7 @@ pub fn nplr(measure: &str, n: usize, rank: usize, b_clip: Option<f32>) -> Result
 
     // Sort by imaginary part and take negative half (conjugate pairs)
     let mut indexed: Vec<(usize, f32)> = w.iter().enumerate().map(|(i, wi)| (i, wi.im)).collect();
-    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    indexed.sort_by(|a, b| a.1.total_cmp(&b.1));
 
     // Take the first N/2 (negative imaginary part)
     let mut w_half = Vec::with_capacity(half_n);
@@ -420,7 +420,7 @@ fn eigendecompose_hippo(a: &[f32], n: usize) -> (Vec<C32>, Vec<C32>) {
     let mut sorted_eigs: Vec<(usize, f32)> = eig_vals_sq.iter().enumerate()
         .map(|(i, &v)| (i, v.max(0.0).sqrt()))
         .collect();
-    sorted_eigs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    sorted_eigs.sort_by(|a, b| a.1.total_cmp(&b.1));
 
     // Pair them up: for each λ, create eigenvalues w_re ± i*λ
     for i in 0..n {

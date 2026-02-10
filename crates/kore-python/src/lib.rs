@@ -666,11 +666,29 @@ impl PyAdam {
         }
     }
 
-    fn step(&mut self, params: Vec<PyTensor>, grads: Vec<PyTensor>) -> PyResult<Vec<PyTensor>> {
-        let mut p: Vec<kore_core::Tensor> = params.into_iter().map(|t| t.inner).collect();
+    /// Update parameters in-place. Params list is mutated directly.
+    ///
+    /// Usage::
+    ///
+    ///     optimizer.step(params, grads)  # params are updated in-place
+    fn step(&mut self, params: Bound<'_, pyo3::types::PyList>, grads: Vec<PyTensor>) -> PyResult<()> {
         let g: Vec<kore_core::Tensor> = grads.into_iter().map(|t| t.inner).collect();
+        let len = params.len();
+        // Extract inner tensors (takes ownership temporarily)
+        let mut p: Vec<kore_core::Tensor> = Vec::with_capacity(len);
+        for i in 0..len {
+            let item = params.get_item(i)?;
+            let t: PyRef<'_, PyTensor> = item.extract()?;
+            p.push(t.inner.clone());
+        }
         self.inner.step(&mut p, &g);
-        Ok(p.into_iter().map(|t| PyTensor { inner: t }).collect())
+        // Write updated tensors back into the Python objects
+        for i in 0..len {
+            let item = params.get_item(i)?;
+            let mut t: PyRefMut<'_, PyTensor> = item.extract()?;
+            t.inner = p.remove(0);
+        }
+        Ok(())
     }
 }
 
@@ -689,11 +707,23 @@ impl PySGD {
         }
     }
 
-    fn step(&mut self, params: Vec<PyTensor>, grads: Vec<PyTensor>) -> PyResult<Vec<PyTensor>> {
-        let mut p: Vec<kore_core::Tensor> = params.into_iter().map(|t| t.inner).collect();
+    /// Update parameters in-place. Params list is mutated directly.
+    fn step(&mut self, params: Bound<'_, pyo3::types::PyList>, grads: Vec<PyTensor>) -> PyResult<()> {
         let g: Vec<kore_core::Tensor> = grads.into_iter().map(|t| t.inner).collect();
+        let len = params.len();
+        let mut p: Vec<kore_core::Tensor> = Vec::with_capacity(len);
+        for i in 0..len {
+            let item = params.get_item(i)?;
+            let t: PyRef<'_, PyTensor> = item.extract()?;
+            p.push(t.inner.clone());
+        }
         self.inner.step(&mut p, &g);
-        Ok(p.into_iter().map(|t| PyTensor { inner: t }).collect())
+        for i in 0..len {
+            let item = params.get_item(i)?;
+            let mut t: PyRefMut<'_, PyTensor> = item.extract()?;
+            t.inner = p.remove(0);
+        }
+        Ok(())
     }
 }
 
