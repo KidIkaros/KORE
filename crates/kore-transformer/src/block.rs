@@ -66,7 +66,8 @@ impl TransformerBlock {
         // Pre-norm attention: h = x + MHA(RMSNorm(x))
         let normed = self.attn_norm.forward(x)?;
         let attn_out = self.attn.forward(&normed, mask, use_cache)?;
-        let attn_data = attn_out.as_f32_slice().unwrap();
+        let attn_data = attn_out.as_f32_slice()
+            .ok_or(KoreError::StorageError("attn_out: expected f32 tensor".into()))?;
 
         let mut h = vec![0.0f32; n];
         for i in 0..n {
@@ -77,7 +78,8 @@ impl TransformerBlock {
         // Pre-norm FFN: out = h + FFN(RMSNorm(h))
         let normed2 = self.ffn_norm.forward(&h_tensor)?;
         let ffn_out = self.ffn.forward(&normed2)?;
-        let ffn_data = ffn_out.as_f32_slice().unwrap();
+        let ffn_data = ffn_out.as_f32_slice()
+            .ok_or(KoreError::StorageError("ffn_out: expected f32 tensor".into()))?;
 
         let mut out = vec![0.0f32; n];
         for i in 0..n {

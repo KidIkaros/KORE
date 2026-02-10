@@ -34,9 +34,11 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Result<Tensor, K
     }
 
     let log_probs = logits.log_softmax(-1)?;
-    let lp_data = log_probs.as_f32_slice().unwrap();
+    let lp_data = log_probs.as_f32_slice()
+        .ok_or_else(|| kore_core::KoreError::UnsupportedDType(log_probs.dtype()))?;
     let t_data = targets.contiguous();
-    let t_slice = t_data.as_f32_slice().unwrap();
+    let t_slice = t_data.as_f32_slice()
+        .ok_or_else(|| kore_core::KoreError::UnsupportedDType(targets.dtype()))?;
 
     let mut total_loss = 0.0f32;
     for b in 0..batch {
@@ -70,9 +72,11 @@ pub fn cross_entropy_loss_smoothed(
     let num_classes = logit_dims[1];
 
     let log_probs = logits.log_softmax(-1)?;
-    let lp_data = log_probs.as_f32_slice().unwrap();
+    let lp_data = log_probs.as_f32_slice()
+        .ok_or_else(|| KoreError::UnsupportedDType(log_probs.dtype()))?;
     let t_data = targets.contiguous();
-    let t_slice = t_data.as_f32_slice().unwrap();
+    let t_slice = t_data.as_f32_slice()
+        .ok_or_else(|| KoreError::UnsupportedDType(targets.dtype()))?;
 
     let confidence = 1.0 - smoothing;
     let smooth_val = smoothing / num_classes as f32;

@@ -74,14 +74,15 @@ impl PyTensor {
         format!("{}", self.inner.dtype())
     }
 
-    /// Convert to NumPy array (zero-copy when possible).
+    /// Convert to NumPy array (copies data).
     fn numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         let data = self.inner.contiguous();
         let slice = data.as_f32_slice()
             .ok_or_else(|| PyValueError::new_err("Cannot convert non-f32 tensor to numpy"))?;
         let shape: Vec<usize> = data.shape().dims().to_vec();
         let flat = PyArray1::from_vec_bound(py, slice.to_vec());
-        Ok(flat.reshape(shape).unwrap())
+        Ok(flat.reshape(shape)
+            .map_err(|e| PyValueError::new_err(format!("numpy reshape failed: {}", e)))?)
     }
 
     /// Element-wise addition.
@@ -233,6 +234,51 @@ impl PyTensor {
         let result = self.inner.abs()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
+    }
+
+    /// Create a tensor with random normal values N(0,1).
+    #[staticmethod]
+    fn randn(shape: Vec<usize>) -> Self {
+        Self {
+            inner: kore_core::Tensor::randn(&shape),
+        }
+    }
+
+    /// Create a tensor with uniform random values in [low, high).
+    #[staticmethod]
+    #[pyo3(signature = (shape, low=0.0, high=1.0))]
+    fn rand_uniform(shape: Vec<usize>, low: f32, high: f32) -> Self {
+        Self {
+            inner: kore_core::Tensor::rand_uniform(&shape, low, high),
+        }
+    }
+
+    /// Enable gradient tracking on this tensor.
+    fn requires_grad_(&mut self, requires_grad: bool) {
+        self.inner.set_requires_grad(requires_grad);
+    }
+
+    /// Whether this tensor requires gradient.
+    #[getter]
+    fn requires_grad(&self) -> bool {
+        self.inner.requires_grad()
+    }
+
+    /// Get the accumulated gradient (None if no grad).
+    #[getter]
+    fn grad(&self) -> Option<PyTensor> {
+        self.inner.grad().map(|g| PyTensor { inner: g })
+    }
+
+    /// Zero the gradient.
+    fn zero_grad(&mut self) {
+        self.inner.zero_grad();
+    }
+
+    /// Run backward pass (tensor must be scalar).
+    fn backward(&self) -> PyResult<()> {
+        self.inner.backward()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 }
 
@@ -491,6 +537,117 @@ impl PyDropout {
     }
 }
 
+#[pyclass(name = "Conv2d")]
+struct PyConv2d {
+    inner: kore_nn::Conv2d,
+}
+
+#[pymethods]
+impl PyConv2d {
+    #[new]
+    #[pyo3(signature = (in_channels, out_channels, kernel_size, stride=1, padding=0, bias=true))]
+    fn new(in_channels: usize, out_channels: usize, kernel_size: usize, stride: usize, padding: usize, bias: bool) -> Self {
+        Self {
+            inner: kore_nn::Conv2d::new(in_channels, out_channels, kernel_size, stride, padding, bias),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn parameters(&self) -> Vec<PyTensor> {
+        kore_nn::Module::parameters(&self.inner)
+            .into_iter()
+            .map(|t| PyTensor { inner: t.clone() })
+            .collect()
+    }
+}
+
+#[pyclass(name = "MaxPool2d")]
+struct PyMaxPool2d {
+    inner: kore_nn::MaxPool2d,
+}
+
+#[pymethods]
+impl PyMaxPool2d {
+    #[new]
+    #[pyo3(signature = (kernel_size, stride=2, padding=0))]
+    fn new(kernel_size: usize, stride: usize, padding: usize) -> Self {
+        Self {
+            inner: kore_nn::MaxPool2d::new(kernel_size, stride, padding),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+}
+
+#[pyclass(name = "AvgPool2d")]
+struct PyAvgPool2d {
+    inner: kore_nn::AvgPool2d,
+}
+
+#[pymethods]
+impl PyAvgPool2d {
+    #[new]
+    #[pyo3(signature = (kernel_size, stride=2, padding=0))]
+    fn new(kernel_size: usize, stride: usize, padding: usize) -> Self {
+        Self {
+            inner: kore_nn::AvgPool2d::new(kernel_size, stride, padding),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+}
+
+#[pyclass(name = "AdaptiveAvgPool2d")]
+struct PyAdaptiveAvgPool2d {
+    inner: kore_nn::AdaptiveAvgPool2d,
+}
+
+#[pymethods]
+impl PyAdaptiveAvgPool2d {
+    #[new]
+    #[pyo3(signature = (output_h, output_w))]
+    fn new(output_h: usize, output_w: usize) -> Self {
+        Self {
+            inner: kore_nn::AdaptiveAvgPool2d::new(output_h, output_w),
+        }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+}
+
 // ============================================================================
 // optim module
 // ============================================================================
@@ -510,11 +667,29 @@ impl PyAdam {
         }
     }
 
-    fn step(&mut self, params: Vec<PyTensor>, grads: Vec<PyTensor>) -> PyResult<Vec<PyTensor>> {
-        let mut p: Vec<kore_core::Tensor> = params.into_iter().map(|t| t.inner).collect();
+    /// Update parameters in-place. Params list is mutated directly.
+    ///
+    /// Usage::
+    ///
+    ///     optimizer.step(params, grads)  # params are updated in-place
+    fn step(&mut self, params: Bound<'_, pyo3::types::PyList>, grads: Vec<PyTensor>) -> PyResult<()> {
         let g: Vec<kore_core::Tensor> = grads.into_iter().map(|t| t.inner).collect();
+        let len = params.len();
+        // Extract inner tensors (takes ownership temporarily)
+        let mut p: Vec<kore_core::Tensor> = Vec::with_capacity(len);
+        for i in 0..len {
+            let item = params.get_item(i)?;
+            let t: PyRef<'_, PyTensor> = item.extract()?;
+            p.push(t.inner.clone());
+        }
         self.inner.step(&mut p, &g);
-        Ok(p.into_iter().map(|t| PyTensor { inner: t }).collect())
+        // Write updated tensors back into the Python objects
+        for i in 0..len {
+            let item = params.get_item(i)?;
+            let mut t: PyRefMut<'_, PyTensor> = item.extract()?;
+            t.inner = p.remove(0);
+        }
+        Ok(())
     }
 }
 
@@ -533,11 +708,23 @@ impl PySGD {
         }
     }
 
-    fn step(&mut self, params: Vec<PyTensor>, grads: Vec<PyTensor>) -> PyResult<Vec<PyTensor>> {
-        let mut p: Vec<kore_core::Tensor> = params.into_iter().map(|t| t.inner).collect();
+    /// Update parameters in-place. Params list is mutated directly.
+    fn step(&mut self, params: Bound<'_, pyo3::types::PyList>, grads: Vec<PyTensor>) -> PyResult<()> {
         let g: Vec<kore_core::Tensor> = grads.into_iter().map(|t| t.inner).collect();
+        let len = params.len();
+        let mut p: Vec<kore_core::Tensor> = Vec::with_capacity(len);
+        for i in 0..len {
+            let item = params.get_item(i)?;
+            let t: PyRef<'_, PyTensor> = item.extract()?;
+            p.push(t.inner.clone());
+        }
         self.inner.step(&mut p, &g);
-        Ok(p.into_iter().map(|t| PyTensor { inner: t }).collect())
+        for i in 0..len {
+            let item = params.get_item(i)?;
+            let mut t: PyRefMut<'_, PyTensor> = item.extract()?;
+            t.inner = p.remove(0);
+        }
+        Ok(())
     }
 }
 
@@ -609,6 +796,41 @@ fn nll_loss(log_probs: &PyTensor, targets: &PyTensor) -> PyResult<PyTensor> {
     Ok(PyTensor { inner: result })
 }
 
+/// Tanh activation.
+#[pyfunction]
+fn tanh(input: &PyTensor) -> PyResult<PyTensor> {
+    let result = kore_nn::activations::tanh(&input.inner)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyTensor { inner: result })
+}
+
+/// SiLU (Swish) activation.
+#[pyfunction]
+fn silu(input: &PyTensor) -> PyResult<PyTensor> {
+    let result = kore_nn::activations::silu(&input.inner)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyTensor { inner: result })
+}
+
+/// Save a state dict to a safetensors file.
+#[pyfunction]
+fn save_state_dict(state_dict: std::collections::HashMap<String, PyTensor>, path: String) -> PyResult<()> {
+    let sd: std::collections::HashMap<String, kore_core::Tensor> = state_dict
+        .into_iter()
+        .map(|(k, v)| (k, v.inner))
+        .collect();
+    kore_nn::save_state_dict(&sd, std::path::Path::new(&path))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+}
+
+/// Load a state dict from a safetensors file.
+#[pyfunction]
+fn load_state_dict(path: String) -> PyResult<std::collections::HashMap<String, PyTensor>> {
+    let sd = kore_nn::load_state_dict(std::path::Path::new(&path))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Ok(sd.into_iter().map(|(k, v)| (k, PyTensor { inner: v })).collect())
+}
+
 // ============================================================================
 // Module entry point
 // ============================================================================
@@ -630,6 +852,10 @@ fn kore(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     nn.add_class::<PyQuatLinear>()?;
     nn.add_class::<PyEmbedding>()?;
     nn.add_class::<PyDropout>()?;
+    nn.add_class::<PyConv2d>()?;
+    nn.add_class::<PyMaxPool2d>()?;
+    nn.add_class::<PyAvgPool2d>()?;
+    nn.add_class::<PyAdaptiveAvgPool2d>()?;
     m.add_submodule(&nn)?;
 
     // optim submodule
@@ -648,7 +874,13 @@ fn kore(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     functional.add_function(wrap_pyfunction!(mse_loss, &functional)?)?;
     functional.add_function(wrap_pyfunction!(l1_loss, &functional)?)?;
     functional.add_function(wrap_pyfunction!(nll_loss, &functional)?)?;
+    functional.add_function(wrap_pyfunction!(tanh, &functional)?)?;
+    functional.add_function(wrap_pyfunction!(silu, &functional)?)?;
     m.add_submodule(&functional)?;
+
+    // io functions
+    m.add_function(wrap_pyfunction!(save_state_dict, m)?)?;
+    m.add_function(wrap_pyfunction!(load_state_dict, m)?)?;
 
     Ok(())
 }

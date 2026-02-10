@@ -63,25 +63,25 @@ impl Adam {
 
             // m = beta1 * m + (1 - beta1) * grad
             let m_new = self.m[i]
-                .mul_scalar(self.beta1).unwrap()
-                .add(&grad.mul_scalar(1.0 - self.beta1).unwrap()).unwrap();
+                .mul_scalar(self.beta1).expect("Adam: m * beta1")
+                .add(&grad.mul_scalar(1.0 - self.beta1).expect("Adam: grad scale")).expect("Adam: m update");
             self.m[i] = m_new;
 
             // v = beta2 * v + (1 - beta2) * grad^2
-            let grad_sq = grad.mul(grad).unwrap();
+            let grad_sq = grad.mul(grad).expect("Adam: grad^2");
             let v_new = self.v[i]
-                .mul_scalar(self.beta2).unwrap()
-                .add(&grad_sq.mul_scalar(1.0 - self.beta2).unwrap()).unwrap();
+                .mul_scalar(self.beta2).expect("Adam: v * beta2")
+                .add(&grad_sq.mul_scalar(1.0 - self.beta2).expect("Adam: grad_sq scale")).expect("Adam: v update");
             self.v[i] = v_new;
 
             // Bias-corrected estimates
-            let m_hat = self.m[i].mul_scalar(1.0 / bc1).unwrap();
-            let v_hat = self.v[i].mul_scalar(1.0 / bc2).unwrap();
+            let m_hat = self.m[i].mul_scalar(1.0 / bc1).expect("Adam: m_hat");
+            let v_hat = self.v[i].mul_scalar(1.0 / bc2).expect("Adam: v_hat");
 
             // param -= lr * m_hat / (sqrt(v_hat) + eps)
-            let v_sqrt = v_hat.sqrt().unwrap().add_scalar(self.eps).unwrap();
-            let update = m_hat.div(&v_sqrt).unwrap().mul_scalar(self.lr).unwrap();
-            let new_param = param.sub(&update).unwrap();
+            let v_sqrt = v_hat.sqrt().expect("Adam: sqrt").add_scalar(self.eps).expect("Adam: eps");
+            let update = m_hat.div(&v_sqrt).expect("Adam: div").mul_scalar(self.lr).expect("Adam: lr scale");
+            let new_param = param.sub(&update).expect("Adam: param update");
 
             if let (Some(dst), Some(src)) = (param.as_f32_slice_mut(), new_param.as_f32_slice()) {
                 dst.copy_from_slice(src);

@@ -1,0 +1,19 @@
+[package]
+name = "kore-vljepa"
+description = "Mamba3-JEPA: State-Space World Model for Vision-Language"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kore-core.workspace = true
+kore-nn.workspace = true
+kore-mamba.workspace = true
+kore-transformer.workspace = true
+kore-attention.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+safetensors.workspace = true
+half.workspace = true

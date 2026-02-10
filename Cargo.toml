@@ -14,6 +14,8 @@ members = [
     "crates/kore-transformer",
     "crates/kore-edge",
     "crates/kore-data",
+    "crates/kore-mamba",
+    "crates/kore-vljepa",
 ]
 resolver = "2"
 
@@ -21,12 +23,14 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ikaros Digital LLC"]
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 # Math & Tensors
 num-traits = "0.2"
+num-complex = "0.4"
 half = "2.3"
+rustfft = "6.2"
 smallvec = "1.11"
 bytemuck = { version = "1.14", features = ["derive"] }
 
@@ -83,6 +87,8 @@ kore-attention = { path = "crates/kore-attention" }
 kore-transformer = { path = "crates/kore-transformer" }
 kore-serve = { path = "crates/kore-serve" }
 kore-edge = { path = "crates/kore-edge" }
+kore-mamba = { path = "crates/kore-mamba" }
+kore-vljepa = { path = "crates/kore-vljepa" }
 
 [profile.release]
 opt-level = 3

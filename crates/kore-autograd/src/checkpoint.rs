@@ -111,7 +111,8 @@ where
     // Save detached copies of inputs (no grad graph references)
     let saved_inputs: Vec<Tensor> = inputs.iter().map(|t| {
         let data = t.contiguous();
-        let slice = data.as_f32_slice().unwrap();
+        let slice = data.as_f32_slice()
+            .expect("checkpoint: input tensor must be F32");
         Tensor::from_f32(slice, data.shape().dims())
     }).collect();
 
@@ -155,7 +156,8 @@ where
         move |inputs: &[Tensor]| vec![func(&inputs[0])],
         vec![input],
     );
-    results.into_iter().next().unwrap()
+    results.into_iter().next()
+        .expect("checkpoint_fn: function must produce at least one output")
 }
 
 #[cfg(test)]

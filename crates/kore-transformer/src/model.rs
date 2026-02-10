@@ -122,7 +122,8 @@ impl Transformer {
 
         // LM head: x @ lm_head → [seq_len, vocab_size]
         let x_data = x.as_f32_slice().ok_or(KoreError::StorageError("expected f32 tensor".into()))?;
-        let lm_data = self.lm_head.as_f32_slice().unwrap();
+        let lm_data = self.lm_head.as_f32_slice()
+            .ok_or(KoreError::StorageError("lm_head: expected f32 tensor".into()))?;
         let d = self.config.d_model;
         let v = self.config.vocab_size;
 
@@ -186,7 +187,8 @@ impl Transformer {
 
         // Decode: one token at a time
         for _ in 1..max_new_tokens {
-            let last_token = *tokens.last().unwrap();
+            let last_token = *tokens.last()
+                .expect("generate: tokens should never be empty during generation");
             let logits = self.forward(&[last_token], true)?;
             let logits_data = logits.as_f32_slice().ok_or(KoreError::StorageError("expected f32 logits".into()))?;
             let next = sampler::sample(logits_data, &tokens, sampler_config, rng);

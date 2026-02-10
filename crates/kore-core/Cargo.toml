@@ -12,6 +12,7 @@ half.workspace = true
 smallvec.workspace = true
 bytemuck.workspace = true
 rayon.workspace = true
+rand.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
 

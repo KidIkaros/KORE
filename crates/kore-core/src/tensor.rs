@@ -107,13 +107,53 @@ impl Tensor {
         Self::from_f32(&data, shape)
     }
 
-    /// Create a 1-D tensor with values from `start` to `end` (exclusive), step 1.
+    /// Create a tensor with random values from standard normal distribution N(0,1).
+    pub fn randn(shape: &[usize]) -> Self {
+        use rand::Rng;
+        let s = Shape::new(shape);
+        let numel = s.numel();
+        let mut rng = rand::thread_rng();
+        // Box-Muller transform for normal distribution
+        let data: Vec<f32> = (0..numel)
+            .map(|_| {
+                let u1: f32 = rng.gen_range(1e-5f32..1.0f32);
+                let u2: f32 = rng.gen_range(0.0f32..std::f32::consts::TAU);
+                (-2.0 * u1.ln()).sqrt() * u2.cos()
+            })
+            .collect();
+        Self::from_f32(&data, shape)
+    }
+
+    /// Create a tensor with random values uniformly distributed in [low, high).
+    pub fn rand_uniform(shape: &[usize], low: f32, high: f32) -> Self {
+        use rand::Rng;
+        let s = Shape::new(shape);
+        let numel = s.numel();
+        let mut rng = rand::thread_rng();
+        let data: Vec<f32> = (0..numel).map(|_| rng.gen_range(low..high)).collect();
+        Self::from_f32(&data, shape)
+    }
+
+    /// Create a 1-D tensor with values from `start` to `end` (exclusive).
+    ///
+    /// # Panics
+    /// Panics if `step` is zero or if `step` direction doesn't match `start`→`end`.
     pub fn arange(start: f32, end: f32, step: f32) -> Self {
+        assert!(step != 0.0, "arange: step must be non-zero");
+        assert!((end - start) * step > 0.0 || (end - start).abs() < f32::EPSILON,
+            "arange: step direction ({}) does not match start ({}) → end ({})", step, start, end);
         let mut data = Vec::new();
         let mut v = start;
-        while v < end {
-            data.push(v);
-            v += step;
+        if step > 0.0 {
+            while v < end {
+                data.push(v);
+                v += step;
+            }
+        } else {
+            while v > end {
+                data.push(v);
+                v += step;
+            }
         }
         let len = data.len();
         Self::from_f32(&data, &[len])
@@ -439,7 +479,8 @@ impl Tensor {
             let numel = self.numel();
             let mut data = vec![0.0f32; numel];
             for i in 0..numel {
-                data[i] = self.get_f32(i).unwrap_or(0.0);
+                data[i] = self.get_f32(i)
+                    .expect("contiguous: index out of bounds during copy");
             }
             let mut t = Tensor::from_f32(&data, self.shape.dims());
             t.requires_grad = self.requires_grad;
