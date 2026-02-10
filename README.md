@@ -20,9 +20,9 @@
 
 - **Autograd engine** — computation graph with automatic backward pass
 - **Native quantization** — 1.58-bit (ternary) and 2-bit (quaternary) layers with 8–16× compression
-- **State-space models** — Mamba S4, Mamba2, Mamba3 + Vision-Language JEPA
+- **LLM training** — decoder transformers (LLaMA, GPT, Mistral-style) with LoRA fine-tuning
 - **Flash Attention** — paged KV-cache, multi-head & grouped-query attention
-- **Edge inference** — `no_std` runtime targeting WASM, iOS, Android
+- **Edge inference** — BitNet, SqueezeNet, `.koref` export, `no_std` runtime (WASM, iOS, Android)
 - **Python bindings** — `import kore` with full NumPy interop, autograd, and safetensors I/O
 
 ---
@@ -180,8 +180,6 @@ The `kore` CLI provides built-in tools for benchmarking, training, serving, and 
 | `kore-clifford` | Geometric algebra engine |
 | `kore-attention` | Flash Attention, paged KV-cache |
 | `kore-transformer` | Decoder transformer, BitNetTransformer, QuatNetTransformer |
-| `kore-mamba` | Mamba selective state-space model (S4, Mamba2, Mamba3) |
-| `kore-vljepa` | Vision-Language JEPA model |
 | `kore-edge` | No-std inference runtime: WASM, iOS, Android |
 | `kore-data` | StreamingDataset, MultipackSampler, TokenBatcher |
 | `kore-serve` | Inference server (axum, OpenAI-compatible) |
@@ -195,7 +193,6 @@ The `kore` CLI provides built-in tools for benchmarking, training, serving, and 
 | Notebook | Description |
 |----------|-------------|
 | [`colab_quickstart.ipynb`](examples/colab_quickstart.ipynb) | Install, tensors, autograd, training, quantized layers, CNN, save/load |
-| [`mamba3_jepa_training.ipynb`](examples/mamba3_jepa_training.ipynb) | End-to-end Mamba3 + Vision-Language JEPA training |
 
 ---
 

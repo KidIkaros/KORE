@@ -53,8 +53,6 @@ crates/
   kore-clifford/    # Geometric algebra
   kore-attention/   # Flash Attention, paged KV-cache
   kore-transformer/ # Decoder transformer models
-  kore-mamba/       # Mamba SSM (S4, Mamba2, Mamba3)
-  kore-vljepa/      # Vision-Language JEPA
   kore-serve/       # Inference server (axum)
   kore-edge/        # No-std inference runtime
   kore-data/        # Dataset utilities

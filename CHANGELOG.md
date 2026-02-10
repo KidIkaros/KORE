@@ -6,10 +6,6 @@ All notable changes to KORE will be documented in this file.
 
 First hardened release of the KORE ML Training Framework.
 
-### New Crates
-- **kore-mamba** — Mamba selective state-space model (S4, Mamba2, Mamba3)
-- **kore-vljepa** — Vision-Language JEPA model
-
 ### Python Bindings (maturin)
 - Autograd: `backward()`, `requires_grad_()`, `.grad`, `zero_grad()`
 - Tensors: `randn()`, `rand_uniform()`
@@ -27,7 +23,7 @@ First hardened release of the KORE ML Training Framework.
 - All bare `unwrap()` replaced with `?` or descriptive `expect()`
 - `usize` underflow guards, NaN-safe sorting, softmax div-by-zero guard
 - Precondition asserts for kernel_size, group_size, ngroups, prompt length
-- `Result`-based error propagation throughout core/nn/optim/mamba crates
+- `Result`-based error propagation throughout core/nn/optim crates
 
 ### Stats
 - **588 tests passing**, zero failures
