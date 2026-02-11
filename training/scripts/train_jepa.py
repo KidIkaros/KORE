@@ -196,56 +196,56 @@ def train_one_epoch(
         if angn_module is not None and do_diag:
             angn_module.enable_activation_tracking(True)
 
-        # Forward JEPA (with optional BF16 autocast)
-        fwd_kwargs = dict(
-            images=images,
-            query_tokens=query_embeds,
-            target_tokens=tokens,
-            temperature=temperature,
-            collect_state_norms=do_diag,
-        )
-        if autocast_ctx is not None:
-            with autocast_ctx:
+        try:
+            # Forward JEPA (with optional BF16 autocast)
+            fwd_kwargs = dict(
+                images=images,
+                query_tokens=query_embeds,
+                target_tokens=tokens,
+                temperature=temperature,
+                collect_state_norms=do_diag,
+            )
+            if autocast_ctx is not None:
+                with autocast_ctx:
+                    outputs = model.forward_jepa(**fwd_kwargs)
+                    loss = outputs["loss"]
+            else:
                 outputs = model.forward_jepa(**fwd_kwargs)
                 loss = outputs["loss"]
-                angn_loss = torch.tensor(0.0, device=device)
-                if model.predictor.angn is not None and angn_reg_weight > 0:
-                    angn_loss = model.predictor.angn.gate_regularization_loss()
-                    loss = loss + angn_reg_weight * angn_loss
-        else:
-            outputs = model.forward_jepa(**fwd_kwargs)
-            loss = outputs["loss"]
+
+            # ANGN regularization (outside autocast — auxiliary term)
             angn_loss = torch.tensor(0.0, device=device)
             if model.predictor.angn is not None and angn_reg_weight > 0:
                 angn_loss = model.predictor.angn.gate_regularization_loss()
                 loss = loss + angn_reg_weight * angn_loss
 
-        # Backward
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-        if scheduler is not None:
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
 
-        total_loss += outputs["loss"].item()
-        total_acc += outputs["accuracy"].item()
-        total_angn_loss += angn_loss.item()
-        n_batches += 1
+            total_loss += outputs["loss"].item()
+            total_acc += outputs["accuracy"].item()
+            total_angn_loss += angn_loss.item()
+            n_batches += 1
 
-        # Diagnostics (State EKG, ANGN heatmap, dreaming)
-        if do_diag:
-            run_diagnostics(
-                state_norms=outputs.get("state_norms"),
-                angn=angn_module,
-                pred_embed=outputs.get("pred_embed"),
-                decoder=model.y_decoder,
-                step=global_step,
-                wandb_run=wandb_run,
-            )
-            # Disable ANGN tracking until next diagnostic step
-            if angn_module is not None:
+            # Diagnostics (State EKG, ANGN heatmap, dreaming)
+            if do_diag:
+                run_diagnostics(
+                    state_norms=outputs.get("state_norms"),
+                    angn=angn_module,
+                    pred_embed=outputs.get("pred_embed"),
+                    decoder=model.y_decoder,
+                    step=global_step,
+                    wandb_run=wandb_run,
+                )
+        finally:
+            # Always disable ANGN tracking to avoid leaked overhead on exception
+            if angn_module is not None and do_diag:
                 angn_module.enable_activation_tracking(False)
 
         if (batch_idx + 1) % log_interval == 0:
@@ -438,6 +438,8 @@ def main():
 
     best_loss = float("inf")
 
+    prev_seq_len = args.max_seq_len
+
     for epoch in range(1, args.epochs + 1):
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{args.epochs}")
@@ -456,7 +458,7 @@ def main():
             else:
                 curr_seq_len = args.max_seq_len
                 phase_name = "full"
-            if curr_seq_len != dataset.max_seq_len:
+            if curr_seq_len != prev_seq_len:
                 dataset = ImageTextDataset(
                     args.data_dir, image_size=image_size, max_seq_len=curr_seq_len,
                 )
@@ -464,6 +466,7 @@ def main():
                     dataset, batch_size=args.batch_size, shuffle=True,
                     num_workers=args.num_workers, pin_memory=True, drop_last=True,
                 )
+                prev_seq_len = curr_seq_len
             print(f"  Curriculum: {phase_name} (seq_len={curr_seq_len})")
 
         train_metrics = train_one_epoch(

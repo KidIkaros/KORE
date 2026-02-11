@@ -206,7 +206,9 @@ class Mamba3Layer(nn.Module):
             outputs.append(y_t)
 
         # Capture final state norm for diagnostics (only when requested)
-        state_norm = h.norm().item() if collect_state_norm else 0.0
+        state_norm = 0.0
+        if collect_state_norm:
+            state_norm = h.norm().item()
 
         y = torch.stack(outputs, dim=1)  # (B, L, nheads)
         # Expand back to d_inner via repeat
