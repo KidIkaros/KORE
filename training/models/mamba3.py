@@ -129,7 +129,7 @@ class Mamba3Layer(nn.Module):
 
         self.trapezoidal_alpha = config.trapezoidal_alpha
 
-    def forward(self, x: torch.Tensor, collect_state_norm: bool = False) -> tuple[torch.Tensor, float]:
+    def forward(self, x: torch.Tensor, collect_state_norm: bool = False) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward pass.
 
         Args:
@@ -137,7 +137,7 @@ class Mamba3Layer(nn.Module):
             collect_state_norm: If True, compute and return L2 norm of final hidden state.
 
         Returns:
-            (output, state_norm) where state_norm is 0.0 when not collected.
+            (output, state_norm_tensor) where state_norm_tensor is None when not collected.
         """
         batch, seq_len, _ = x.shape
 
@@ -205,10 +205,10 @@ class Mamba3Layer(nn.Module):
             y_t = y_t + self.D.unsqueeze(0) * x_t.mean(dim=-1)  # D skip connection
             outputs.append(y_t)
 
-        # Capture final state norm for diagnostics (only when requested)
-        state_norm = 0.0
+        # Capture final state norm for diagnostics (stays on GPU, no .item() here)
+        state_norm = None
         if collect_state_norm:
-            state_norm = h.norm().item()
+            state_norm = h.norm()
 
         y = torch.stack(outputs, dim=1)  # (B, L, nheads)
         # Expand back to d_inner via repeat
@@ -256,7 +256,7 @@ class Mamba3Backbone(nn.Module):
             (batch, seq_len, d_model) if collect_state_norms is False,
             else (output, state_norms) where state_norms is a list of floats.
         """
-        state_norms = []
+        state_norm_tensors: list[torch.Tensor] | None = [] if collect_state_norms else None
         for i, (layer, norm) in enumerate(zip(self.layers, self.norms)):
             # 1) ANGN gate (if provided)
             if gate_fn is not None:
@@ -268,10 +268,12 @@ class Mamba3Backbone(nn.Module):
             mixed, s_norm = layer(normed, collect_state_norm=collect_state_norms)
             # 4) Residual
             hidden = hidden + mixed
-            if collect_state_norms:
-                state_norms.append(s_norm)
+            if state_norm_tensors is not None and s_norm is not None:
+                state_norm_tensors.append(s_norm)
 
         output = self.final_norm(hidden)
-        if collect_state_norms:
+        if collect_state_norms and state_norm_tensors is not None:
+            # Single CPU sync: convert all GPU norm tensors to floats at once
+            state_norms = [t.item() for t in state_norm_tensors]
             return output, state_norms
         return output
