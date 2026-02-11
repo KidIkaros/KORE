@@ -99,6 +99,7 @@ class AdaptiveNeuralGate(nn.Module):
 
         # Diagnostics: last gate activations per layer (mean over batch/seq/dim)
         self._last_gate_activations: list[float] = []
+        self._track_activations: bool = False
 
     def gate_layer(self, hidden: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Apply gating for a specific backbone layer.
@@ -115,10 +116,11 @@ class AdaptiveNeuralGate(nn.Module):
 
         gated, gate_activation = self.gates[layer_idx](hidden)
 
-        # Store mean activation for diagnostics
-        if layer_idx == 0:
-            self._last_gate_activations = []
-        self._last_gate_activations.append(gate_activation.mean().item())
+        # Store mean activation for diagnostics (only when tracking is enabled)
+        if self._track_activations:
+            if layer_idx == 0:
+                self._last_gate_activations = []
+            self._last_gate_activations.append(gate_activation.mean().item())
 
         # Update EMA on last gated layer (only during eval/inference)
         if not self.training and layer_idx == len(self.gates) - 1:
@@ -145,11 +147,16 @@ class AdaptiveNeuralGate(nn.Module):
         self.ema_activation.fill_(1.0)
         self.step_count.zero_()
 
+    def enable_activation_tracking(self, enabled: bool = True):
+        """Enable or disable gate activation tracking for diagnostics."""
+        self._track_activations = enabled
+
     def get_last_gate_activations(self) -> list[float]:
         """Return mean gate activation per layer from the most recent forward pass.
 
         Returns:
-            List of floats, one per gate layer. Empty if no forward pass yet.
+            List of floats, one per gate layer. Empty if tracking is disabled
+            or no forward pass has occurred since tracking was enabled.
         """
         return list(self._last_gate_activations)
 

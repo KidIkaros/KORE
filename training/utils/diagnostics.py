@@ -166,17 +166,22 @@ def log_dream_text(
     Returns:
         List of decoded strings (one per batch element, max 4).
     """
+    was_training = decoder.training
     decoder.eval()
 
     # Only decode first few samples to save compute
     n_samples = min(pred_embed.shape[0], 4)
     embed_subset = pred_embed[:n_samples].detach()
 
-    token_sequences = decoder.generate(
-        embed_subset,
-        max_tokens=max_tokens,
-        temperature=0.0,  # Greedy for deterministic dreams
-    )
+    try:
+        token_sequences = decoder.generate(
+            embed_subset,
+            max_tokens=max_tokens,
+            temperature=0.0,  # Greedy for deterministic dreams
+        )
+    finally:
+        if was_training:
+            decoder.train()
 
     # Convert token IDs to readable strings
     dream_texts = []
