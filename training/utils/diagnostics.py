@@ -10,6 +10,7 @@ All functions are W&B-aware but degrade gracefully when W&B is unavailable.
 
 from __future__ import annotations
 
+import html as html_mod
 import io
 import logging
 from typing import TYPE_CHECKING
@@ -201,7 +202,7 @@ def log_dream_text(
         try:
             import wandb
             html = "<br>".join(
-                f"<b>Sample {i}:</b> <code>{text}</code>"
+                f"<b>Sample {i}:</b> <code>{html_mod.escape(text)}</code>"
                 for i, text in enumerate(dream_texts)
             )
             wandb_run.log({"dream_text": wandb.Html(html)}, step=step)

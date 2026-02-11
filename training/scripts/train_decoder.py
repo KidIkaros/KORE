@@ -160,14 +160,14 @@ def train_one_epoch(
                 loss = F.cross_entropy(
                     logits.reshape(-1, logits.shape[-1]),
                     target_labels.reshape(-1),
-                    ignore_index=0,
+                    ignore_index=-100,
                 )
         else:
             logits = model.y_decoder(pred_embed, input_tokens)
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]),
                 target_labels.reshape(-1),
-                ignore_index=0,
+                ignore_index=-100,
             )
 
         optimizer.zero_grad()
