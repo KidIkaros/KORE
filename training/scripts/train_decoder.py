@@ -118,7 +118,6 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
     log_interval: int = 50,
-    scaler: torch.amp.GradScaler | None = None,
     autocast_ctx=None,
 ) -> dict:
     """Train decoder for one epoch."""
@@ -172,16 +171,9 @@ def train_one_epoch(
             )
 
         optimizer.zero_grad()
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.y_decoder.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.y_decoder.parameters(), max_norm=1.0)
-            optimizer.step()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.y_decoder.parameters(), max_norm=1.0)
+        optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
@@ -239,14 +231,12 @@ def main():
 
     model = model.to(device)
 
-    # BF16 mixed precision setup
-    scaler = None
+    # BF16 mixed precision setup (no GradScaler — BF16 has same dynamic range as FP32)
     autocast_ctx = None
     if args.bf16:
         if device.type == "cuda" and torch.cuda.is_bf16_supported():
             print("[Phase 2] BF16 mixed precision enabled")
             autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-            scaler = torch.amp.GradScaler()
         else:
             print("[Phase 2] BF16 requested but not supported — falling back to FP32")
 
@@ -281,7 +271,7 @@ def main():
 
         metrics = train_one_epoch(
             model, dataloader, optimizer, device, epoch,
-            scaler=scaler, autocast_ctx=autocast_ctx,
+            autocast_ctx=autocast_ctx,
         )
         print(f"  Loss: {metrics['loss']:.4f}")
 

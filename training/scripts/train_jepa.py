@@ -154,7 +154,6 @@ def train_one_epoch(
     log_interval: int = 50,
     diag_interval: int = 200,
     wandb_run=None,
-    scaler: torch.amp.GradScaler | None = None,
     autocast_ctx=None,
 ) -> dict:
     """Train one epoch of Phase 1 JEPA pretraining."""
@@ -221,18 +220,11 @@ def train_one_epoch(
                 angn_loss = model.predictor.angn.gate_regularization_loss()
                 loss = loss + angn_reg_weight * angn_loss
 
-        # Backward (with optional GradScaler for mixed precision)
+        # Backward
         optimizer.zero_grad()
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
 
         if scheduler is not None:
             scheduler.step()
@@ -361,14 +353,12 @@ def main():
         import wandb
         wandb_run = wandb.init(project=args.wandb_project, config=vars(args))
 
-    # BF16 mixed precision setup
-    scaler = None
+    # BF16 mixed precision setup (no GradScaler — BF16 has same dynamic range as FP32)
     autocast_ctx = None
     if args.bf16:
         if device.type == "cuda" and torch.cuda.is_bf16_supported():
             print("[Phase 1] BF16 mixed precision enabled")
             autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-            scaler = torch.amp.GradScaler()
         else:
             print("[Phase 1] BF16 requested but not supported — falling back to FP32")
 
@@ -481,7 +471,6 @@ def main():
             epoch, args.temperature, args.angn_reg_weight,
             diag_interval=args.diag_interval,
             wandb_run=wandb_run,
-            scaler=scaler,
             autocast_ctx=autocast_ctx,
         )
         print(f"  Train: loss={train_metrics['loss']:.4f} acc={train_metrics['accuracy']:.3f}")
