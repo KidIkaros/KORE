@@ -467,7 +467,7 @@ def main():
                     num_workers=args.num_workers, pin_memory=True, drop_last=True,
                 )
                 prev_seq_len = curr_seq_len
-            print(f"  Curriculum: {phase_name} (seq_len={curr_seq_len})")
+                print(f"  Curriculum: {phase_name} (seq_len={curr_seq_len})")
 
         train_metrics = train_one_epoch(
             model, dataloader, optimizer, scheduler, device,
