@@ -10,7 +10,6 @@ All functions are W&B-aware but degrade gracefully when W&B is unavailable.
 
 from __future__ import annotations
 
-import html as html_mod
 import io
 import logging
 from typing import TYPE_CHECKING
@@ -150,7 +149,6 @@ def log_dream_text(
     step: int,
     max_tokens: int = 32,
     wandb_run=None,
-    tokenizer=None,
 ) -> list[str]:
     """Decode predicted embedding to text and log it.
 
@@ -164,45 +162,34 @@ def log_dream_text(
         step: Current training step.
         max_tokens: Max tokens to generate per sample.
         wandb_run: Optional wandb run object.
-        tokenizer: Optional tokenizer with a decode(list[int]) -> str method
-            (e.g. HuggingFace tokenizer). If None, falls back to printable
-            ASCII mapping which only works for character-level vocabularies.
 
     Returns:
         List of decoded strings (one per batch element, max 4).
     """
-    was_training = decoder.training
     decoder.eval()
 
     # Only decode first few samples to save compute
     n_samples = min(pred_embed.shape[0], 4)
     embed_subset = pred_embed[:n_samples].detach()
 
-    try:
-        token_sequences = decoder.generate(
-            embed_subset,
-            max_tokens=max_tokens,
-            temperature=0.0,  # Greedy for deterministic dreams
-        )
-    finally:
-        if was_training:
-            decoder.train()
+    token_sequences = decoder.generate(
+        embed_subset,
+        max_tokens=max_tokens,
+        temperature=0.0,  # Greedy for deterministic dreams
+    )
 
     # Convert token IDs to readable strings
     dream_texts = []
     for seq in token_sequences:
-        if tokenizer is not None:
-            dream_texts.append(tokenizer.decode(seq, skip_special_tokens=True))
-        else:
-            # Fallback: printable ASCII range (character-level vocabularies only)
-            chars = [chr(t) if 32 <= t < 127 else "?" for t in seq]
-            dream_texts.append("".join(chars))
+        # Best-effort: printable ASCII range, replace others with '?'
+        chars = [chr(t) if 32 <= t < 127 else "?" for t in seq]
+        dream_texts.append("".join(chars))
 
     if wandb_run is not None:
         try:
             import wandb
             html = "<br>".join(
-                f"<b>Sample {i}:</b> <code>{html_mod.escape(text)}</code>"
+                f"<b>Sample {i}:</b> <code>{text}</code>"
                 for i, text in enumerate(dream_texts)
             )
             wandb_run.log({"dream_text": wandb.Html(html)}, step=step)
@@ -227,7 +214,6 @@ def run_diagnostics(
     step: int,
     wandb_run=None,
     dream_max_tokens: int = 32,
-    tokenizer=None,
 ) -> dict:
     """Run all enabled diagnostics in one call.
 
@@ -239,7 +225,6 @@ def run_diagnostics(
         step: Current training step.
         wandb_run: Optional wandb run object.
         dream_max_tokens: Max tokens for dream generation.
-        tokenizer: Optional tokenizer with decode() for BPE/WordPiece vocabularies.
 
     Returns:
         Dict with all collected diagnostic data.
@@ -255,7 +240,6 @@ def run_diagnostics(
     if pred_embed is not None and decoder is not None:
         result["dream_texts"] = log_dream_text(
             pred_embed, decoder, step, dream_max_tokens, wandb_run,
-            tokenizer=tokenizer,
         )
 
     return result

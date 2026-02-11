@@ -57,6 +57,7 @@ class Mamba3Jepa(nn.Module):
         query_tokens: torch.Tensor,
         target_tokens: torch.Tensor,
         temperature: float = 0.07,
+        collect_state_norms: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Phase 1: JEPA forward pass with InfoNCE loss.
 
@@ -65,9 +66,11 @@ class Mamba3Jepa(nn.Module):
             query_tokens: (batch, n_qry, query_embed_dim) query embeddings
             target_tokens: (batch, seq_len) target text token IDs
             temperature: InfoNCE temperature
+            collect_state_norms: If True, include 'state_norms' in output.
 
         Returns:
-            Dict with 'loss', 'pred_embed', 'target_embed', 'accuracy'
+            Dict with 'loss', 'pred_embed', 'target_embed', 'accuracy',
+            and optionally 'state_norms'.
         """
         batch = images.shape[0]
 
@@ -76,7 +79,13 @@ class Mamba3Jepa(nn.Module):
             visual_tokens = self.x_encoder(images)  # (B, N, vision_dim)
 
         # Predictor
-        pred_embed = self.predictor(visual_tokens, query_tokens)  # (B, embed_dim)
+        predictor_out = self.predictor(
+            visual_tokens, query_tokens, collect_state_norms=collect_state_norms,
+        )
+        if collect_state_norms:
+            pred_embed, state_norms = predictor_out
+        else:
+            pred_embed = predictor_out
 
         # Y-Encoder (target)
         target_embed = self.y_encoder(target_tokens)  # (B, embed_dim)
@@ -92,12 +101,15 @@ class Mamba3Jepa(nn.Module):
             preds = logits.argmax(dim=-1)
             accuracy = (preds == labels).float().mean()
 
-        return {
+        result = {
             "loss": loss,
             "pred_embed": pred_embed,
             "target_embed": target_embed,
             "accuracy": accuracy,
         }
+        if collect_state_norms:
+            result["state_norms"] = state_norms
+        return result
 
     def forward_jepa_text_only(
         self,

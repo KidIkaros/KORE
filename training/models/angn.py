@@ -97,6 +97,9 @@ class AdaptiveNeuralGate(nn.Module):
         self.register_buffer("ema_activation", torch.ones(1))
         self.register_buffer("step_count", torch.zeros(1, dtype=torch.long))
 
+        # Diagnostics: last gate activations per layer (mean over batch/seq/dim)
+        self._last_gate_activations: list[float] = []
+
     def gate_layer(self, hidden: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Apply gating for a specific backbone layer.
 
@@ -111,6 +114,11 @@ class AdaptiveNeuralGate(nn.Module):
             return hidden
 
         gated, gate_activation = self.gates[layer_idx](hidden)
+
+        # Store mean activation for diagnostics
+        if layer_idx == 0:
+            self._last_gate_activations = []
+        self._last_gate_activations.append(gate_activation.mean().item())
 
         # Update EMA on last gated layer (only during eval/inference)
         if not self.training and layer_idx == len(self.gates) - 1:
@@ -136,6 +144,14 @@ class AdaptiveNeuralGate(nn.Module):
         """Reset EMA tracking state."""
         self.ema_activation.fill_(1.0)
         self.step_count.zero_()
+
+    def get_last_gate_activations(self) -> list[float]:
+        """Return mean gate activation per layer from the most recent forward pass.
+
+        Returns:
+            List of floats, one per gate layer. Empty if no forward pass yet.
+        """
+        return list(self._last_gate_activations)
 
     def gate_regularization_loss(self) -> torch.Tensor:
         """Auxiliary loss to encourage sparse gating.
