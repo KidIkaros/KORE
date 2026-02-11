@@ -45,6 +45,7 @@ from models.angn import ANGNConfig
 from models.y_encoder import Mamba3TextEncoder
 from models.y_decoder import Mamba3Decoder
 from utils.export_weights import export_to_safetensors
+from utils.diagnostics import run_diagnostics
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -151,6 +152,10 @@ def train_one_epoch(
     temperature: float = 0.07,
     angn_reg_weight: float = 0.01,
     log_interval: int = 50,
+    diag_interval: int = 200,
+    wandb_run=None,
+    scaler: torch.amp.GradScaler | None = None,
+    autocast_ctx=None,
 ) -> dict:
     """Train one epoch of Phase 1 JEPA pretraining."""
     model.train()
@@ -183,27 +188,46 @@ def train_one_epoch(
                                       device=device)
                     query_embeds = torch.cat([query_embeds, pad], dim=-1)
 
-        # Forward JEPA
-        outputs = model.forward_jepa(
+        # Determine if diagnostics are due this step
+        global_step = (epoch - 1) * len(dataloader) + batch_idx
+        do_diag = diag_interval > 0 and (global_step + 1) % diag_interval == 0
+
+        # Forward JEPA (with optional BF16 autocast)
+        fwd_kwargs = dict(
             images=images,
             query_tokens=query_embeds,
             target_tokens=tokens,
             temperature=temperature,
+            collect_state_norms=do_diag,
         )
+        if autocast_ctx is not None:
+            with autocast_ctx:
+                outputs = model.forward_jepa(**fwd_kwargs)
+                loss = outputs["loss"]
+                angn_loss = torch.tensor(0.0, device=device)
+                if model.predictor.angn is not None and angn_reg_weight > 0:
+                    angn_loss = model.predictor.angn.gate_regularization_loss()
+                    loss = loss + angn_reg_weight * angn_loss
+        else:
+            outputs = model.forward_jepa(**fwd_kwargs)
+            loss = outputs["loss"]
+            angn_loss = torch.tensor(0.0, device=device)
+            if model.predictor.angn is not None and angn_reg_weight > 0:
+                angn_loss = model.predictor.angn.gate_regularization_loss()
+                loss = loss + angn_reg_weight * angn_loss
 
-        loss = outputs["loss"]
-
-        # ANGN regularization (encourage sparse gating)
-        angn_loss = torch.tensor(0.0, device=device)
-        if model.predictor.angn is not None and angn_reg_weight > 0:
-            angn_loss = model.predictor.angn.gate_regularization_loss()
-            loss = loss + angn_reg_weight * angn_loss
-
-        # Backward
+        # Backward (with optional GradScaler for mixed precision)
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         if scheduler is not None:
             scheduler.step()
@@ -212,6 +236,17 @@ def train_one_epoch(
         total_acc += outputs["accuracy"].item()
         total_angn_loss += angn_loss.item()
         n_batches += 1
+
+        # Diagnostics (State EKG, ANGN heatmap, dreaming)
+        if do_diag:
+            run_diagnostics(
+                state_norms=outputs.get("state_norms"),
+                angn=getattr(model.predictor, "angn", None),
+                pred_embed=outputs.get("pred_embed"),
+                decoder=model.y_decoder,
+                step=global_step,
+                wandb_run=wandb_run,
+            )
 
         if (batch_idx + 1) % log_interval == 0:
             avg_loss = total_loss / n_batches
@@ -301,15 +336,33 @@ def main():
     parser.add_argument("--wandb", action="store_true",
                         help="Enable W&B logging")
     parser.add_argument("--wandb-project", type=str, default="mamba3-jepa")
+    parser.add_argument("--diag-interval", type=int, default=200,
+                        help="Run diagnostics every N steps (0 to disable)")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Enable BF16 mixed precision (CUDA only)")
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Enable curriculum learning (progressive seq length)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Phase 1] Device: {device}")
 
     # W&B
+    wandb_run = None
     if args.wandb:
         import wandb
-        wandb.init(project=args.wandb_project, config=vars(args))
+        wandb_run = wandb.init(project=args.wandb_project, config=vars(args))
+
+    # BF16 mixed precision setup
+    scaler = None
+    autocast_ctx = None
+    if args.bf16:
+        if device.type == "cuda" and torch.cuda.is_bf16_supported():
+            print("[Phase 1] BF16 mixed precision enabled")
+            autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+            scaler = torch.amp.GradScaler()
+        else:
+            print("[Phase 1] BF16 requested but not supported — falling back to FP32")
 
     # ─── Build model ───
     if args.tiny:
@@ -392,9 +445,28 @@ def main():
         print(f"Epoch {epoch}/{args.epochs}")
         print(f"{'='*60}")
 
+        # Curriculum learning: progressive sequence length
+        if args.curriculum:
+            progress = epoch / args.epochs
+            if progress < 1/3:
+                curr_seq_len = max(128, args.max_seq_len // 4)
+                phase_name = "short"
+            elif progress < 2/3:
+                curr_seq_len = max(256, args.max_seq_len // 2)
+                phase_name = "medium"
+            else:
+                curr_seq_len = args.max_seq_len
+                phase_name = "full"
+            dataset.max_seq_len = curr_seq_len
+            print(f"  Curriculum: {phase_name} (seq_len={curr_seq_len})")
+
         train_metrics = train_one_epoch(
             model, dataloader, optimizer, scheduler, device,
             epoch, args.temperature, args.angn_reg_weight,
+            diag_interval=args.diag_interval,
+            wandb_run=wandb_run,
+            scaler=scaler,
+            autocast_ctx=autocast_ctx,
         )
         print(f"  Train: loss={train_metrics['loss']:.4f} acc={train_metrics['accuracy']:.3f}")
 
@@ -417,9 +489,8 @@ def main():
             print(f"  New best model (loss={best_loss:.4f}) → {best_path}")
 
         # W&B
-        if args.wandb:
-            import wandb
-            wandb.log({"epoch": epoch, **train_metrics})
+        if wandb_run is not None:
+            wandb_run.log({"epoch": epoch, **train_metrics})
 
     # ─── Export to safetensors ───
     print(f"\n{'='*60}")
