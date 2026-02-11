@@ -87,10 +87,9 @@ impl Module for RMSNorm {
         let tracks = autograd::is_grad_enabled()
             && (input.tracks_grad() || self.gamma.tracks_grad());
         if tracks {
-            // Order must match fused_rms_norm_backward return: (dx, dgamma)
             let mut inputs = Vec::new();
-            if let Some(n) = input.grad_node() { inputs.push(Arc::clone(n)); }  // idx 0 → dx
-            if let Some(n) = self.gamma.grad_node() { inputs.push(Arc::clone(n)); }  // idx 1 → dgamma
+            if let Some(n) = input.grad_node() { inputs.push(Arc::clone(n)); }
+            if let Some(n) = self.gamma.grad_node() { inputs.push(Arc::clone(n)); }
             let grad_fn = Box::new(FusedRMSNormBackward {
                 input: input.clone(),
                 gamma: self.gamma.clone(),

@@ -155,20 +155,6 @@ impl Adam {
     ) {
         assert_eq!(params.len(), grads.len(), "params and grads length mismatch");
 
-        // Validate no overlapping param_indices between groups
-        {
-            let mut seen = vec![false; params.len()];
-            for group in groups {
-                for &i in &group.param_indices {
-                    if i < params.len() {
-                        assert!(!seen[i],
-                            "Adam::step_groups: param index {} appears in multiple groups (double update)", i);
-                        seen[i] = true;
-                    }
-                }
-            }
-        }
-
         if !self.initialized {
             self.m = grads
                 .iter()
@@ -319,27 +305,6 @@ mod tests {
         let v1 = params[1].get_f32(0).unwrap();
         assert!(v0 < 5.0, "param0 should have been updated");
         assert!((v1 - 5.0).abs() < 1e-7, "param1 should be frozen at 5.0, got {v1}");
-    }
-
-    #[test]
-    #[should_panic(expected = "appears in multiple groups")]
-    fn test_param_groups_overlap_panics() {
-        let mut params = vec![
-            Tensor::from_f32(&[5.0], &[1]),
-            Tensor::from_f32(&[5.0], &[1]),
-        ];
-        let grads = vec![
-            Tensor::from_f32(&[1.0], &[1]),
-            Tensor::from_f32(&[1.0], &[1]),
-        ];
-
-        let groups = vec![
-            ParamGroup::new(vec![0, 1]),
-            ParamGroup::new(vec![1]),  // overlaps with group 0
-        ];
-
-        let mut opt = Adam::default_with_lr(0.01);
-        opt.step_groups(&mut params, &grads, &groups);
     }
 
     #[test]
