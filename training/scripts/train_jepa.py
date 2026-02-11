@@ -192,6 +192,11 @@ def train_one_epoch(
         global_step = (epoch - 1) * len(dataloader) + batch_idx
         do_diag = diag_interval > 0 and (global_step + 1) % diag_interval == 0
 
+        # Enable ANGN activation tracking only when diagnostics are due
+        angn_module = getattr(model.predictor, "angn", None)
+        if angn_module is not None and do_diag:
+            angn_module.enable_activation_tracking(True)
+
         # Forward JEPA (with optional BF16 autocast)
         fwd_kwargs = dict(
             images=images,
@@ -241,12 +246,15 @@ def train_one_epoch(
         if do_diag:
             run_diagnostics(
                 state_norms=outputs.get("state_norms"),
-                angn=getattr(model.predictor, "angn", None),
+                angn=angn_module,
                 pred_embed=outputs.get("pred_embed"),
                 decoder=model.y_decoder,
                 step=global_step,
                 wandb_run=wandb_run,
             )
+            # Disable ANGN tracking until next diagnostic step
+            if angn_module is not None:
+                angn_module.enable_activation_tracking(False)
 
         if (batch_idx + 1) % log_interval == 0:
             avg_loss = total_loss / n_batches
@@ -446,6 +454,7 @@ def main():
         print(f"{'='*60}")
 
         # Curriculum learning: progressive sequence length
+        # Recreate dataset + dataloader on phase change so forked workers see the new seq_len
         if args.curriculum:
             progress = epoch / args.epochs
             if progress < 1/3:
@@ -457,7 +466,14 @@ def main():
             else:
                 curr_seq_len = args.max_seq_len
                 phase_name = "full"
-            dataset.max_seq_len = curr_seq_len
+            if curr_seq_len != dataset.max_seq_len:
+                dataset = ImageTextDataset(
+                    args.data_dir, image_size=image_size, max_seq_len=curr_seq_len,
+                )
+                dataloader = DataLoader(
+                    dataset, batch_size=args.batch_size, shuffle=True,
+                    num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                )
             print(f"  Curriculum: {phase_name} (seq_len={curr_seq_len})")
 
         train_metrics = train_one_epoch(

@@ -129,15 +129,15 @@ class Mamba3Layer(nn.Module):
 
         self.trapezoidal_alpha = config.trapezoidal_alpha
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, float]:
+    def forward(self, x: torch.Tensor, collect_state_norm: bool = False) -> tuple[torch.Tensor, float]:
         """Forward pass.
 
         Args:
             x: (batch, seq_len, d_model)
+            collect_state_norm: If True, compute and return L2 norm of final hidden state.
 
         Returns:
-            (output, state_norm) where output is (batch, seq_len, d_model)
-            and state_norm is the L2 norm of the final hidden state.
+            (output, state_norm) where state_norm is 0.0 when not collected.
         """
         batch, seq_len, _ = x.shape
 
@@ -205,8 +205,8 @@ class Mamba3Layer(nn.Module):
             y_t = y_t + self.D.unsqueeze(0) * x_t.mean(dim=-1)  # D skip connection
             outputs.append(y_t)
 
-        # Capture final state norm for diagnostics
-        state_norm = h.norm().item()
+        # Capture final state norm for diagnostics (only when requested)
+        state_norm = h.norm().item() if collect_state_norm else 0.0
 
         y = torch.stack(outputs, dim=1)  # (B, L, nheads)
         # Expand back to d_inner via repeat
@@ -263,10 +263,11 @@ class Mamba3Backbone(nn.Module):
             # 2) Pre-norm
             normed = norm(hidden)
             # 3) Mixer
-            mixed, s_norm = layer(normed)
+            mixed, s_norm = layer(normed, collect_state_norm=collect_state_norms)
             # 4) Residual
             hidden = hidden + mixed
-            state_norms.append(s_norm)
+            if collect_state_norms:
+                state_norms.append(s_norm)
 
         output = self.final_norm(hidden)
         if collect_state_norms:
