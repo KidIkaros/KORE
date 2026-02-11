@@ -7,8 +7,10 @@
 //! Used in LLaMA, Mistral, and most modern transformer architectures.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use kore_core::{DType, KoreError, Tensor};
+use kore_core::autograd::{self, GradFn, GradNode};
 use crate::module::Module;
 
 /// Root Mean Square Layer Normalization.
@@ -71,37 +73,33 @@ impl Module for RMSNorm {
             });
         }
 
-        let data = input.contiguous();
-        let x = data.as_f32_slice()
-            .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
-        let gamma = self.gamma.as_f32_slice()
-            .ok_or_else(|| KoreError::UnsupportedDType(self.gamma.dtype()))?;
-
-        let batch: usize = dims[..ndim - 1].iter().product();
-        let d = self.dim;
-        if d == 0 {
+        if self.dim == 0 {
             return Err(KoreError::ShapeMismatch {
-                expected: vec![1],  // dim must be >= 1
+                expected: vec![1],
                 got: vec![0],
             });
         }
-        let mut output = vec![0.0f32; x.len()];
 
-        for b in 0..batch {
-            let row = &x[b * d..(b + 1) * d];
-            let out_row = &mut output[b * d..(b + 1) * d];
+        // Use fused kernel for forward pass
+        let result = kore_kernels::cpu_fused::fused_rms_norm(input, &self.gamma, self.eps)?;
 
-            // Compute RMS: sqrt(mean(x^2) + eps)
-            let sq_mean: f32 = row.iter().map(|v| v * v).sum::<f32>() / d as f32;
-            let rms = (sq_mean + self.eps).sqrt();
-            let inv_rms = 1.0 / rms;
-
-            for i in 0..d {
-                out_row[i] = row[i] * inv_rms * gamma[i];
-            }
+        // Wire into autograd graph if tracking gradients
+        let tracks = autograd::is_grad_enabled()
+            && (input.tracks_grad() || self.gamma.tracks_grad());
+        if tracks {
+            let mut inputs = Vec::new();
+            if let Some(n) = input.grad_node() { inputs.push(Arc::clone(n)); }
+            if let Some(n) = self.gamma.grad_node() { inputs.push(Arc::clone(n)); }
+            let grad_fn = Box::new(FusedRMSNormBackward {
+                input: input.clone(),
+                gamma: self.gamma.clone(),
+                eps: self.eps,
+            });
+            let node = GradNode::with_grad_fn(grad_fn, inputs);
+            Ok(result.with_grad_node(node))
+        } else {
+            Ok(result)
         }
-
-        Ok(Tensor::from_f32(&output, dims))
     }
 
     fn parameters(&self) -> Vec<&Tensor> {
@@ -125,6 +123,33 @@ impl Module for RMSNorm {
         sd.insert("gamma".to_string(), self.gamma.clone());
         sd
     }
+}
+
+// ============================================================================
+// Fused backward GradFn
+// ============================================================================
+
+/// GradFn wrapper that delegates to `kore_kernels::cpu_fused_backward::fused_rms_norm_backward`.
+struct FusedRMSNormBackward {
+    input: Tensor,
+    gamma: Tensor,
+    eps: f32,
+}
+
+impl GradFn for FusedRMSNormBackward {
+    fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        match kore_kernels::cpu_fused_backward::fused_rms_norm_backward(
+            grad_output, &self.input, &self.gamma, self.eps,
+        ) {
+            Ok((dx, dgamma)) => vec![Some(dx), Some(dgamma)],
+            Err(e) => {
+                eprintln!("FusedRMSNormBackward failed: {e}");
+                vec![None, None]
+            }
+        }
+    }
+
+    fn name(&self) -> &str { "FusedRMSNormBackward" }
 }
 
 #[cfg(test)]
@@ -182,5 +207,27 @@ mod tests {
         let s = format!("{}", norm);
         assert!(s.contains("RMSNorm"));
         assert!(s.contains("64"));
+    }
+
+    #[test]
+    fn test_rms_norm_backward_produces_grads() {
+        let norm = RMSNorm::new(4, 1e-6);
+        let mut input = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
+        input.set_requires_grad(true);
+        let input_node = kore_core::autograd::GradNode::leaf();
+        let input = input.with_grad_node(std::sync::Arc::clone(&input_node));
+
+        let output = norm.forward(&input).unwrap();
+        assert!(output.grad_node().is_some(), "output should have grad node");
+
+        // Backward with ones
+        let go = Tensor::ones(&[2, 4]);
+        kore_core::autograd::backward(output.grad_node().unwrap(), go);
+
+        let g = input_node.get_grad();
+        assert!(g.is_some(), "input should have gradient after backward");
+        let gd = g.unwrap();
+        assert_eq!(gd.shape().dims(), &[2, 4]);
+        assert!(gd.as_f32_slice().unwrap().iter().all(|v| v.is_finite()));
     }
 }

@@ -36,6 +36,7 @@ pub mod ssd3;
 pub mod mixer;
 pub mod model;
 pub mod loader;
+pub mod autograd;
 
 // S4 modules
 pub mod complex_utils;
@@ -58,6 +59,7 @@ pub use ssd3::{mamba3_scan_combined, mamba3_ssm_step, Mamba3ScanOutput};
 pub use mixer::{MixerModel, MixerLayer};
 pub use model::{MambaLMHeadModel, SamplerConfig};
 pub use loader::{load_pretrained, load_config, LoadError};
+pub use autograd::{MambaScanBackward, MambaScanSaved, mamba3_scan_with_grad};
 
 // S4 re-exports
 

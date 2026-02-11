@@ -31,5 +31,5 @@ pub use dropout::Dropout;
 pub use conv::{Conv1d, Conv2d};
 pub use pool::{MaxPool2d, AvgPool2d, AdaptiveAvgPool2d};
 pub use squeezenet::{Fire, SqueezeNet};
-pub use loss::{cross_entropy_loss, mse_loss, l1_loss, nll_loss};
+pub use loss::{cross_entropy_loss, mse_loss, l1_loss, nll_loss, FusedSoftmaxBackward};
 pub use serialization::{save_state_dict, load_state_dict, save_module, load_module_state};

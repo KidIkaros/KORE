@@ -8,6 +8,6 @@ pub mod scheduler;
 pub mod clip;
 
 pub use sgd::SGD;
-pub use adam::Adam;
+pub use adam::{Adam, ParamGroup};
 pub use scheduler::{LrScheduler, CosineAnnealing, WarmupCosine, OneCycle, StepDecay};
 pub use clip::{clip_grad_norm_, clip_grad_value_};
