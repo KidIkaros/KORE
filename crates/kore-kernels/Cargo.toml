@@ -20,3 +20,6 @@ cuda = ["dep:cudarc", "kore-core/cuda"]
 [dependencies.cudarc]
 workspace = true
 optional = true
+
+[dev-dependencies]
+kore-mamba.workspace = true

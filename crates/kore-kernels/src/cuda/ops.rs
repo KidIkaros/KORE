@@ -3,12 +3,38 @@
 //! Each function loads the relevant PTX module (compiled from .cu source at runtime),
 //! allocates output GPU memory, launches the kernel, and returns the result buffer.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+use parking_lot::Mutex;
 
 use super::context::CudaError;
 use super::launch::{get_or_load_func, grid_1d};
+
+// ============================================================================
+// Cached dummy buffer for optional kernel parameters
+// ============================================================================
+
+/// Per-device cached 4-byte dummy buffer. Used as a valid device pointer for
+/// optional kernel parameters that are gated by a `has_*` u32 flag — the
+/// pointer is never dereferenced when the flag is 0. Cached to avoid
+/// allocating a new buffer on every kernel dispatch call.
+static DUMMY_BUFS: OnceLock<Mutex<HashMap<usize, Arc<CudaSlice<u8>>>>> = OnceLock::new();
+
+fn get_dummy_buf(dev: &Arc<CudaDevice>, dev_idx: usize) -> Result<Arc<CudaSlice<u8>>, CudaError> {
+    let map_mu = DUMMY_BUFS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = map_mu.lock();
+    if let Some(buf) = map.get(&dev_idx) {
+        return Ok(Arc::clone(buf));
+    }
+    let buf = Arc::new(
+        dev.alloc_zeros::<u8>(4)
+            .map_err(|e| CudaError::MemoryError(e.to_string()))?,
+    );
+    map.insert(dev_idx, Arc::clone(&buf));
+    Ok(buf)
+}
 
 // ============================================================================
 // PTX sources (embedded at compile time)
@@ -20,6 +46,9 @@ const REDUCE_CU: &str = include_str!("kernels/reduce.cu");
 const SOFTMAX_CU: &str = include_str!("kernels/softmax.cu");
 const RMS_NORM_CU: &str = include_str!("kernels/rms_norm.cu");
 const ROPE_CU: &str = include_str!("kernels/rope.cu");
+const FUSED_NORM_PROJ_CU: &str = include_str!("kernels/fused_norm_proj.cu");
+const DEQUANT_MATMUL_CU: &str = include_str!("kernels/dequant_matmul.cu");
+const MAMBA_SCAN_CU: &str = include_str!("kernels/mamba_scan.cu");
 
 const BLOCK_SIZE: usize = 256;
 
@@ -539,4 +568,346 @@ pub fn cuda_rope_f32(
             .map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }
     Ok(())
+}
+
+// ============================================================================
+// Fused RMSNorm + Linear Projection
+// ============================================================================
+
+/// Fused RMSNorm + Linear: y[row,:] = RMSNorm(x[row,:]) @ W^T + bias
+///
+/// Eliminates intermediate VRAM write of normalized activations.
+/// Uses tiled approach: one block per (row, output_tile).
+///
+/// - `input`: [rows, hidden] f32
+/// - `gamma`: [hidden] f32 RMSNorm scale
+/// - `weight`: [out_dim, hidden] f32 projection weight
+/// - `bias`: optional [out_dim] f32 bias (pass None for no bias)
+pub fn cuda_fused_rms_norm_proj_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    input: &CudaSlice<u8>,
+    gamma: &CudaSlice<u8>,
+    weight: &CudaSlice<u8>,
+    bias: Option<&CudaSlice<u8>>,
+    rows: usize,
+    hidden: usize,
+    out_dim: usize,
+    eps: f32,
+) -> Result<CudaSlice<u8>, CudaError> {
+    let out = dev
+        .alloc_zeros::<u8>(rows * out_dim * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+
+    let dummy = get_dummy_buf(dev, dev_idx)?;
+    let has_bias: u32 = bias.is_some() as u32;
+    let bias_ptr = bias.unwrap_or(&dummy);
+
+    // Choose kernel variant based on hidden size.
+    // smem variant caches x_hat in shared memory, avoiding redundant recomputation
+    // per output column. The 8192 threshold corresponds to 32KB of shared memory
+    // (8192 * 4 bytes) which fits comfortably on SM 7.0+. For hidden > 8192,
+    // the tiled variant recomputes x_hat per tile — still faster than two
+    // separate kernel launches due to eliminated VRAM round-trip.
+    if hidden <= 8192 {
+        let f = get_or_load_func(
+            dev, dev_idx, "fused_norm_proj", "fused_rms_norm_proj_smem_f32",
+            FUSED_NORM_PROJ_CU,
+        )?;
+        let block = BLOCK_SIZE;
+        let shared_bytes = (hidden * 4) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (block as u32, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        };
+        unsafe {
+            f.launch(cfg, (input, gamma, weight, has_bias, bias_ptr, &out,
+                rows as u32, hidden as u32, out_dim as u32, eps))
+                .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        }
+    } else {
+        let f = get_or_load_func(
+            dev, dev_idx, "fused_norm_proj", "fused_rms_norm_proj_f32",
+            FUSED_NORM_PROJ_CU,
+        )?;
+        let grid_y = (out_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, grid_y as u32, 1),
+            block_dim: (BLOCK_SIZE as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            f.launch(cfg, (input, gamma, weight, has_bias, bias_ptr, &out,
+                rows as u32, hidden as u32, out_dim as u32, eps))
+                .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        }
+    }
+
+    Ok(out)
+}
+
+/// Fused RMSNorm + SiLU gate: y = RMSNorm(x) * SiLU(z)
+///
+/// Common in Mamba input paths where norm output is gated.
+///
+/// - `input`: [rows, cols] f32
+/// - `gamma`: [cols] f32 RMSNorm scale
+/// - `gate`: [rows, cols] f32 gate tensor (z)
+pub fn cuda_fused_rms_norm_silu_gate_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    input: &CudaSlice<u8>,
+    gamma: &CudaSlice<u8>,
+    gate: &CudaSlice<u8>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<CudaSlice<u8>, CudaError> {
+    let f = get_or_load_func(
+        dev, dev_idx, "fused_norm_proj", "fused_rms_norm_silu_gate_f32",
+        FUSED_NORM_PROJ_CU,
+    )?;
+    let out = dev
+        .alloc_zeros::<u8>(rows * cols * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let block = if cols <= 256 { 256 } else { 512 };
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        f.launch(cfg, (input, gamma, gate, &out, rows as u32, cols as u32, eps))
+            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+    }
+    Ok(out)
+}
+
+// ============================================================================
+// Dequantized Quaternary MatMul
+// ============================================================================
+
+/// On-the-fly dequantized quaternary GEMM: C[M,N] = dequant(A_packed) @ B
+///
+/// Unpacks 2-bit quaternary weights ({-3,-1,+1,+3}) from packed bytes in
+/// registers — never materializes full f32 weight matrix in VRAM.
+/// 16x memory bandwidth reduction vs f32 weights.
+///
+/// - `a_packed`: [M, K_packed] packed uint8 (4 quats per byte, kore-btes format)
+/// - `a_scales`: [M] per-row f32 scale factors
+/// - `b`: [K, N] dense f32 activations
+/// - `m`, `n`, `k`: logical dimensions
+pub fn cuda_dequant_quat_matmul_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    a_packed: &CudaSlice<u8>,
+    a_scales: &CudaSlice<u8>,
+    b: &CudaSlice<u8>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<CudaSlice<u8>, CudaError> {
+    let k_packed = (k + 3) / 4;
+    let out = dev
+        .alloc_zeros::<u8>(m * n * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+
+    let (func_name, cfg) = if m >= 64 && n >= 64 {
+        let grid_x = ((n + 63) / 64) as u32;
+        let grid_y = ((m + 63) / 64) as u32;
+        (
+            "dequant_quat_matmul_tiled2x2_f32",
+            LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (32, 32, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    } else {
+        let tile = 32;
+        let grid_x = ((n + tile - 1) / tile) as u32;
+        let grid_y = ((m + tile - 1) / tile) as u32;
+        (
+            "dequant_quat_matmul_f32",
+            LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (tile as u32, tile as u32, 1),
+                shared_mem_bytes: 0,
+            },
+        )
+    };
+
+    let f = get_or_load_func(dev, dev_idx, "dequant_matmul", func_name, DEQUANT_MATMUL_CU)?;
+    unsafe {
+        f.launch(cfg, (a_packed, a_scales, b, &out,
+            m as u32, n as u32, k as u32, k_packed as u32))
+            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+    }
+    Ok(out)
+}
+
+/// Fused dequant matmul + bias + ReLU: C = max(0, dequant(A) @ B + bias)
+pub fn cuda_dequant_quat_matmul_bias_relu_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    a_packed: &CudaSlice<u8>,
+    a_scales: &CudaSlice<u8>,
+    b: &CudaSlice<u8>,
+    bias: &CudaSlice<u8>,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<CudaSlice<u8>, CudaError> {
+    let k_packed = (k + 3) / 4;
+    let out = dev
+        .alloc_zeros::<u8>(m * n * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+
+    let tile = 32;
+    let grid_x = ((n + tile - 1) / tile) as u32;
+    let grid_y = ((m + tile - 1) / tile) as u32;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, grid_y, 1),
+        block_dim: (tile as u32, tile as u32, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let f = get_or_load_func(
+        dev, dev_idx, "dequant_matmul", "dequant_quat_matmul_bias_relu_f32",
+        DEQUANT_MATMUL_CU,
+    )?;
+    unsafe {
+        f.launch(cfg, (a_packed, a_scales, b, bias, &out,
+            m as u32, n as u32, k as u32, k_packed as u32))
+            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+    }
+    Ok(out)
+}
+
+// ============================================================================
+// Mamba-3 Flash Scan (Chunked Parallel SSM)
+// ============================================================================
+
+/// Chunked size for the flash scan (must match SCAN_CHUNK in mamba_scan.cu).
+const SCAN_CHUNK: usize = 128;
+
+/// Maximum supported d_state (must match MAX_DSTATE in mamba_scan.cu).
+const MAX_DSTATE: usize = 64;
+
+/// Mamba-3 chunked parallel scan on GPU.
+///
+/// Splits the sequence into chunks of 128 timesteps, processes each chunk
+/// in registers, then propagates boundary states across chunks.
+///
+/// Thread model: each thread owns specific headdim positions and processes
+/// ALL d_state elements for those positions. No atomics, no inter-thread races.
+///
+/// - `x`: [batch, seq_len, nheads, headdim] f32
+/// - `dt`: [batch, seq_len, nheads] f32
+/// - `a_real`: [nheads] f32
+/// - `b`: [batch, seq_len, ngroups, d_state] f32
+/// - `c`: [batch, seq_len, ngroups, d_state] f32
+/// - `dt_bias`: optional [nheads] f32
+/// - `z`: optional [batch, seq_len, nheads, headdim] f32 gate
+/// - `d_skip`: optional [nheads] f32 skip connection
+///
+/// Returns `(output, chunk_last_h, chunk_last_bx)`.
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_mamba3_scan_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    x: &CudaSlice<u8>,
+    dt: &CudaSlice<u8>,
+    a_real: &CudaSlice<u8>,
+    b: &CudaSlice<u8>,
+    c: &CudaSlice<u8>,
+    dt_bias: Option<&CudaSlice<u8>>,
+    z: Option<&CudaSlice<u8>>,
+    d_skip: Option<&CudaSlice<u8>>,
+    batch: usize,
+    seq_len: usize,
+    nheads: usize,
+    headdim: usize,
+    ngroups: usize,
+    d_state: usize,
+    alpha: f32,
+    dt_softplus: bool,
+) -> Result<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>), CudaError> {
+    assert!(d_state <= MAX_DSTATE,
+        "cuda_mamba3_scan_f32: d_state={} exceeds MAX_DSTATE={}", d_state, MAX_DSTATE);
+
+    let num_chunks = (seq_len + SCAN_CHUNK - 1) / SCAN_CHUNK;
+    let state_size = d_state * headdim;
+
+    // Allocate outputs
+    let output = dev
+        .alloc_zeros::<u8>(batch * seq_len * nheads * headdim * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let chunk_last_h = dev
+        .alloc_zeros::<u8>(batch * nheads * num_chunks * state_size * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let chunk_last_bx = dev
+        .alloc_zeros::<u8>(batch * nheads * num_chunks * state_size * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+
+    let has_dt_bias: u32 = dt_bias.is_some() as u32;
+    let has_z: u32 = z.is_some() as u32;
+    let has_d_skip: u32 = d_skip.is_some() as u32;
+
+    let dummy = get_dummy_buf(dev, dev_idx)?;
+    let dt_bias_ptr = dt_bias.unwrap_or(&dummy);
+    let z_ptr = z.unwrap_or(&dummy);
+    let d_skip_ptr = d_skip.unwrap_or(&dummy);
+
+    // Block size: one thread per headdim position (capped at 256).
+    // Smaller block if headdim is small to avoid idle threads.
+    let block_size = headdim.min(256) as u32;
+
+    // Phase 1: Intra-chunk scan
+    let f1 = get_or_load_func(
+        dev, dev_idx, "mamba_scan", "mamba3_scan_chunk_f32", MAMBA_SCAN_CU,
+    )?;
+    let total_blocks = batch * nheads * num_chunks;
+    let cfg1 = LaunchConfig {
+        grid_dim: (total_blocks as u32, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        f1.launch(cfg1, (
+            x, dt, a_real, b, c,
+            has_dt_bias, dt_bias_ptr,
+            has_z, z_ptr,
+            has_d_skip, d_skip_ptr,
+            &output, &chunk_last_h, &chunk_last_bx,
+            batch as u32, seq_len as u32, nheads as u32, headdim as u32,
+            ngroups as u32, d_state as u32, num_chunks as u32,
+            alpha, dt_softplus as u32,
+        )).map_err(|e| CudaError::LaunchError(e.to_string()))?;
+    }
+
+    // Phase 2: Inter-chunk prefix scan (only if multiple chunks)
+    if num_chunks > 1 {
+        let f2 = get_or_load_func(
+            dev, dev_idx, "mamba_scan", "mamba3_scan_prefix_f32", MAMBA_SCAN_CU,
+        )?;
+        let prefix_blocks = batch * nheads;
+        let cfg2 = LaunchConfig {
+            grid_dim: (prefix_blocks as u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            f2.launch(cfg2, (
+                &chunk_last_h, &chunk_last_bx, a_real, dt,
+                has_dt_bias, dt_bias_ptr,
+                batch as u32, seq_len as u32, nheads as u32,
+                state_size as u32, num_chunks as u32,
+                alpha, dt_softplus as u32,
+            )).map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        }
+    }
+
+    Ok((output, chunk_last_h, chunk_last_bx))
 }

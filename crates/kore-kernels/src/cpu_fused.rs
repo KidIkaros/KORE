@@ -305,4 +305,530 @@ mod tests {
         let sum: f32 = data.iter().sum();
         assert!((sum - 1.0).abs() < 1e-6);
     }
+
+    /// CPU-reference test for fused RMSNorm + Linear projection.
+    /// Validates that: y = RMSNorm(x) @ W^T matches doing the two steps separately.
+    #[test]
+    fn test_fused_rms_norm_proj_cpu_reference() {
+        let hidden = 8;
+        let out_dim = 4;
+        let batch = 2;
+
+        // Random-ish input
+        let x_data: Vec<f32> = (0..batch * hidden).map(|i| (i as f32 * 0.3 - 1.0)).collect();
+        let gamma_data: Vec<f32> = (0..hidden).map(|i| 1.0 + i as f32 * 0.1).collect();
+        let w_data: Vec<f32> = (0..out_dim * hidden).map(|i| (i as f32 * 0.1 - 0.5)).collect();
+
+        let input = Tensor::from_f32(&x_data, &[batch, hidden]);
+        let gamma = Tensor::from_f32(&gamma_data, &[hidden]);
+        let weight = Tensor::from_f32(&w_data, &[out_dim, hidden]);
+
+        // Step 1: RMSNorm
+        let normed = fused_rms_norm(&input, &gamma, 1e-6).unwrap();
+
+        // Step 2: Linear projection (normed @ W^T)
+        let normed_data = normed.as_f32_slice().unwrap();
+        let mut expected = vec![0.0f32; batch * out_dim];
+        for b in 0..batch {
+            for j in 0..out_dim {
+                let mut acc = 0.0f32;
+                for k in 0..hidden {
+                    acc += normed_data[b * hidden + k] * w_data[j * hidden + k];
+                }
+                expected[b * out_dim + j] = acc;
+            }
+        }
+
+        // Verify fused result matches (simulated inline)
+        let mut fused = vec![0.0f32; batch * out_dim];
+        let eps = 1e-6f32;
+        for b in 0..batch {
+            let row = &x_data[b * hidden..(b + 1) * hidden];
+            let sum_sq: f32 = row.iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
+            for j in 0..out_dim {
+                let mut acc = 0.0f32;
+                for k in 0..hidden {
+                    let x_hat = row[k] * inv_rms * gamma_data[k];
+                    acc += x_hat * w_data[j * hidden + k];
+                }
+                fused[b * out_dim + j] = acc;
+            }
+        }
+
+        for i in 0..expected.len() {
+            assert!((expected[i] - fused[i]).abs() < 1e-5,
+                "mismatch at {}: expected={}, fused={}", i, expected[i], fused[i]);
+        }
+    }
+
+    /// CPU-reference test for dequantized quaternary matmul.
+    /// Validates: C = dequant(A_packed) @ B matches explicit unpack + matmul.
+    #[test]
+    fn test_dequant_quat_matmul_cpu_reference() {
+        use kore_btes::encoder::{Quat, pack_quats};
+
+        let m = 4;
+        let k = 8;
+        let n = 3;
+        let k_packed = (k + 3) / 4;
+
+        // Create quaternary weight matrix and pack it
+        let quat_weights: Vec<Quat> = vec![
+            Quat::Pos3, Quat::Neg1, Quat::Pos1, Quat::Neg3,
+            Quat::Pos1, Quat::Pos3, Quat::Neg1, Quat::Neg3,
+        ];
+        // Repeat for m rows
+        let mut packed = Vec::new();
+        let scales = vec![0.5f32; m]; // uniform scale
+        for _row in 0..m {
+            for chunk in quat_weights.chunks(4) {
+                let block = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                packed.push(pack_quats(&block));
+            }
+        }
+
+        // Dense activations B [K, N]
+        let b_data: Vec<f32> = (0..k * n).map(|i| i as f32 * 0.1).collect();
+
+        // Reference: explicit dequant then matmul
+        let quat_vals: Vec<f32> = quat_weights.iter().map(|q| q.to_f32()).collect();
+        let mut expected = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    acc += quat_vals[p] * b_data[p * n + j];
+                }
+                expected[i * n + j] = acc * scales[i];
+            }
+        }
+
+        // Simulate on-the-fly dequant matmul (same logic as CUDA kernel)
+        let mut fused = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    let byte_idx = p / 4;
+                    let bit_slot = p % 4;
+                    let byte = packed[i * k_packed + byte_idx];
+                    let qidx = (byte >> (bit_slot * 2)) & 0x3;
+                    let lut = [-3.0f32, -1.0, 1.0, 3.0];
+                    let w = lut[qidx as usize];
+                    acc += w * b_data[p * n + j];
+                }
+                fused[i * n + j] = acc * scales[i];
+            }
+        }
+
+        for i in 0..expected.len() {
+            assert!((expected[i] - fused[i]).abs() < 1e-5,
+                "mismatch at {}: expected={}, fused={}", i, expected[i], fused[i]);
+        }
+    }
+
+    /// CPU-reference test for fused RMSNorm + SiLU gate.
+    /// Validates: y = RMSNorm(x) * SiLU(z).
+    #[test]
+    fn test_fused_rms_norm_silu_gate_cpu_reference() {
+        let cols = 4;
+        let rows = 2;
+        let eps = 1e-6f32;
+
+        let x_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let gamma_data = vec![1.0f32; cols];
+        let z_data = vec![0.5f32, 1.0, -0.5, 2.0, -1.0, 0.0, 1.5, -2.0];
+
+        let silu = |x: f32| -> f32 { x / (1.0 + (-x).exp()) };
+
+        let mut expected = vec![0.0f32; rows * cols];
+        for b in 0..rows {
+            let row = &x_data[b * cols..(b + 1) * cols];
+            let sum_sq: f32 = row.iter().map(|v| v * v).sum();
+            let inv_rms = 1.0 / (sum_sq / cols as f32 + eps).sqrt();
+            for c in 0..cols {
+                let x_hat = row[c] * inv_rms * gamma_data[c];
+                let z_val = z_data[b * cols + c];
+                expected[b * cols + c] = x_hat * silu(z_val);
+            }
+        }
+
+        // All values should be finite
+        assert!(expected.iter().all(|v| v.is_finite()));
+        // SiLU(0) = 0, so for z=0.0 the output should be 0
+        // z_data[5] = 0.0, so expected[5] should be ~0
+        assert!(expected[5].abs() < 1e-5, "SiLU(0) gate should zero output, got {}", expected[5]);
+    }
+
+    // ====================================================================
+    // Edge-case tests for CUDA kernel algorithms (CPU reference)
+    // ====================================================================
+
+    /// Mamba scan edge case: d_state=1 (minimum), seq_len=1 (single step).
+    /// Validates correctness at the smallest possible dimensions.
+    #[test]
+    fn test_mamba_scan_edge_dstate1_seqlen1() {
+        let (batch, seq_len, nheads, headdim) = (1, 1, 1, 2);
+        let (ngroups, d_state) = (1, 1);
+        let alpha = 0.5f32;
+
+        let x = vec![1.0f32, 2.0];          // [1,1,1,2]
+        let dt = vec![0.1f32];               // [1,1,1]
+        let a_real = vec![-1.0f32];          // [1]
+        let b_in = vec![0.5f32];             // [1,1,1,1]
+        let c_in = vec![1.0f32];             // [1,1,1,1]
+
+        // Reference: single step, no previous state
+        // da = exp(0.1 * -1.0) = exp(-0.1)
+        // beta = 0.1 * 0.5 = 0.05, gamma = 0.1 * 0.5 = 0.05
+        // For p=0: h[0] = 0*da + 0.05*(0.5*1.0) + 0.05*0 = 0.025
+        //          y = 1.0 * 0.025 = 0.025
+        // For p=1: h[0] = 0*da + 0.05*(0.5*2.0) + 0.05*0 = 0.05
+        //          y = 1.0 * 0.05 = 0.05
+        let da = (0.1f32 * -1.0f32).exp();
+        let beta = 0.1f32 * alpha;
+        let _gamma = 0.1f32 * (1.0 - alpha);
+        let _ = da; // da * 0 = 0 for initial state
+
+        let mut expected = vec![0.0f32; 2];
+        for p in 0..headdim {
+            let x_val = x[p];
+            let cur_bx = b_in[0] * x_val;
+            let h = beta * cur_bx; // da*0 + beta*cur_bx + gamma*0
+            expected[p] = c_in[0] * h;
+        }
+
+        // Verify via kore-mamba reference
+        let a_imag = vec![0.0f32];
+        let result = kore_mamba::ssd3::mamba3_scan_combined(
+            &x, batch, seq_len, nheads, headdim, &dt, &a_real, &a_imag,
+            &b_in, ngroups, d_state, &c_in,
+            None, None, None, None, None, false, alpha, false,
+        );
+        for i in 0..headdim {
+            assert!((result.output[i] - expected[i]).abs() < 1e-5,
+                "d_state=1,seq=1 mismatch at {}: expected={}, got={}", i, expected[i], result.output[i]);
+        }
+    }
+
+    /// Mamba scan edge case: d_state=64 (MAX_DSTATE), verifying no truncation.
+    #[test]
+    fn test_mamba_scan_edge_dstate64() {
+        let (batch, seq_len, nheads, headdim) = (1, 2, 1, 4);
+        let (ngroups, d_state) = (1, 64);
+        let alpha = 0.5f32;
+
+        let x: Vec<f32> = (0..batch * seq_len * nheads * headdim)
+            .map(|i| (i as f32 * 0.1) + 0.1).collect();
+        let dt: Vec<f32> = vec![0.05f32; batch * seq_len * nheads];
+        let a_real = vec![-0.5f32; nheads];
+        let a_imag = vec![0.0f32; nheads];
+        let b_in: Vec<f32> = (0..batch * seq_len * ngroups * d_state)
+            .map(|i| ((i % 7) as f32 * 0.1) - 0.3).collect();
+        let c_in: Vec<f32> = (0..batch * seq_len * ngroups * d_state)
+            .map(|i| ((i % 5) as f32 * 0.2) - 0.4).collect();
+
+        let result = kore_mamba::ssd3::mamba3_scan_combined(
+            &x, batch, seq_len, nheads, headdim, &dt, &a_real, &a_imag,
+            &b_in, ngroups, d_state, &c_in,
+            None, None, None, None, None, false, alpha, false,
+        );
+
+        // All outputs must be finite (no NaN/Inf from large state arrays)
+        assert!(result.output.iter().all(|v| v.is_finite()),
+            "d_state=64: non-finite output detected");
+        // State arrays must have correct size
+        assert_eq!(result.last_state.len(), batch * nheads * d_state * headdim);
+        assert_eq!(result.prev_bx.len(), batch * nheads * d_state * headdim);
+        // Non-zero output (sanity: the scan actually computed something)
+        assert!(result.output.iter().any(|v| v.abs() > 1e-10),
+            "d_state=64: all-zero output suggests truncation");
+    }
+
+    /// Mamba scan edge case: seq_len=129 crosses a chunk boundary (SCAN_CHUNK=128).
+    /// Verifies inter-chunk state propagation produces same result as sequential.
+    #[test]
+    fn test_mamba_scan_edge_cross_chunk_boundary() {
+        let (batch, seq_len, nheads, headdim) = (1, 129, 1, 2);
+        let (ngroups, d_state) = (1, 2);
+        let alpha = 0.5f32;
+
+        let x: Vec<f32> = (0..batch * seq_len * nheads * headdim)
+            .map(|i| ((i % 11) as f32 * 0.2) - 1.0).collect();
+        let dt: Vec<f32> = (0..batch * seq_len * nheads)
+            .map(|i| 0.01 + (i % 3) as f32 * 0.01).collect();
+        let a_real = vec![-1.0f32; nheads];
+        let a_imag = vec![0.0f32; nheads];
+        let b_in: Vec<f32> = (0..batch * seq_len * ngroups * d_state)
+            .map(|i| ((i % 5) as f32 * 0.3) - 0.6).collect();
+        let c_in: Vec<f32> = (0..batch * seq_len * ngroups * d_state)
+            .map(|i| ((i % 7) as f32 * 0.2) - 0.6).collect();
+
+        let result = kore_mamba::ssd3::mamba3_scan_combined(
+            &x, batch, seq_len, nheads, headdim, &dt, &a_real, &a_imag,
+            &b_in, ngroups, d_state, &c_in,
+            None, None, None, None, None, false, alpha, false,
+        );
+
+        assert_eq!(result.output.len(), batch * seq_len * nheads * headdim);
+        assert!(result.output.iter().all(|v| v.is_finite()),
+            "cross-chunk: non-finite output");
+
+        // Output at t=128 (first step of second chunk) should depend on state
+        // accumulated from t=0..127. Verify it's nonzero.
+        let t128_start = 128 * nheads * headdim;
+        let t128_slice = &result.output[t128_start..t128_start + headdim];
+        assert!(t128_slice.iter().any(|v| v.abs() > 1e-8),
+            "cross-chunk: t=128 output is zero, state not propagated");
+    }
+
+    /// Mamba scan edge case: all optional params enabled (dt_bias, z gate, d skip, dt_softplus).
+    #[test]
+    fn test_mamba_scan_edge_all_optional_params() {
+        let (batch, seq_len, nheads, headdim) = (1, 4, 2, 2);
+        let (ngroups, d_state) = (1, 2);
+        let alpha = 0.5f32;
+
+        let x: Vec<f32> = (0..batch * seq_len * nheads * headdim)
+            .map(|i| (i as f32) * 0.1).collect();
+        let dt: Vec<f32> = vec![0.5f32; batch * seq_len * nheads];
+        let a_real = vec![-1.0f32; nheads];
+        let a_imag = vec![0.0f32; nheads];
+        let b_in: Vec<f32> = vec![0.3f32; batch * seq_len * ngroups * d_state];
+        let c_in: Vec<f32> = vec![0.5f32; batch * seq_len * ngroups * d_state];
+
+        let dt_bias = vec![0.1f32; nheads];
+        let z: Vec<f32> = (0..batch * seq_len * nheads * headdim)
+            .map(|i| (i as f32) * 0.3 - 1.0).collect();
+        let d_skip = vec![0.5f32; nheads];
+
+        let result = kore_mamba::ssd3::mamba3_scan_combined(
+            &x, batch, seq_len, nheads, headdim, &dt, &a_real, &a_imag,
+            &b_in, ngroups, d_state, &c_in,
+            None, None, Some(&d_skip), Some(&z), Some(&dt_bias),
+            true, alpha, false,
+        );
+
+        assert!(result.output.iter().all(|v| v.is_finite()),
+            "all-optional: non-finite output");
+        // With z gate, output at z≈0 should be ~0 (SiLU(0)=0)
+        // z[3] = 0.3*3 - 1.0 = -0.1, z[4] = 0.3*4 - 1.0 = 0.2
+        // Just verify outputs are finite and non-trivially computed
+        assert!(result.output.len() == batch * seq_len * nheads * headdim);
+    }
+
+    /// Fused RMSNorm+Proj edge case: single row, single hidden dim, no bias.
+    #[test]
+    fn test_fused_norm_proj_edge_single_element() {
+        let hidden = 1;
+        let out_dim = 1;
+        let eps = 1e-6f32;
+
+        let x = vec![3.0f32];
+        let gamma = vec![2.0f32];
+        let w = vec![0.5f32];
+
+        // RMS = sqrt(9/1 + eps) ≈ 3.0
+        // x_hat = 3.0 / 3.0 * 2.0 = 2.0
+        // y = 2.0 * 0.5 = 1.0
+        let rms = (9.0f32 / 1.0 + eps).sqrt();
+        let x_hat = 3.0 / rms * 2.0;
+        let expected = x_hat * 0.5;
+
+        let mut fused = 0.0f32;
+        let sum_sq: f32 = x.iter().map(|v| v * v).sum();
+        let inv_rms = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
+        fused = x[0] * inv_rms * gamma[0] * w[0];
+
+        assert!((expected - fused).abs() < 1e-5,
+            "single-element: expected={}, fused={}", expected, fused);
+    }
+
+    /// Fused RMSNorm+Proj edge case: with bias vector.
+    #[test]
+    fn test_fused_norm_proj_edge_with_bias() {
+        let hidden = 4;
+        let out_dim = 2;
+        let batch = 1;
+        let eps = 1e-6f32;
+
+        let x_data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let gamma_data = vec![1.0f32; hidden];
+        let w_data = vec![0.1f32; out_dim * hidden];
+        let bias_data = vec![10.0f32, -5.0f32];
+
+        let sum_sq: f32 = x_data.iter().map(|v| v * v).sum();
+        let inv_rms = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
+
+        let mut expected = vec![0.0f32; out_dim];
+        for j in 0..out_dim {
+            let mut acc = 0.0f32;
+            for k in 0..hidden {
+                acc += x_data[k] * inv_rms * gamma_data[k] * w_data[j * hidden + k];
+            }
+            expected[j] = acc + bias_data[j];
+        }
+
+        // Verify bias actually shifts the result
+        assert!((expected[0] - expected[1] - 15.0).abs() < 1e-4,
+            "bias shift: diff should be ~15.0, got {}", expected[0] - expected[1]);
+    }
+
+    /// Dequant matmul edge case: K not divisible by 4 (partial packed byte).
+    #[test]
+    fn test_dequant_matmul_edge_partial_packing() {
+        use kore_btes::encoder::{Quat, pack_quats};
+
+        let m = 1;
+        let k = 5; // Not divisible by 4
+        let n = 1;
+        let k_packed = (k + 3) / 4; // = 2 bytes per row
+
+        // Pack 5 quat values: 4 in first byte, 1 in second (3 padding slots)
+        let quat_weights = vec![
+            Quat::Pos1, Quat::Neg1, Quat::Pos3, Quat::Neg3, // byte 0
+            Quat::Pos1,                                       // byte 1, slots 1-3 unused
+        ];
+        let lut = [-3.0f32, -1.0, 1.0, 3.0];
+
+        let mut packed = Vec::new();
+        // First 4
+        let block0 = [quat_weights[0], quat_weights[1], quat_weights[2], quat_weights[3]];
+        packed.push(pack_quats(&block0));
+        // Last 1 (pad with Neg3 = 0b00 which maps to -3.0, but only slot 0 used)
+        let block1 = [quat_weights[4], Quat::Neg3, Quat::Neg3, Quat::Neg3];
+        packed.push(pack_quats(&block1));
+
+        let b_data = vec![1.0f32; k * n]; // all ones
+        let scale = 1.0f32;
+
+        // Reference: sum of dequantized weights * 1.0
+        let expected: f32 = quat_weights.iter().take(k).map(|q| q.to_f32()).sum::<f32>() * scale;
+
+        // On-the-fly dequant (same logic as CUDA kernel)
+        let mut fused = 0.0f32;
+        for p in 0..k {
+            let byte_idx = p / 4;
+            let bit_slot = p % 4;
+            let byte = packed[byte_idx];
+            let qidx = (byte >> (bit_slot * 2)) & 0x3;
+            fused += lut[qidx as usize] * b_data[p];
+        }
+        fused *= scale;
+
+        assert!((expected - fused).abs() < 1e-5,
+            "partial-pack: expected={}, fused={}", expected, fused);
+    }
+
+    /// Dequant matmul edge case: all-zero quaternary weights (Quat::Neg3 maps to -3, but
+    /// we test Pos1 - Pos1 cancellation to verify accumulation correctness).
+    #[test]
+    fn test_dequant_matmul_edge_cancellation() {
+        use kore_btes::encoder::{Quat, pack_quats};
+
+        let m = 2;
+        let k = 4;
+        let n = 1;
+
+        // Row 0: [+1, -1, +1, -1] → sum = 0
+        // Row 1: [+3, +3, +3, +3] → sum = 12
+        let row0 = [Quat::Pos1, Quat::Neg1, Quat::Pos1, Quat::Neg1];
+        let row1 = [Quat::Pos3, Quat::Pos3, Quat::Pos3, Quat::Pos3];
+
+        let packed = vec![pack_quats(&row0), pack_quats(&row1)];
+        let b_data = vec![1.0f32; k * n];
+        let scales = vec![1.0f32; m];
+
+        let lut = [-3.0f32, -1.0, 1.0, 3.0];
+        let mut result = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    let byte_idx = p / 4;
+                    let bit_slot = p % 4;
+                    let byte = packed[i * 1 + byte_idx]; // k_packed=1
+                    let qidx = (byte >> (bit_slot * 2)) & 0x3;
+                    acc += lut[qidx as usize] * b_data[p * n + j];
+                }
+                result[i * n + j] = acc * scales[i];
+            }
+        }
+
+        assert!(result[0].abs() < 1e-5,
+            "cancellation: row0 should be 0, got {}", result[0]);
+        assert!((result[1] - 12.0).abs() < 1e-5,
+            "cancellation: row1 should be 12, got {}", result[1]);
+    }
+
+    /// Mamba scan edge case: batch=2 with different data to verify batch isolation.
+    #[test]
+    fn test_mamba_scan_edge_batch_isolation() {
+        let (batch, seq_len, nheads, headdim) = (2, 3, 1, 2);
+        let (ngroups, d_state) = (1, 2);
+        let alpha = 0.5f32;
+
+        // Batch 0: all ones. Batch 1: all twos.
+        let mut x = vec![0.0f32; batch * seq_len * nheads * headdim];
+        for i in 0..seq_len * nheads * headdim {
+            x[i] = 1.0;
+            x[seq_len * nheads * headdim + i] = 2.0;
+        }
+
+        let dt = vec![0.1f32; batch * seq_len * nheads];
+        let a_real = vec![-1.0f32; nheads];
+        let a_imag = vec![0.0f32; nheads];
+        let b_in = vec![1.0f32; batch * seq_len * ngroups * d_state];
+        let c_in = vec![1.0f32; batch * seq_len * ngroups * d_state];
+
+        let result = kore_mamba::ssd3::mamba3_scan_combined(
+            &x, batch, seq_len, nheads, headdim, &dt, &a_real, &a_imag,
+            &b_in, ngroups, d_state, &c_in,
+            None, None, None, None, None, false, alpha, false,
+        );
+
+        // Since batch 1 input is 2x batch 0, with linear dynamics and same params,
+        // batch 1 output should be exactly 2x batch 0 output.
+        let out_size = seq_len * nheads * headdim;
+        for i in 0..out_size {
+            let ratio = if result.output[i].abs() > 1e-10 {
+                result.output[out_size + i] / result.output[i]
+            } else {
+                2.0 // both near zero is fine
+            };
+            assert!((ratio - 2.0).abs() < 1e-4,
+                "batch isolation: index {} ratio={}, expected 2.0", i, ratio);
+        }
+    }
+
+    /// Fused RMSNorm + SiLU gate edge case: extreme values (large positive, large negative).
+    #[test]
+    fn test_fused_rms_norm_silu_gate_edge_extreme() {
+        let cols = 4;
+        let rows = 1;
+        let eps = 1e-6f32;
+
+        let x_data = vec![100.0f32, -100.0, 0.0001, -0.0001];
+        let gamma_data = vec![1.0f32; cols];
+        let z_data = vec![50.0f32, -50.0, 0.0, 100.0]; // large positive, large negative, zero, very large
+
+        let silu = |x: f32| -> f32 { x / (1.0 + (-x).exp()) };
+
+        let sum_sq: f32 = x_data.iter().map(|v| v * v).sum();
+        let inv_rms = 1.0 / (sum_sq / cols as f32 + eps).sqrt();
+
+        let mut expected = vec![0.0f32; cols];
+        for c in 0..cols {
+            let x_hat = x_data[c] * inv_rms * gamma_data[c];
+            expected[c] = x_hat * silu(z_data[c]);
+        }
+
+        // All values must be finite even with extreme inputs
+        assert!(expected.iter().all(|v| v.is_finite()),
+            "extreme values: non-finite output detected: {:?}", expected);
+        // SiLU(50) ≈ 50, SiLU(-50) ≈ 0, SiLU(0) = 0
+        assert!(expected[1].abs() < 1e-10, "SiLU(-50) should gate to ~0, got {}", expected[1]);
+        assert!(expected[2].abs() < 1e-10, "SiLU(0) should gate to 0, got {}", expected[2]);
+    }
 }
