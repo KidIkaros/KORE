@@ -16,3 +16,11 @@ thiserror.workspace = true
 rand.workspace = true
 safetensors.workspace = true
 half.workspace = true
+
+[dependencies.cudarc]
+workspace = true
+optional = true
+
+[features]
+default = []
+cuda = ["dep:cudarc", "kore-kernels/cuda", "kore-core/cuda"]

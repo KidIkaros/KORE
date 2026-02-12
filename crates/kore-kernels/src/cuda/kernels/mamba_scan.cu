@@ -7,6 +7,11 @@
 //
 // Trapezoidal: h_t = da * h_{t-1} + beta * B_t*x_t + gamma * prev_bx
 // Output: y_t = sum_n(C_t[n] * h_t[n,p])
+//
+// Data-dependent RoPE: When use_rope is set, B and C vectors are rotated by
+// theta = dt * a_imag[head] before use. This applies a complex rotation to
+// adjacent pairs (2i, 2i+1), recovering complex-valued dynamics from the
+// imaginary component of the SSM A matrix.
 
 extern "C" {
 
@@ -23,6 +28,20 @@ __device__ float silu_scan(float x) {
     return x / (1.0f + expf(-x));
 }
 
+// Apply RoPE rotation to adjacent pairs in a register array.
+// For each pair (v[2i], v[2i+1]):
+//   v[2i]'   = v[2i] * cos_t - v[2i+1] * sin_t
+//   v[2i+1]' = v[2i] * sin_t + v[2i+1] * cos_t
+__device__ void apply_rope_device(float* v, unsigned int len, float cos_t, float sin_t) {
+    unsigned int pairs = len / 2;
+    for (unsigned int i = 0; i < pairs; i++) {
+        float a = v[2 * i];
+        float b = v[2 * i + 1];
+        v[2 * i]     = a * cos_t - b * sin_t;
+        v[2 * i + 1] = a * sin_t + b * cos_t;
+    }
+}
+
 // Phase 1: Intra-chunk sequential scan.
 // Grid: (batch * nheads * num_chunks, 1, 1)
 // Block: (min(headdim, 256), 1, 1)
@@ -30,6 +49,7 @@ __global__ void mamba3_scan_chunk_f32(
     const float* __restrict__ x,          // [B, T, H, D]
     const float* __restrict__ dt,         // [B, T, H]
     const float* __restrict__ a_real,     // [H]
+    const float* __restrict__ a_imag,     // [H]
     const float* __restrict__ b_in,       // [B, T, G, N]
     const float* __restrict__ c_in,       // [B, T, G, N]
     unsigned int has_dt_bias,
@@ -49,7 +69,8 @@ __global__ void mamba3_scan_chunk_f32(
     unsigned int d_state,
     unsigned int num_chunks,
     float alpha,
-    unsigned int dt_softplus
+    unsigned int dt_softplus,
+    unsigned int use_rope
 ) {
     unsigned int block_id = blockIdx.x;
     unsigned int chunk_idx = block_id % num_chunks;
@@ -64,6 +85,8 @@ __global__ void mamba3_scan_chunk_f32(
     unsigned int chunk_end = chunk_start + SCAN_CHUNK;
     if (chunk_end > seq_len) chunk_end = seq_len;
     unsigned int state_size = d_state * headdim;
+
+    float a_imag_h = a_imag[head];
 
     // Each thread processes headdim positions p = tid, tid+blockDim.x, ...
     // For each p, maintain d_state floats of state — no cross-thread sharing needed.
@@ -87,17 +110,31 @@ __global__ void mamba3_scan_chunk_f32(
             float x_val = x[batch_idx * seq_len * nheads * headdim
                            + t * nheads * headdim + head * headdim + p];
 
-            float y = 0.0f;
+            // Load B and C vectors into registers
+            float b_reg[MAX_DSTATE];
+            float c_reg[MAX_DSTATE];
             for (unsigned int n = 0; n < d_state; n++) {
                 unsigned int bc_idx = batch_idx * seq_len * ngroups * d_state
                                     + t * ngroups * d_state + group * d_state + n;
-                float b_val = b_in[bc_idx];
-                float c_val = c_in[bc_idx];
+                b_reg[n] = b_in[bc_idx];
+                c_reg[n] = c_in[bc_idx];
+            }
 
-                float cur_bx = b_val * x_val;
+            // Data-dependent RoPE: rotate B and C pairs by theta = dt * a_imag[head]
+            if (use_rope && d_state >= 2) {
+                float rope_theta = dt_val * a_imag_h;
+                float cos_t = cosf(rope_theta);
+                float sin_t = sinf(rope_theta);
+                apply_rope_device(b_reg, d_state, cos_t, sin_t);
+                apply_rope_device(c_reg, d_state, cos_t, sin_t);
+            }
+
+            float y = 0.0f;
+            for (unsigned int n = 0; n < d_state; n++) {
+                float cur_bx = b_reg[n] * x_val;
                 h[n] = da * h[n] + beta * cur_bx + gam * pbx[n];
                 pbx[n] = cur_bx;
-                y += c_val * h[n];
+                y += c_reg[n] * h[n];
             }
 
             // Skip connection: y += D[head] * x

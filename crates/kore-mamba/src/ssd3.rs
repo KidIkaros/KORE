@@ -5,6 +5,12 @@
 //! 2. Data-dependent RoPE: rotation matrices on B, C recovering complex dynamics
 //! 3. MIMO: rank-r matrix multiply state update for higher arithmetic intensity
 //!
+//! Two execution paths:
+//! - **CPU** (`mamba3_scan_combined`): Pure Rust reference implementation.
+//! - **GPU** (`mamba3_scan_gpu`, requires `cuda` feature): Uploads data to GPU,
+//!   calls the Flash Scan CUDA kernel, and downloads results. Falls back to CPU
+//!   if CUDA initialization fails.
+//!
 //! Reference: "Mamba-3: Improved Sequence Modeling using State Space Principles" (ICLR 2026)
 
 /// SiLU (Swish) activation: x * sigmoid(x)
@@ -346,6 +352,240 @@ pub fn mamba3_ssm_step(
     }
 
     output
+}
+
+// ============================================================================
+// GPU-accelerated scan (requires `cuda` feature)
+// ============================================================================
+
+/// GPU-accelerated Mamba-3 scan using the Flash Scan CUDA kernel.
+///
+/// Takes CPU `&[f32]` data (same interface as `mamba3_scan_combined`),
+/// uploads to GPU, runs the chunked parallel scan kernel, and downloads
+/// the result. This avoids requiring callers to manage GPU memory directly.
+///
+/// Returns `None` if CUDA is not available or initialization fails,
+/// allowing callers to fall back to the CPU path.
+///
+/// # Fallback conditions
+/// - CUDA device not available
+/// - Input size validation fails
+/// - Any GPU operation fails
+///
+/// # B/C bias handling
+/// The CUDA kernel does not natively support `b_bias`/`c_bias`. When provided,
+/// biases are pre-added to B and C tensors on the CPU before GPU upload. This
+/// is a lightweight O(batch * seq_len * ngroups * d_state) element-wise add.
+///
+/// # RoPE support
+/// Data-dependent RoPE is fully supported in the CUDA kernel. When `use_rope`
+/// is true, B and C vectors are rotated by `theta = dt * a_imag[head]` on-device.
+///
+/// # Known limitations
+/// - **H2D/D2H per call**: Data is uploaded to GPU and downloaded each call.
+///   A future persistent-tensor API would avoid this overhead for sequences of
+///   calls where data is already on-device.
+/// - **No GPU backward pass**: `MambaScanBackward` remains CPU-based. A CUDA
+///   backward kernel is needed to avoid a GPU→CPU→GPU round-trip during training.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+pub fn mamba3_scan_gpu(
+    x: &[f32],
+    batch: usize,
+    seq_len: usize,
+    nheads: usize,
+    headdim: usize,
+    dt: &[f32],
+    a_real: &[f32],
+    a_imag: &[f32],
+    b: &[f32],
+    ngroups: usize,
+    d_state: usize,
+    c: &[f32],
+    b_bias: Option<&[f32]>,
+    c_bias: Option<&[f32]>,
+    d: Option<&[f32]>,
+    z: Option<&[f32]>,
+    dt_bias: Option<&[f32]>,
+    dt_softplus: bool,
+    alpha: f32,
+    use_rope: bool,
+) -> Option<Mamba3ScanOutput> {
+    use kore_kernels::cuda::context::{get_device, is_cuda_available};
+    use kore_kernels::cuda::memory::CudaBuffer;
+    use kore_kernels::cuda::ops::cuda_mamba3_scan_f32;
+
+    if !is_cuda_available() { return None; }
+
+    // --- Input size validation ---
+    let expected_x = batch * seq_len * nheads * headdim;
+    let expected_dt = batch * seq_len * nheads;
+    let expected_bc = batch * seq_len * ngroups * d_state;
+    if x.len() != expected_x { return None; }
+    if dt.len() != expected_dt { return None; }
+    if a_real.len() != nheads { return None; }
+    if a_imag.len() != nheads { return None; }
+    if b.len() != expected_bc { return None; }
+    if c.len() != expected_bc { return None; }
+    if let Some(s) = b_bias { if s.len() != ngroups * d_state { return None; } }
+    if let Some(s) = c_bias { if s.len() != ngroups * d_state { return None; } }
+    if let Some(s) = d { if s.len() != nheads { return None; } }
+    if let Some(s) = z { if s.len() != expected_x { return None; } }
+    if let Some(s) = dt_bias { if s.len() != nheads { return None; } }
+
+    // --- Pre-add B/C biases on CPU before GPU upload ---
+    // The CUDA kernel does not support b_bias/c_bias natively. We fuse them
+    // into the B and C tensors here. The bias is (ngroups, d_state) and
+    // broadcasts across (batch, seq_len), so we add bias[g*d_state + n] to
+    // every b[batch, seq, g, n] element.
+    let b_biased: Vec<f32>;
+    let b_upload: &[f32] = if let Some(bb) = b_bias {
+        b_biased = b.iter().enumerate().map(|(i, &v)| {
+            // b layout: [batch, seq_len, ngroups, d_state]
+            // bias index: i % (ngroups * d_state)
+            v + bb[i % (ngroups * d_state)]
+        }).collect();
+        &b_biased
+    } else {
+        b
+    };
+
+    let c_biased: Vec<f32>;
+    let c_upload: &[f32] = if let Some(cb) = c_bias {
+        c_biased = c.iter().enumerate().map(|(i, &v)| {
+            v + cb[i % (ngroups * d_state)]
+        }).collect();
+        &c_biased
+    } else {
+        c
+    };
+
+    let dev_idx = 0;
+    let dev = get_device(dev_idx).ok()?;
+
+    // Helper: upload f32 slice to GPU as raw bytes
+    let upload = |data: &[f32]| -> Option<CudaBuffer> {
+        let bytes: &[u8] = bytemuck_cast_slice(data);
+        CudaBuffer::from_host(dev_idx, bytes).ok()
+    };
+
+    // Upload required inputs
+    let x_gpu = upload(x)?;
+    let dt_gpu = upload(dt)?;
+    let a_gpu = upload(a_real)?;
+    let a_imag_gpu = upload(a_imag)?;
+    let b_gpu = upload(b_upload)?;
+    let c_gpu = upload(c_upload)?;
+
+    // Upload optional inputs
+    let dt_bias_gpu = dt_bias.and_then(|s| upload(s));
+    let z_gpu = z.and_then(|s| upload(s));
+    let d_gpu = d.and_then(|s| upload(s));
+
+    let num_chunks = (seq_len + 127) / 128; // SCAN_CHUNK = 128
+    let state_elems = d_state * headdim;
+
+    let (output_gpu, chunk_h_gpu, chunk_bx_gpu) = cuda_mamba3_scan_f32(
+        &dev,
+        dev_idx,
+        x_gpu.as_cuda_slice(),
+        dt_gpu.as_cuda_slice(),
+        a_gpu.as_cuda_slice(),
+        a_imag_gpu.as_cuda_slice(),
+        b_gpu.as_cuda_slice(),
+        c_gpu.as_cuda_slice(),
+        dt_bias_gpu.as_ref().map(|b| b.as_cuda_slice()),
+        z_gpu.as_ref().map(|b| b.as_cuda_slice()),
+        d_gpu.as_ref().map(|b| b.as_cuda_slice()),
+        batch,
+        seq_len,
+        nheads,
+        headdim,
+        ngroups,
+        d_state,
+        alpha,
+        dt_softplus,
+        use_rope,
+    ).ok()?;
+
+    // Download output from GPU
+    let out_bytes = dev.dtoh_sync_copy(&output_gpu).ok()?;
+    let output: Vec<f32> = bytes_to_f32_vec(&out_bytes);
+
+    // Extract real last_state and prev_bx from chunk buffers.
+    // Layout: chunk_last_h[B, H, num_chunks, N*D] — the last chunk holds the
+    // final state for each (batch, head) pair.
+    let chunk_h_bytes = dev.dtoh_sync_copy(&chunk_h_gpu).ok()?;
+    let chunk_bx_bytes = dev.dtoh_sync_copy(&chunk_bx_gpu).ok()?;
+    let chunk_h_all: Vec<f32> = bytes_to_f32_vec(&chunk_h_bytes);
+    let chunk_bx_all: Vec<f32> = bytes_to_f32_vec(&chunk_bx_bytes);
+
+    let total_state = batch * nheads * state_elems;
+    let mut last_state = vec![0.0f32; total_state];
+    let mut prev_bx = vec![0.0f32; total_state];
+    let last_chunk = num_chunks - 1;
+
+    for bi in 0..batch {
+        for h in 0..nheads {
+            let src_base = bi * nheads * num_chunks * state_elems
+                         + h * num_chunks * state_elems
+                         + last_chunk * state_elems;
+            let dst_base = bi * nheads * state_elems + h * state_elems;
+            last_state[dst_base..dst_base + state_elems]
+                .copy_from_slice(&chunk_h_all[src_base..src_base + state_elems]);
+            prev_bx[dst_base..dst_base + state_elems]
+                .copy_from_slice(&chunk_bx_all[src_base..src_base + state_elems]);
+        }
+    }
+
+    Some(Mamba3ScanOutput {
+        output,
+        last_state,
+        prev_bx,
+    })
+}
+
+/// Reinterpret `&[f32]` as `&[u8]` without copying.
+#[cfg(feature = "cuda")]
+#[inline]
+fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            data.as_ptr() as *const u8,
+            data.len() * std::mem::size_of::<f32>(),
+        )
+    }
+}
+
+/// Convert raw bytes back to `Vec<f32>`.
+#[cfg(feature = "cuda")]
+#[inline]
+fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    assert!(bytes.len() % 4 == 0);
+    let n = bytes.len() / 4;
+    let mut out = vec![0.0f32; n];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            out.as_mut_ptr() as *mut u8,
+            bytes.len(),
+        );
+    }
+    out
+}
+
+/// Check if GPU-accelerated scan is available at runtime.
+///
+/// Returns `true` if compiled with `cuda` feature AND a CUDA device is present.
+pub fn is_gpu_scan_available() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        kore_kernels::cuda::context::is_cuda_available()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]

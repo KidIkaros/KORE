@@ -820,6 +820,7 @@ pub fn cuda_mamba3_scan_f32(
     x: &CudaSlice<u8>,
     dt: &CudaSlice<u8>,
     a_real: &CudaSlice<u8>,
+    a_imag: &CudaSlice<u8>,
     b: &CudaSlice<u8>,
     c: &CudaSlice<u8>,
     dt_bias: Option<&CudaSlice<u8>>,
@@ -833,6 +834,7 @@ pub fn cuda_mamba3_scan_f32(
     d_state: usize,
     alpha: f32,
     dt_softplus: bool,
+    use_rope: bool,
 ) -> Result<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>), CudaError> {
     assert!(d_state <= MAX_DSTATE,
         "cuda_mamba3_scan_f32: d_state={} exceeds MAX_DSTATE={}", d_state, MAX_DSTATE);
@@ -876,14 +878,14 @@ pub fn cuda_mamba3_scan_f32(
     };
     unsafe {
         f1.launch(cfg1, (
-            x, dt, a_real, b, c,
+            x, dt, a_real, a_imag, b, c,
             has_dt_bias, dt_bias_ptr,
             has_z, z_ptr,
             has_d_skip, d_skip_ptr,
             &output, &chunk_last_h, &chunk_last_bx,
             batch as u32, seq_len as u32, nheads as u32, headdim as u32,
             ngroups as u32, d_state as u32, num_chunks as u32,
-            alpha, dt_softplus as u32,
+            alpha, dt_softplus as u32, use_rope as u32,
         )).map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }
 

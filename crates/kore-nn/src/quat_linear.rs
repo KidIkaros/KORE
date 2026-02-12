@@ -151,6 +151,73 @@ impl QuatLinear {
     }
 }
 
+#[cfg(feature = "cuda")]
+impl QuatLinear {
+    /// Try to run the dequant matmul on GPU. Returns `None` if CUDA unavailable.
+    ///
+    /// `input_t`: transposed input [in_features, batch_size] as contiguous Tensor.
+    /// Returns: output Tensor [out_features, batch_size] (same layout as CPU path).
+    fn try_cuda_forward(&self, input_t: &Tensor, batch_size: usize) -> Option<Tensor> {
+        use kore_kernels::cuda::context::{get_device, is_cuda_available};
+        use kore_kernels::cuda::memory::CudaBuffer;
+        use kore_kernels::cuda::ops::cuda_dequant_quat_matmul_f32;
+
+        if !is_cuda_available() { return None; }
+
+        let dev_idx = 0;
+        let dev = get_device(dev_idx).ok()?;
+
+        let m = self.out_features;
+        let n = batch_size;
+        let k = self.in_features;
+
+        // Upload packed weights (already u8)
+        let a_gpu = CudaBuffer::from_host(dev_idx, &self.packed_weights).ok()?;
+
+        // Upload scales as raw bytes
+        let scales_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.scales.as_ptr() as *const u8,
+                self.scales.len() * 4,
+            )
+        };
+        let scales_gpu = CudaBuffer::from_host(dev_idx, scales_bytes).ok()?;
+
+        // Upload input_t as raw bytes
+        let input_data = input_t.contiguous();
+        let input_slice = input_data.as_f32_slice().ok()?;
+        let input_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                input_slice.as_ptr() as *const u8,
+                input_slice.len() * 4,
+            )
+        };
+        let b_gpu = CudaBuffer::from_host(dev_idx, input_bytes).ok()?;
+
+        let out_gpu = cuda_dequant_quat_matmul_f32(
+            &dev, dev_idx,
+            a_gpu.as_cuda_slice(),
+            scales_gpu.as_cuda_slice(),
+            b_gpu.as_cuda_slice(),
+            m, n, k,
+        ).ok()?;
+
+        // Download result
+        let out_bytes = dev.dtoh_sync_copy(&out_gpu).ok()?;
+        assert!(out_bytes.len() == m * n * 4);
+        let mut out_f32 = vec![0.0f32; m * n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                out_bytes.as_ptr(),
+                out_f32.as_mut_ptr() as *mut u8,
+                out_bytes.len(),
+            );
+        }
+
+        Some(Tensor::from_f32(&out_f32, &[m, n]))
+    }
+}
+
 impl std::fmt::Display for QuatLinear {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -199,6 +266,20 @@ impl Module for QuatLinear {
         // Which is: output^T[out, batch] = W[out, in] @ input^T[in, batch]
         let input_t = input_2d.transpose()?.contiguous();
 
+        #[cfg(feature = "cuda")]
+        let mut output = self.try_cuda_forward(&input_t, batch_size)
+            .unwrap_or_else(|| {
+                quat_matmul(
+                    &self.packed_weights,
+                    &self.scales,
+                    &input_t,
+                    self.out_features,
+                    batch_size,
+                    self.in_features,
+                ).expect("CPU quat_matmul failed")
+            });
+
+        #[cfg(not(feature = "cuda"))]
         let mut output = quat_matmul(
             &self.packed_weights,
             &self.scales,
