@@ -599,34 +599,39 @@ pub fn cuda_fused_rms_norm_proj_f32(
         .alloc_zeros::<u8>(rows * out_dim * 4)
         .map_err(|e| CudaError::MemoryError(e.to_string()))?;
 
-    let dummy = get_dummy_buf(dev, dev_idx)?;
-    let has_bias: u32 = bias.is_some() as u32;
-    let bias_ptr = bias.unwrap_or(&dummy);
-
-    // Choose kernel variant based on hidden size.
-    // smem variant caches x_hat in shared memory, avoiding redundant recomputation
-    // per output column. The 8192 threshold corresponds to 32KB of shared memory
-    // (8192 * 4 bytes) which fits comfortably on SM 7.0+. For hidden > 8192,
-    // the tiled variant recomputes x_hat per tile — still faster than two
-    // separate kernel launches due to eliminated VRAM round-trip.
+    // Choose kernel variant based on hidden size
     if hidden <= 8192 {
+        // Shared-memory variant: cache x_hat in smem for reuse across output columns
         let f = get_or_load_func(
             dev, dev_idx, "fused_norm_proj", "fused_rms_norm_proj_smem_f32",
             FUSED_NORM_PROJ_CU,
         )?;
         let block = BLOCK_SIZE;
-        let shared_bytes = (hidden * 4) as u32;
+        let shared_bytes = (hidden * 4) as u32; // x_hat[hidden] floats
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
             block_dim: (block as u32, 1, 1),
             shared_mem_bytes: shared_bytes,
         };
-        unsafe {
-            f.launch(cfg, (input, gamma, weight, has_bias, bias_ptr, &out,
-                rows as u32, hidden as u32, out_dim as u32, eps))
-                .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        // Pass null pointer for bias if not provided
+        match bias {
+            Some(b) => unsafe {
+                f.launch(cfg, (input, gamma, weight, b, &out,
+                    rows as u32, hidden as u32, out_dim as u32, eps))
+                    .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+            },
+            None => {
+                let null_bias = dev.alloc_zeros::<u8>(0)
+                    .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+                unsafe {
+                    f.launch(cfg, (input, gamma, weight, &null_bias, &out,
+                        rows as u32, hidden as u32, out_dim as u32, eps))
+                        .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+                }
+            }
         }
     } else {
+        // Tiled variant: one block per (row, output_tile)
         let f = get_or_load_func(
             dev, dev_idx, "fused_norm_proj", "fused_rms_norm_proj_f32",
             FUSED_NORM_PROJ_CU,
@@ -637,10 +642,21 @@ pub fn cuda_fused_rms_norm_proj_f32(
             block_dim: (BLOCK_SIZE as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe {
-            f.launch(cfg, (input, gamma, weight, has_bias, bias_ptr, &out,
-                rows as u32, hidden as u32, out_dim as u32, eps))
-                .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        match bias {
+            Some(b) => unsafe {
+                f.launch(cfg, (input, gamma, weight, b, &out,
+                    rows as u32, hidden as u32, out_dim as u32, eps))
+                    .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+            },
+            None => {
+                let null_bias = dev.alloc_zeros::<u8>(0)
+                    .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+                unsafe {
+                    f.launch(cfg, (input, gamma, weight, &null_bias, &out,
+                        rows as u32, hidden as u32, out_dim as u32, eps))
+                        .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+                }
+            }
         }
     }
 
@@ -792,16 +808,10 @@ pub fn cuda_dequant_quat_matmul_bias_relu_f32(
 /// Chunked size for the flash scan (must match SCAN_CHUNK in mamba_scan.cu).
 const SCAN_CHUNK: usize = 128;
 
-/// Maximum supported d_state (must match MAX_DSTATE in mamba_scan.cu).
-const MAX_DSTATE: usize = 64;
-
 /// Mamba-3 chunked parallel scan on GPU.
 ///
 /// Splits the sequence into chunks of 128 timesteps, processes each chunk
-/// in registers, then propagates boundary states across chunks.
-///
-/// Thread model: each thread owns specific headdim positions and processes
-/// ALL d_state elements for those positions. No atomics, no inter-thread races.
+/// in shared memory, then propagates boundary states across chunks.
 ///
 /// - `x`: [batch, seq_len, nheads, headdim] f32
 /// - `dt`: [batch, seq_len, nheads] f32
@@ -834,9 +844,6 @@ pub fn cuda_mamba3_scan_f32(
     alpha: f32,
     dt_softplus: bool,
 ) -> Result<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>), CudaError> {
-    assert!(d_state <= MAX_DSTATE,
-        "cuda_mamba3_scan_f32: d_state={} exceeds MAX_DSTATE={}", d_state, MAX_DSTATE);
-
     let num_chunks = (seq_len + SCAN_CHUNK - 1) / SCAN_CHUNK;
     let state_size = d_state * headdim;
 
@@ -851,18 +858,12 @@ pub fn cuda_mamba3_scan_f32(
         .alloc_zeros::<u8>(batch * nheads * num_chunks * state_size * 4)
         .map_err(|e| CudaError::MemoryError(e.to_string()))?;
 
-    let has_dt_bias: u32 = dt_bias.is_some() as u32;
-    let has_z: u32 = z.is_some() as u32;
-    let has_d_skip: u32 = d_skip.is_some() as u32;
-
-    let dummy = get_dummy_buf(dev, dev_idx)?;
-    let dt_bias_ptr = dt_bias.unwrap_or(&dummy);
-    let z_ptr = z.unwrap_or(&dummy);
-    let d_skip_ptr = d_skip.unwrap_or(&dummy);
-
-    // Block size: one thread per headdim position (capped at 256).
-    // Smaller block if headdim is small to avoid idle threads.
-    let block_size = headdim.min(256) as u32;
+    // Null slices for optional parameters
+    let empty = dev.alloc_zeros::<u8>(0)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let dt_bias_ptr = dt_bias.unwrap_or(&empty);
+    let z_ptr = z.unwrap_or(&empty);
+    let d_skip_ptr = d_skip.unwrap_or(&empty);
 
     // Phase 1: Intra-chunk scan
     let f1 = get_or_load_func(
@@ -871,15 +872,12 @@ pub fn cuda_mamba3_scan_f32(
     let total_blocks = batch * nheads * num_chunks;
     let cfg1 = LaunchConfig {
         grid_dim: (total_blocks as u32, 1, 1),
-        block_dim: (block_size, 1, 1),
+        block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
     unsafe {
         f1.launch(cfg1, (
-            x, dt, a_real, b, c,
-            has_dt_bias, dt_bias_ptr,
-            has_z, z_ptr,
-            has_d_skip, d_skip_ptr,
+            x, dt, a_real, b, c, dt_bias_ptr, z_ptr, d_skip_ptr,
             &output, &chunk_last_h, &chunk_last_bx,
             batch as u32, seq_len as u32, nheads as u32, headdim as u32,
             ngroups as u32, d_state as u32, num_chunks as u32,
@@ -900,8 +898,7 @@ pub fn cuda_mamba3_scan_f32(
         };
         unsafe {
             f2.launch(cfg2, (
-                &chunk_last_h, &chunk_last_bx, a_real, dt,
-                has_dt_bias, dt_bias_ptr,
+                &chunk_last_h, &chunk_last_bx, a_real, dt, dt_bias_ptr,
                 batch as u32, seq_len as u32, nheads as u32,
                 state_size as u32, num_chunks as u32,
                 alpha, dt_softplus as u32,
