@@ -599,10 +599,7 @@ pub fn cuda_fused_rms_norm_proj_f32(
         .alloc_zeros::<u8>(rows * out_dim * 4)
         .map_err(|e| CudaError::MemoryError(e.to_string()))?;
 
-    // Dummy 4-byte buffer for bias when None — always a valid device pointer,
-    // never dereferenced because kernel checks `has_bias` flag.
-    let dummy = dev.alloc_zeros::<u8>(4)
-        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let dummy = get_dummy_buf(dev, dev_idx)?;
     let has_bias: u32 = bias.is_some() as u32;
     let bias_ptr = bias.unwrap_or(&dummy);
 
@@ -854,15 +851,11 @@ pub fn cuda_mamba3_scan_f32(
         .alloc_zeros::<u8>(batch * nheads * num_chunks * state_size * 4)
         .map_err(|e| CudaError::MemoryError(e.to_string()))?;
 
-    // Boolean flags for optional parameters (avoids null pointer issues)
     let has_dt_bias: u32 = dt_bias.is_some() as u32;
     let has_z: u32 = z.is_some() as u32;
     let has_d_skip: u32 = d_skip.is_some() as u32;
 
-    // Dummy 4-byte buffer for unused optional pointers — always a valid device
-    // pointer, never dereferenced when the corresponding has_* flag is 0.
-    let dummy = dev.alloc_zeros::<u8>(4)
-        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let dummy = get_dummy_buf(dev, dev_idx)?;
     let dt_bias_ptr = dt_bias.unwrap_or(&dummy);
     let z_ptr = z.unwrap_or(&dummy);
     let d_skip_ptr = d_skip.unwrap_or(&dummy);
