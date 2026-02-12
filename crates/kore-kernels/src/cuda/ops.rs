@@ -49,6 +49,7 @@ const ROPE_CU: &str = include_str!("kernels/rope.cu");
 const FUSED_NORM_PROJ_CU: &str = include_str!("kernels/fused_norm_proj.cu");
 const DEQUANT_MATMUL_CU: &str = include_str!("kernels/dequant_matmul.cu");
 const MAMBA_SCAN_CU: &str = include_str!("kernels/mamba_scan.cu");
+const MAMBA_SCAN_BWD_CU: &str = include_str!("kernels/mamba_scan_backward.cu");
 
 const BLOCK_SIZE: usize = 256;
 
@@ -812,7 +813,20 @@ const MAX_DSTATE: usize = 64;
 /// - `z`: optional [batch, seq_len, nheads, headdim] f32 gate
 /// - `d_skip`: optional [nheads] f32 skip connection
 ///
+/// Output from the forward scan when `save_states` is true.
+pub struct MambaScanForwardGpu {
+    pub output: CudaSlice<u8>,
+    pub chunk_last_h: CudaSlice<u8>,
+    pub chunk_last_bx: CudaSlice<u8>,
+    /// Per-timestep hidden states [B, (L+1), H, N, D] — only set when save_states=true
+    pub h_all: Option<CudaSlice<u8>>,
+    /// Per-timestep prev_bx cache [B, (L+1), H, N, D] — only set when save_states=true
+    pub bx_all: Option<CudaSlice<u8>>,
+}
+
 /// Returns `(output, chunk_last_h, chunk_last_bx)`.
+/// When `save_states` is true, also returns per-timestep h_all and bx_all
+/// on GPU for the backward pass (avoids D2H+H2D round-trip).
 #[allow(clippy::too_many_arguments)]
 pub fn cuda_mamba3_scan_f32(
     dev: &Arc<CudaDevice>,
@@ -835,12 +849,15 @@ pub fn cuda_mamba3_scan_f32(
     alpha: f32,
     dt_softplus: bool,
     use_rope: bool,
-) -> Result<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>), CudaError> {
+    save_states: bool,
+) -> Result<MambaScanForwardGpu, CudaError> {
     assert!(d_state <= MAX_DSTATE,
         "cuda_mamba3_scan_f32: d_state={} exceeds MAX_DSTATE={}", d_state, MAX_DSTATE);
 
     let num_chunks = (seq_len + SCAN_CHUNK - 1) / SCAN_CHUNK;
     let state_size = d_state * headdim;
+    let frame = nheads * d_state * headdim;
+    let nf = seq_len + 1;
 
     // Allocate outputs
     let output = dev
@@ -853,14 +870,31 @@ pub fn cuda_mamba3_scan_f32(
         .alloc_zeros::<u8>(batch * nheads * num_chunks * state_size * 4)
         .map_err(|e| CudaError::MemoryError(e.to_string()))?;
 
+    // Allocate per-timestep state buffers if saving for backward
+    let h_all_buf = if save_states {
+        Some(dev.alloc_zeros::<u8>(batch * nf * frame * 4)
+            .map_err(|e| CudaError::MemoryError(e.to_string()))?)
+    } else {
+        None
+    };
+    let bx_all_buf = if save_states {
+        Some(dev.alloc_zeros::<u8>(batch * nf * frame * 4)
+            .map_err(|e| CudaError::MemoryError(e.to_string()))?)
+    } else {
+        None
+    };
+
     let has_dt_bias: u32 = dt_bias.is_some() as u32;
     let has_z: u32 = z.is_some() as u32;
     let has_d_skip: u32 = d_skip.is_some() as u32;
+    let save_flag: u32 = save_states as u32;
 
     let dummy = get_dummy_buf(dev, dev_idx)?;
     let dt_bias_ptr = dt_bias.unwrap_or(&dummy);
     let z_ptr = z.unwrap_or(&dummy);
     let d_skip_ptr = d_skip.unwrap_or(&dummy);
+    let h_all_ptr = h_all_buf.as_ref().unwrap_or(&dummy);
+    let bx_all_ptr = bx_all_buf.as_ref().unwrap_or(&dummy);
 
     // Block size: one thread per headdim position (capped at 256).
     // Smaller block if headdim is small to avoid idle threads.
@@ -883,6 +917,7 @@ pub fn cuda_mamba3_scan_f32(
             has_z, z_ptr,
             has_d_skip, d_skip_ptr,
             &output, &chunk_last_h, &chunk_last_bx,
+            save_flag, h_all_ptr, bx_all_ptr,
             batch as u32, seq_len as u32, nheads as u32, headdim as u32,
             ngroups as u32, d_state as u32, num_chunks as u32,
             alpha, dt_softplus as u32, use_rope as u32,
@@ -911,5 +946,112 @@ pub fn cuda_mamba3_scan_f32(
         }
     }
 
-    Ok((output, chunk_last_h, chunk_last_bx))
+    Ok(MambaScanForwardGpu {
+        output,
+        chunk_last_h,
+        chunk_last_bx,
+        h_all: h_all_buf,
+        bx_all: bx_all_buf,
+    })
+}
+
+// ============================================================================
+// Mamba-3 scan backward pass
+// ============================================================================
+
+/// Backward pass for the Mamba-3 chunked scan.
+///
+/// Computes gradients dx, d_dt, d_b, d_c, dz from the upstream grad_output
+/// and saved forward context (inputs + per-timestep states).
+///
+/// Thread model matches forward: one block per (batch, head), threads map to
+/// headdim positions, d_state maintained in registers.
+///
+/// - `grad_output`: [batch, seq_len, nheads, headdim] f32
+/// - `x`, `dt`, `a_real`, `a_imag`, `b`, `c`: saved forward inputs
+/// - `h_all`: [batch, seq_len+1, nheads, d_state, headdim] f32 — per-timestep states
+/// - `bx_all`: [batch, seq_len+1, nheads, d_state, headdim] f32 — per-timestep prev_bx
+///
+/// Returns `(dx, d_dt, d_b, d_c, dz)`.
+#[allow(clippy::too_many_arguments)]
+pub fn cuda_mamba3_scan_backward_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    grad_output: &CudaSlice<u8>,
+    x: &CudaSlice<u8>,
+    dt: &CudaSlice<u8>,
+    a_real: &CudaSlice<u8>,
+    a_imag: &CudaSlice<u8>,
+    b: &CudaSlice<u8>,
+    c: &CudaSlice<u8>,
+    h_all: &CudaSlice<u8>,
+    bx_all: &CudaSlice<u8>,
+    dt_bias: Option<&CudaSlice<u8>>,
+    z: Option<&CudaSlice<u8>>,
+    d_skip: Option<&CudaSlice<u8>>,
+    batch: usize,
+    seq_len: usize,
+    nheads: usize,
+    headdim: usize,
+    ngroups: usize,
+    d_state: usize,
+    alpha: f32,
+    dt_softplus: bool,
+    use_rope: bool,
+) -> Result<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>), CudaError> {
+    assert!(d_state <= MAX_DSTATE,
+        "cuda_mamba3_scan_backward_f32: d_state={} exceeds MAX_DSTATE={}", d_state, MAX_DSTATE);
+
+    // Allocate gradient output buffers (zeroed — atomicAdd accumulates into these)
+    let dx = dev
+        .alloc_zeros::<u8>(batch * seq_len * nheads * headdim * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let d_dt = dev
+        .alloc_zeros::<u8>(batch * seq_len * nheads * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let d_b = dev
+        .alloc_zeros::<u8>(batch * seq_len * ngroups * d_state * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let d_c = dev
+        .alloc_zeros::<u8>(batch * seq_len * ngroups * d_state * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+    let dz = dev
+        .alloc_zeros::<u8>(batch * seq_len * nheads * headdim * 4)
+        .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+
+    let has_dt_bias: u32 = dt_bias.is_some() as u32;
+    let has_z: u32 = z.is_some() as u32;
+    let has_d_skip: u32 = d_skip.is_some() as u32;
+
+    let dummy = get_dummy_buf(dev, dev_idx)?;
+    let dt_bias_ptr = dt_bias.unwrap_or(&dummy);
+    let z_ptr = z.unwrap_or(&dummy);
+    let d_skip_ptr = d_skip.unwrap_or(&dummy);
+
+    let block_size = headdim.min(256) as u32;
+    let total_blocks = batch * nheads;
+
+    let f = get_or_load_func(
+        dev, dev_idx, "mamba_scan_backward", "mamba3_scan_backward_f32", MAMBA_SCAN_BWD_CU,
+    )?;
+    let cfg = LaunchConfig {
+        grid_dim: (total_blocks as u32, 1, 1),
+        block_dim: (block_size, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        f.launch(cfg, (
+            grad_output, x, dt, a_real, a_imag, b, c,
+            h_all, bx_all,
+            has_dt_bias, dt_bias_ptr,
+            has_z, z_ptr,
+            has_d_skip, d_skip_ptr,
+            &dx, &d_dt, &d_b, &d_c, &dz,
+            batch as u32, seq_len as u32, nheads as u32, headdim as u32,
+            ngroups as u32, d_state as u32,
+            alpha, dt_softplus as u32, use_rope as u32,
+        )).map_err(|e| CudaError::LaunchError(e.to_string()))?;
+    }
+
+    Ok((dx, d_dt, d_b, d_c, dz))
 }

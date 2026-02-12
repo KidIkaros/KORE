@@ -7,6 +7,26 @@ use kore_core::Tensor;
 
 use super::MambaScanBackward;
 
+/// GPU-resident saved context for backward pass.
+/// Holds all forward inputs and per-timestep states on GPU to avoid
+/// D2H+H2D round-trips between forward and backward.
+#[cfg(feature = "cuda")]
+pub struct GpuSavedContext {
+    pub dev: Arc<cudarc::driver::CudaDevice>,
+    pub dev_idx: usize,
+    pub x: cudarc::driver::CudaSlice<u8>,
+    pub dt: cudarc::driver::CudaSlice<u8>,
+    pub a_real: cudarc::driver::CudaSlice<u8>,
+    pub a_imag: cudarc::driver::CudaSlice<u8>,
+    pub b: cudarc::driver::CudaSlice<u8>,
+    pub c: cudarc::driver::CudaSlice<u8>,
+    pub dt_bias: Option<cudarc::driver::CudaSlice<u8>>,
+    pub z: Option<cudarc::driver::CudaSlice<u8>>,
+    pub d_skip: Option<cudarc::driver::CudaSlice<u8>>,
+    pub h_all: cudarc::driver::CudaSlice<u8>,
+    pub bx_all: cudarc::driver::CudaSlice<u8>,
+}
+
 /// All data saved during the forward pass, needed by the backward.
 pub struct MambaScanSaved {
     // Inputs (cloned)
@@ -39,6 +59,11 @@ pub struct MambaScanSaved {
     pub h_all: Vec<f32>,
     // Per-timestep prev_bx cache: same layout as h_all
     pub bx_all: Vec<f32>,
+
+    // GPU-resident saved context (set when forward ran on GPU with save_states=true).
+    // When present, backward uses these directly instead of re-uploading CPU data.
+    #[cfg(feature = "cuda")]
+    pub gpu_ctx: Option<GpuSavedContext>,
 }
 
 /// SiLU activation
@@ -230,6 +255,8 @@ pub fn mamba3_scan_with_grad(
         use_rope,
         h_all,
         bx_all,
+        #[cfg(feature = "cuda")]
+        gpu_ctx: None,
     };
 
     // Build output tensor with grad node

@@ -485,7 +485,7 @@ pub fn mamba3_scan_gpu(
     let num_chunks = (seq_len + 127) / 128; // SCAN_CHUNK = 128
     let state_elems = d_state * headdim;
 
-    let (output_gpu, chunk_h_gpu, chunk_bx_gpu) = cuda_mamba3_scan_f32(
+    let fwd_result = cuda_mamba3_scan_f32(
         &dev,
         dev_idx,
         x_gpu.as_cuda_slice(),
@@ -506,17 +506,18 @@ pub fn mamba3_scan_gpu(
         alpha,
         dt_softplus,
         use_rope,
+        false,  // save_states — not needed for inference-only path
     ).ok()?;
 
     // Download output from GPU
-    let out_bytes = dev.dtoh_sync_copy(&output_gpu).ok()?;
+    let out_bytes = dev.dtoh_sync_copy(&fwd_result.output).ok()?;
     let output: Vec<f32> = bytes_to_f32_vec(&out_bytes);
 
     // Extract real last_state and prev_bx from chunk buffers.
     // Layout: chunk_last_h[B, H, num_chunks, N*D] — the last chunk holds the
     // final state for each (batch, head) pair.
-    let chunk_h_bytes = dev.dtoh_sync_copy(&chunk_h_gpu).ok()?;
-    let chunk_bx_bytes = dev.dtoh_sync_copy(&chunk_bx_gpu).ok()?;
+    let chunk_h_bytes = dev.dtoh_sync_copy(&fwd_result.chunk_last_h).ok()?;
+    let chunk_bx_bytes = dev.dtoh_sync_copy(&fwd_result.chunk_last_bx).ok()?;
     let chunk_h_all: Vec<f32> = bytes_to_f32_vec(&chunk_h_bytes);
     let chunk_bx_all: Vec<f32> = bytes_to_f32_vec(&chunk_bx_bytes);
 

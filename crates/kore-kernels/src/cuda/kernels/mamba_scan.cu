@@ -61,6 +61,9 @@ __global__ void mamba3_scan_chunk_f32(
     float* __restrict__ output,           // [B, T, H, D]
     float* __restrict__ chunk_last_h,     // [B, H, num_chunks, N, D]
     float* __restrict__ chunk_last_bx,    // [B, H, num_chunks, N, D]
+    unsigned int save_states,
+    float* __restrict__ h_all_out,        // [B, (T+1), H, N, D] — per-timestep states for backward
+    float* __restrict__ bx_all_out,       // [B, (T+1), H, N, D] — per-timestep prev_bx for backward
     unsigned int batch,
     unsigned int seq_len,
     unsigned int nheads,
@@ -150,6 +153,18 @@ __global__ void mamba3_scan_chunk_f32(
             // Single write per (t, head, p) — no atomics, no races
             output[batch_idx * seq_len * nheads * headdim
                   + t * nheads * headdim + head * headdim + p] = y;
+
+            // Save per-timestep states for backward pass (frame t+1)
+            if (save_states) {
+                unsigned int frame = nheads * d_state * headdim;
+                unsigned int nf = seq_len + 1;
+                for (unsigned int n = 0; n < d_state; n++) {
+                    unsigned int si = (batch_idx * nf + t + 1) * frame
+                                   + head * d_state * headdim + n * headdim + p;
+                    h_all_out[si] = h[n];
+                    bx_all_out[si] = pbx[n];
+                }
+            }
         }
 
         // Store boundary states for inter-chunk prefix

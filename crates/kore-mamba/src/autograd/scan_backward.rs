@@ -38,12 +38,98 @@ fn apply_rope_inplace(v: &mut [f32], theta: f32) {
     }
 }
 
-impl GradFn for MambaScanBackward {
-    fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
-        let s = &self.saved;
-        let go = grad_output.contiguous();
-        let go_data = go.as_f32_slice().unwrap();
+/// Helper to reinterpret `&[f32]` as `&[u8]` without copying.
+#[cfg(feature = "cuda")]
+#[inline]
+fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
+    unsafe {
+        std::slice::from_raw_parts(
+            data.as_ptr() as *const u8,
+            data.len() * std::mem::size_of::<f32>(),
+        )
+    }
+}
 
+/// Helper to reinterpret `Vec<u8>` as `Vec<f32>`.
+#[cfg(feature = "cuda")]
+#[inline]
+fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    assert!(bytes.len() % 4 == 0);
+    let n = bytes.len() / 4;
+    let mut out = vec![0.0f32; n];
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, bytes.len());
+    }
+    out
+}
+
+impl MambaScanBackward {
+    /// Try to run backward on GPU. Returns None if CUDA unavailable or GPU context missing.
+    #[cfg(feature = "cuda")]
+    fn try_gpu_backward(&self, go_data: &[f32]) -> Option<Vec<Option<Tensor>>> {
+        use kore_kernels::cuda::ops::cuda_mamba3_scan_backward_f32;
+
+        let s = &self.saved;
+        let (batch, seq_len, nheads, headdim) = (s.batch, s.seq_len, s.nheads, s.headdim);
+        let (ngroups, d_state) = (s.ngroups, s.d_state);
+        let has_z = s.z.is_some();
+
+        let gpu_ctx = s.gpu_ctx.as_ref()?;
+        let dev = &gpu_ctx.dev;
+        let dev_idx = gpu_ctx.dev_idx;
+
+        // Upload grad_output to GPU
+        let go_gpu = dev.htod_copy(bytemuck_cast_slice(go_data).to_vec()).ok()?;
+
+        let (dx_gpu, d_dt_gpu, d_b_gpu, d_c_gpu, dz_gpu) = cuda_mamba3_scan_backward_f32(
+            dev,
+            dev_idx,
+            &go_gpu,
+            &gpu_ctx.x,
+            &gpu_ctx.dt,
+            &gpu_ctx.a_real,
+            &gpu_ctx.a_imag,
+            &gpu_ctx.b,
+            &gpu_ctx.c,
+            &gpu_ctx.h_all,
+            &gpu_ctx.bx_all,
+            gpu_ctx.dt_bias.as_ref(),
+            gpu_ctx.z.as_ref(),
+            gpu_ctx.d_skip.as_ref(),
+            batch,
+            seq_len,
+            nheads,
+            headdim,
+            ngroups,
+            d_state,
+            s.alpha,
+            s.dt_softplus,
+            s.use_rope,
+        ).ok()?;
+
+        // Download gradients from GPU
+        let dx: Vec<f32> = bytes_to_f32_vec(&dev.dtoh_sync_copy(&dx_gpu).ok()?);
+        let d_dt: Vec<f32> = bytes_to_f32_vec(&dev.dtoh_sync_copy(&d_dt_gpu).ok()?);
+        let d_b: Vec<f32> = bytes_to_f32_vec(&dev.dtoh_sync_copy(&d_b_gpu).ok()?);
+        let d_c: Vec<f32> = bytes_to_f32_vec(&dev.dtoh_sync_copy(&d_c_gpu).ok()?);
+
+        let dx_t = Tensor::from_f32(&dx, &[batch, seq_len, nheads * headdim]);
+        let dt_t = Tensor::from_f32(&d_dt, &[batch, seq_len, nheads]);
+        let b_t = Tensor::from_f32(&d_b, &[batch, seq_len, ngroups * d_state]);
+        let c_t = Tensor::from_f32(&d_c, &[batch, seq_len, ngroups * d_state]);
+
+        if has_z {
+            let dz: Vec<f32> = bytes_to_f32_vec(&dev.dtoh_sync_copy(&dz_gpu).ok()?);
+            let z_t = Tensor::from_f32(&dz, &[batch, seq_len, nheads * headdim]);
+            Some(vec![Some(dx_t), Some(dt_t), Some(b_t), Some(c_t), Some(z_t)])
+        } else {
+            Some(vec![Some(dx_t), Some(dt_t), Some(b_t), Some(c_t)])
+        }
+    }
+
+    /// CPU backward pass (existing implementation).
+    fn cpu_backward(&self, go_data: &[f32]) -> Vec<Option<Tensor>> {
+        let s = &self.saved;
         let (batch, seq_len, nheads, headdim) = (s.batch, s.seq_len, s.nheads, s.headdim);
         let (ngroups, d_state) = (s.ngroups, s.d_state);
         let hpg = nheads / ngroups;
@@ -60,10 +146,7 @@ impl GradFn for MambaScanBackward {
         let ss = nheads * d_state * headdim;
 
         for bi in 0..batch {
-            // dh: gradient w.r.t. h[l+1], propagated backward through time
             let mut dh = vec![0.0f32; ss];
-            // d_cur_bx: gradient w.r.t. cur_bx = B_l*x_l that was saved as
-            // prev_bx for timestep l+1. Set when processing l+1, consumed at l.
             let mut d_cur_bx = vec![0.0f32; ss];
 
             for l in (0..seq_len).rev() {
@@ -123,50 +206,29 @@ impl GradFn for MambaScanBackward {
                             let pbx = s.bx_all[(bi * nf + l) * frame + si];
                             let cur_bx = bv[n] * xv;
 
-                            // dC: d(loss)/d(C[n]) += dy_pre * h_t[n,p]
                             let ci = bi * seq_len * ngroups * d_state + l * ngroups * d_state + g * d_state + n;
                             d_c[ci] += dy_pre * ht;
 
-                            // dh from output: y_pre += h_t[n,p] * C[n]
                             dh[si] += dy_pre * cv[n];
 
-                            // --- Consume d_cur_bx from timestep l+1 ---
-                            // d_cur_bx[si] is the gradient w.r.t. cur_bx = B_l[n]*x_l[p]
-                            // that was stored as prev_bx for timestep l+1.
-                            // At the last reverse iteration (l=0), this is still valid:
-                            // it carries the gradient from l=1's use of prev_bx.
-                            // The value set at line ~159 when l=0 is never consumed
-                            // (no l=-1 exists), which is correct — initial prev_bx is
-                            // zero and has no learnable upstream.
                             let d_cbx = d_cur_bx[si];
                             let bi_idx = bi * seq_len * ngroups * d_state + l * ngroups * d_state + g * d_state + n;
                             dx[xi] += d_cbx * bv[n];
                             d_b[bi_idx] += d_cbx * xv;
 
-                            // --- Recurrence backward ---
                             let dh_t = dh[si];
 
-                            // d(h_{t-1}) += dh_t * da
                             let dh_prop = dh_t * da;
 
-                            // d(da) = dh_t * h_{t-1}; da = exp(dtv * a_real)
-                            // d(dtv) += dh_t * h_{t-1} * da * a_real
                             d_dtv += dh_t * hp * da * s.a_real[h];
 
-                            // d(beta * B[n] * x[p])
                             dx[xi] += dh_t * beta * bv[n];
                             d_b[bi_idx] += dh_t * beta * xv;
-                            // d(beta) = dh_t * cur_bx; beta = dtv * alpha
                             d_dtv += dh_t * cur_bx * s.alpha;
 
-                            // d(gamma * prev_bx[n,p])
-                            // Flows to cur_bx at timestep l-1. When l=0 this value
-                            // is written but never read — safe, see note above.
                             d_cur_bx[si] = dh_t * gamma;
-                            // d(gamma) = dh_t * prev_bx; gamma = dtv * (1-alpha)
                             d_dtv += dh_t * pbx * (1.0 - s.alpha);
 
-                            // Set dh for next reverse iteration (timestep l-1)
                             dh[si] = dh_prop;
                         }
                     }
@@ -188,6 +250,24 @@ impl GradFn for MambaScanBackward {
         } else {
             vec![Some(dx_t), Some(dt_t), Some(b_t), Some(c_t)]
         }
+    }
+}
+
+impl GradFn for MambaScanBackward {
+    fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        let go = grad_output.contiguous();
+        let go_data = go.as_f32_slice().unwrap();
+
+        // Try GPU backward first (zero-copy from GPU-resident saved states)
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(result) = self.try_gpu_backward(go_data) {
+                return result;
+            }
+        }
+
+        // Fallback to CPU backward
+        self.cpu_backward(go_data)
     }
 
     fn name(&self) -> &str { "MambaScanBackward" }
