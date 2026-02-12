@@ -75,6 +75,11 @@ impl MambaScanBackward {
         let has_z = s.z.is_some();
 
         let gpu_ctx = s.gpu_ctx.as_ref()?;
+
+        // Consistency check: CPU and GPU contexts must agree on optional params
+        if has_z != gpu_ctx.z.is_some() {
+            return None; // Mismatch, fall back to CPU
+        }
         let dev = &gpu_ctx.dev;
         let dev_idx = gpu_ctx.dev_idx;
 

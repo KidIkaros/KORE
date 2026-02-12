@@ -154,7 +154,10 @@ __global__ void mamba3_scan_chunk_f32(
             output[batch_idx * seq_len * nheads * headdim
                   + t * nheads * headdim + head * headdim + p] = y;
 
-            // Save per-timestep states for backward pass (frame t+1)
+            // Save per-timestep states for backward pass (frame t+1).
+            // Frame 0 (initial state) is zero — guaranteed by alloc_zeros in
+            // the Rust dispatch (cuda_mamba3_scan_f32). The backward kernel
+            // reads h_all[batch_idx * nf + 0] as the initial zero state.
             if (save_states) {
                 unsigned int frame = nheads * d_state * headdim;
                 unsigned int nf = seq_len + 1;
