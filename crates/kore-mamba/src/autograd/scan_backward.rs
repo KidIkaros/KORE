@@ -131,8 +131,13 @@ impl GradFn for MambaScanBackward {
                             dh[si] += dy_pre * cv[n];
 
                             // --- Consume d_cur_bx from timestep l+1 ---
-                            // d_cur_bx[si] is the gradient of cur_bx = B_l[n]*x_l[p]
-                            // computed at this timestep l, used as prev_bx at l+1.
+                            // d_cur_bx[si] is the gradient w.r.t. cur_bx = B_l[n]*x_l[p]
+                            // that was stored as prev_bx for timestep l+1.
+                            // At the last reverse iteration (l=0), this is still valid:
+                            // it carries the gradient from l=1's use of prev_bx.
+                            // The value set at line ~159 when l=0 is never consumed
+                            // (no l=-1 exists), which is correct — initial prev_bx is
+                            // zero and has no learnable upstream.
                             let d_cbx = d_cur_bx[si];
                             let bi_idx = bi * seq_len * ngroups * d_state + l * ngroups * d_state + g * d_state + n;
                             dx[xi] += d_cbx * bv[n];
@@ -155,7 +160,8 @@ impl GradFn for MambaScanBackward {
                             d_dtv += dh_t * cur_bx * s.alpha;
 
                             // d(gamma * prev_bx[n,p])
-                            // This gradient flows to the cur_bx at timestep l-1
+                            // Flows to cur_bx at timestep l-1. When l=0 this value
+                            // is written but never read — safe, see note above.
                             d_cur_bx[si] = dh_t * gamma;
                             // d(gamma) = dh_t * prev_bx; gamma = dtv * (1-alpha)
                             d_dtv += dh_t * pbx * (1.0 - s.alpha);
