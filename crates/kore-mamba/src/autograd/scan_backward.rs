@@ -39,7 +39,7 @@ fn apply_rope_inplace(v: &mut [f32], theta: f32) {
 }
 
 /// Helper to reinterpret `&[f32]` as `&[u8]` without copying.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 #[inline]
 fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
     unsafe {
@@ -51,7 +51,7 @@ fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
 }
 
 /// Helper to reinterpret `Vec<u8>` as `Vec<f32>`.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 #[inline]
 fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
     assert!(bytes.len() % 4 == 0);
@@ -125,6 +125,60 @@ impl MambaScanBackward {
 
         if has_z {
             let dz: Vec<f32> = bytes_to_f32_vec(&dev.dtoh_sync_copy(&dz_gpu).ok()?);
+            let z_t = Tensor::from_f32(&dz, &[batch, seq_len, nheads * headdim]);
+            Some(vec![Some(dx_t), Some(dt_t), Some(b_t), Some(c_t), Some(z_t)])
+        } else {
+            Some(vec![Some(dx_t), Some(dt_t), Some(b_t), Some(c_t)])
+        }
+    }
+
+    /// Try to run backward on ROCm GPU. Returns None if ROCm unavailable or context missing.
+    #[cfg(feature = "rocm")]
+    fn try_rocm_backward(&self, go_data: &[f32]) -> Option<Vec<Option<Tensor>>> {
+        use kore_kernels::rocm::memory::HipBuffer;
+        use kore_kernels::rocm::ops::rocm_mamba3_scan_backward_f32;
+
+        let s = &self.saved;
+        let (batch, seq_len, nheads, headdim) = (s.batch, s.seq_len, s.nheads, s.headdim);
+        let (ngroups, d_state) = (s.ngroups, s.d_state);
+        let has_z = s.z.is_some();
+
+        let ctx = s.rocm_ctx.as_ref()?;
+
+        // Consistency check
+        if has_z != ctx.z.is_some() {
+            return None;
+        }
+
+        let dev_idx = ctx.dev_idx;
+
+        // Upload grad_output to GPU
+        let go_gpu = HipBuffer::from_host(dev_idx, bytemuck_cast_slice(go_data)).ok()?;
+
+        let (dx_gpu, d_dt_gpu, d_b_gpu, d_c_gpu, dz_gpu) = rocm_mamba3_scan_backward_f32(
+            dev_idx,
+            &go_gpu,
+            &ctx.x, &ctx.dt, &ctx.a_real, &ctx.a_imag,
+            &ctx.b, &ctx.c,
+            &ctx.h_all, &ctx.bx_all,
+            ctx.dt_bias.as_ref(), ctx.z.as_ref(), ctx.d_skip.as_ref(),
+            batch, seq_len, nheads, headdim, ngroups, d_state,
+            s.alpha, s.dt_softplus, s.use_rope,
+        ).ok()?;
+
+        // Download gradients from GPU
+        let dx: Vec<f32> = bytes_to_f32_vec(&dx_gpu.to_host().ok()?);
+        let d_dt: Vec<f32> = bytes_to_f32_vec(&d_dt_gpu.to_host().ok()?);
+        let d_b: Vec<f32> = bytes_to_f32_vec(&d_b_gpu.to_host().ok()?);
+        let d_c: Vec<f32> = bytes_to_f32_vec(&d_c_gpu.to_host().ok()?);
+
+        let dx_t = Tensor::from_f32(&dx, &[batch, seq_len, nheads * headdim]);
+        let dt_t = Tensor::from_f32(&d_dt, &[batch, seq_len, nheads]);
+        let b_t = Tensor::from_f32(&d_b, &[batch, seq_len, ngroups * d_state]);
+        let c_t = Tensor::from_f32(&d_c, &[batch, seq_len, ngroups * d_state]);
+
+        if has_z {
+            let dz: Vec<f32> = bytes_to_f32_vec(&dz_gpu.to_host().ok()?);
             let z_t = Tensor::from_f32(&dz, &[batch, seq_len, nheads * headdim]);
             Some(vec![Some(dx_t), Some(dt_t), Some(b_t), Some(c_t), Some(z_t)])
         } else {
@@ -267,6 +321,13 @@ impl GradFn for MambaScanBackward {
         #[cfg(feature = "cuda")]
         {
             if let Some(result) = self.try_gpu_backward(go_data) {
+                return result;
+            }
+        }
+
+        #[cfg(feature = "rocm")]
+        {
+            if let Some(result) = self.try_rocm_backward(go_data) {
                 return result;
             }
         }
