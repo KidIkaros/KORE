@@ -59,6 +59,8 @@ __global__ void dequant_quat_matmul_f32(
             unsigned int byte_idx = a_k / 4;
             unsigned int bit_slot = a_k % 4;
             unsigned char packed = A_packed[row * K_packed + byte_idx];
+            // LSB-first packing: slot 0 in bits [1:0], slot 1 in [3:2], etc.
+            // Matches kore-btes pack_quats() byte layout exactly.
             unsigned int qidx = (packed >> (bit_slot * 2)) & 0x3;
             As[threadIdx.y][threadIdx.x] = QUAT_LUT[qidx];
         } else {
@@ -137,6 +139,7 @@ __global__ void dequant_quat_matmul_tiled2x2_f32(
                 unsigned int byte_idx = a_global_col / 4;
                 unsigned int bit_slot = a_global_col % 4;
                 unsigned char packed = A_packed[a_global_row * K_packed + byte_idx];
+                // LSB-first packing: slot 0 in bits [1:0], slot 1 in [3:2], etc.
                 unsigned int qidx = (packed >> (bit_slot * 2)) & 0x3;
                 As[a_smem_row][a_smem_col] = QUAT_LUT[qidx];
             } else {

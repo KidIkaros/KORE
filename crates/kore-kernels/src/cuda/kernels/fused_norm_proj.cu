@@ -45,7 +45,8 @@ __global__ void fused_rms_norm_proj_f32(
     const float* __restrict__ input,
     const float* __restrict__ gamma,
     const float* __restrict__ weight,
-    const float* __restrict__ bias,
+    unsigned int has_bias,             // 1 if bias is valid, 0 otherwise
+    const float* __restrict__ bias,    // only read when has_bias == 1
     float* __restrict__ output,
     unsigned int rows,
     unsigned int hidden,
@@ -90,6 +91,10 @@ __global__ void fused_rms_norm_proj_f32(
     unsigned int out_tile_start = blockIdx.y * FNP_BLOCK;
 
     // Each thread computes one output element within the tile.
+    // Note: x_hat is recomputed per output element because hidden > 8192
+    // won't fit in shared memory. This is still faster than two separate
+    // kernel launches (norm + matmul) due to eliminated VRAM round-trip.
+    // For hidden <= 8192, the smem variant below avoids this recomputation.
     unsigned int j = out_tile_start + tid;
     if (j >= out_dim) return;
 
@@ -101,7 +106,7 @@ __global__ void fused_rms_norm_proj_f32(
         acc += x_hat * w_row[i];
     }
 
-    if (bias != nullptr) {
+    if (has_bias) {
         acc += bias[j];
     }
 
@@ -123,6 +128,7 @@ __global__ void fused_rms_norm_proj_smem_f32(
     const float* __restrict__ input,
     const float* __restrict__ gamma,
     const float* __restrict__ weight,
+    unsigned int has_bias,
     const float* __restrict__ bias,
     float* __restrict__ output,
     unsigned int rows,
@@ -180,7 +186,7 @@ __global__ void fused_rms_norm_proj_smem_f32(
         for (unsigned int i = 0; i < hidden; i++) {
             acc += x_hat[i] * w_row[i];
         }
-        if (bias != nullptr) {
+        if (has_bias) {
             acc += bias[j];
         }
         out_row[j] = acc;
