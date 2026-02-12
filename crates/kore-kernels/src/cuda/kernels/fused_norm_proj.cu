@@ -122,6 +122,9 @@ __global__ void fused_rms_norm_proj_f32(
 //
 // Each thread loops over output columns, reusing x_hat from shared memory.
 // Requires hidden <= 8192 (32KB shared memory at 4 bytes/float).
+// Minimum GPU: compute capability 3.0 (Kepler) which guarantees 48KB smem/block.
+// On CC 2.x (Fermi, 16KB default smem) this variant will fail for hidden > 4096;
+// the Rust dispatch selects the tiled variant as fallback in that case.
 // ============================================================================
 
 __global__ void fused_rms_norm_proj_smem_f32(
