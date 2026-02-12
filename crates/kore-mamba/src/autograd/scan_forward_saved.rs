@@ -27,6 +27,24 @@ pub struct GpuSavedContext {
     pub bx_all: cudarc::driver::CudaSlice<u8>,
 }
 
+/// ROCm GPU-resident saved context for backward pass.
+/// Mirrors `GpuSavedContext` but uses `HipBuffer` instead of `CudaSlice`.
+#[cfg(feature = "rocm")]
+pub struct RocmSavedContext {
+    pub dev_idx: usize,
+    pub x: kore_kernels::rocm::memory::HipBuffer,
+    pub dt: kore_kernels::rocm::memory::HipBuffer,
+    pub a_real: kore_kernels::rocm::memory::HipBuffer,
+    pub a_imag: kore_kernels::rocm::memory::HipBuffer,
+    pub b: kore_kernels::rocm::memory::HipBuffer,
+    pub c: kore_kernels::rocm::memory::HipBuffer,
+    pub dt_bias: Option<kore_kernels::rocm::memory::HipBuffer>,
+    pub z: Option<kore_kernels::rocm::memory::HipBuffer>,
+    pub d_skip: Option<kore_kernels::rocm::memory::HipBuffer>,
+    pub h_all: kore_kernels::rocm::memory::HipBuffer,
+    pub bx_all: kore_kernels::rocm::memory::HipBuffer,
+}
+
 /// All data saved during the forward pass, needed by the backward.
 pub struct MambaScanSaved {
     // Inputs (cloned)
@@ -64,6 +82,10 @@ pub struct MambaScanSaved {
     // When present, backward uses these directly instead of re-uploading CPU data.
     #[cfg(feature = "cuda")]
     pub gpu_ctx: Option<GpuSavedContext>,
+
+    // ROCm GPU-resident saved context (same purpose, AMD GPUs).
+    #[cfg(feature = "rocm")]
+    pub rocm_ctx: Option<RocmSavedContext>,
 }
 
 /// SiLU activation
@@ -257,6 +279,8 @@ pub fn mamba3_scan_with_grad(
         bx_all,
         #[cfg(feature = "cuda")]
         gpu_ctx: None,
+        #[cfg(feature = "rocm")]
+        rocm_ctx: None,
     };
 
     // Build output tensor with grad node

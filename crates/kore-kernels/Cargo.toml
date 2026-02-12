@@ -16,8 +16,13 @@ parking_lot.workspace = true
 [features]
 default = []
 cuda = ["dep:cudarc", "kore-core/cuda"]
+rocm = ["dep:libloading"]
 
 [dependencies.cudarc]
+workspace = true
+optional = true
+
+[dependencies.libloading]
 workspace = true
 optional = true
 

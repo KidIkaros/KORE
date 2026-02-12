@@ -19,4 +19,7 @@ pub mod cpu_fused_backward;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+#[cfg(feature = "rocm")]
+pub mod rocm;
+
 pub use simd::SimdCapability;

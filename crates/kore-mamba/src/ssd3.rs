@@ -546,8 +546,135 @@ pub fn mamba3_scan_gpu(
     })
 }
 
+/// ROCm GPU-accelerated Mamba-3 scan (mirrors `mamba3_scan_gpu` for AMD GPUs).
+#[cfg(feature = "rocm")]
+#[allow(clippy::too_many_arguments)]
+pub fn mamba3_scan_rocm(
+    x: &[f32],
+    batch: usize,
+    seq_len: usize,
+    nheads: usize,
+    headdim: usize,
+    dt: &[f32],
+    a_real: &[f32],
+    a_imag: &[f32],
+    b: &[f32],
+    ngroups: usize,
+    d_state: usize,
+    c: &[f32],
+    b_bias: Option<&[f32]>,
+    c_bias: Option<&[f32]>,
+    d: Option<&[f32]>,
+    z: Option<&[f32]>,
+    dt_bias: Option<&[f32]>,
+    dt_softplus: bool,
+    alpha: f32,
+    use_rope: bool,
+) -> Option<Mamba3ScanOutput> {
+    use kore_kernels::rocm::context::is_rocm_available;
+    use kore_kernels::rocm::memory::HipBuffer;
+    use kore_kernels::rocm::ops::rocm_mamba3_scan_f32;
+
+    if !is_rocm_available() { return None; }
+
+    // --- Input size validation ---
+    let expected_x = batch * seq_len * nheads * headdim;
+    let expected_dt = batch * seq_len * nheads;
+    let expected_bc = batch * seq_len * ngroups * d_state;
+    if x.len() != expected_x { return None; }
+    if dt.len() != expected_dt { return None; }
+    if a_real.len() != nheads { return None; }
+    if a_imag.len() != nheads { return None; }
+    if b.len() != expected_bc { return None; }
+    if c.len() != expected_bc { return None; }
+    if let Some(s) = b_bias { if s.len() != ngroups * d_state { return None; } }
+    if let Some(s) = c_bias { if s.len() != ngroups * d_state { return None; } }
+    if let Some(s) = d { if s.len() != nheads { return None; } }
+    if let Some(s) = z { if s.len() != expected_x { return None; } }
+    if let Some(s) = dt_bias { if s.len() != nheads { return None; } }
+
+    // --- Pre-add B/C biases on CPU before GPU upload ---
+    let b_biased: Vec<f32>;
+    let b_upload: &[f32] = if let Some(bb) = b_bias {
+        b_biased = b.iter().enumerate().map(|(i, &v)| {
+            v + bb[i % (ngroups * d_state)]
+        }).collect();
+        &b_biased
+    } else {
+        b
+    };
+
+    let c_biased: Vec<f32>;
+    let c_upload: &[f32] = if let Some(cb) = c_bias {
+        c_biased = c.iter().enumerate().map(|(i, &v)| {
+            v + cb[i % (ngroups * d_state)]
+        }).collect();
+        &c_biased
+    } else {
+        c
+    };
+
+    let dev_idx = 0;
+
+    let upload = |data: &[f32]| -> Option<HipBuffer> {
+        let bytes: &[u8] = bytemuck_cast_slice(data);
+        HipBuffer::from_host(dev_idx, bytes).ok()
+    };
+
+    let x_gpu = upload(x)?;
+    let dt_gpu = upload(dt)?;
+    let a_gpu = upload(a_real)?;
+    let a_imag_gpu = upload(a_imag)?;
+    let b_gpu = upload(b_upload)?;
+    let c_gpu = upload(c_upload)?;
+
+    let dt_bias_gpu = dt_bias.and_then(|s| upload(s));
+    let z_gpu = z.and_then(|s| upload(s));
+    let d_gpu = d.and_then(|s| upload(s));
+
+    let num_chunks = (seq_len + 127) / 128;
+    let state_elems = d_state * headdim;
+
+    let fwd = rocm_mamba3_scan_f32(
+        dev_idx,
+        &x_gpu, &dt_gpu, &a_gpu, &a_imag_gpu, &b_gpu, &c_gpu,
+        dt_bias_gpu.as_ref(), z_gpu.as_ref(), d_gpu.as_ref(),
+        batch, seq_len, nheads, headdim, ngroups, d_state,
+        alpha, dt_softplus, use_rope,
+        false,
+    ).ok()?;
+
+    let output: Vec<f32> = bytes_to_f32_vec(&fwd.output.to_host().ok()?);
+    let chunk_h_all: Vec<f32> = bytes_to_f32_vec(&fwd.chunk_last_h.to_host().ok()?);
+    let chunk_bx_all: Vec<f32> = bytes_to_f32_vec(&fwd.chunk_last_bx.to_host().ok()?);
+
+    let total_state = batch * nheads * state_elems;
+    let mut last_state = vec![0.0f32; total_state];
+    let mut prev_bx = vec![0.0f32; total_state];
+    let last_chunk = num_chunks - 1;
+
+    for bi in 0..batch {
+        for h in 0..nheads {
+            let src_base = bi * nheads * num_chunks * state_elems
+                         + h * num_chunks * state_elems
+                         + last_chunk * state_elems;
+            let dst_base = bi * nheads * state_elems + h * state_elems;
+            last_state[dst_base..dst_base + state_elems]
+                .copy_from_slice(&chunk_h_all[src_base..src_base + state_elems]);
+            prev_bx[dst_base..dst_base + state_elems]
+                .copy_from_slice(&chunk_bx_all[src_base..src_base + state_elems]);
+        }
+    }
+
+    Some(Mamba3ScanOutput {
+        output,
+        last_state,
+        prev_bx,
+    })
+}
+
 /// Reinterpret `&[f32]` as `&[u8]` without copying.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 #[inline]
 fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
     unsafe {
@@ -559,7 +686,7 @@ fn bytemuck_cast_slice(data: &[f32]) -> &[u8] {
 }
 
 /// Convert raw bytes back to `Vec<f32>`.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 #[inline]
 fn bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
     assert!(bytes.len() % 4 == 0);

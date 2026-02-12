@@ -28,3 +28,4 @@ optional = true
 [features]
 default = []
 cuda = ["dep:cudarc", "kore-kernels/cuda", "kore-core/cuda"]
+rocm = ["kore-kernels/rocm"]
