@@ -5,7 +5,7 @@ use crate::encoder::{Trit, Quat, encode_trits, decode_trits, pack_quats, unpack_
 /// Pack a slice of trits into bytes using base-243 encoding.
 /// 5 trits per byte, ~95% storage efficiency.
 pub fn pack_ternary(trits: &[Trit]) -> Vec<u8> {
-    let nbytes = (trits.len() + 4) / 5;
+    let nbytes = trits.len().div_ceil(5);
     let mut packed = Vec::with_capacity(nbytes);
 
     for chunk in trits.chunks(5) {
@@ -38,7 +38,7 @@ pub fn unpack_ternary(packed: &[u8], num_trits: usize) -> Vec<Trit> {
 /// Pack a slice of quaternary values into bytes.
 /// 4 values per byte (2 bits each), 4x compression.
 pub fn pack_quaternary(quats: &[Quat]) -> Vec<u8> {
-    let nbytes = (quats.len() + 3) / 4;
+    let nbytes = quats.len().div_ceil(4);
     let mut packed = Vec::with_capacity(nbytes);
 
     for chunk in quats.chunks(4) {

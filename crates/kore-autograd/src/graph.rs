@@ -82,6 +82,7 @@ impl GradNode {
 
 /// The computation graph — a collection of nodes.
 /// Used for managing the full graph during backward.
+#[allow(dead_code)]
 pub struct GradGraph {
     /// All nodes in topological order (populated during backward).
     nodes: Vec<Arc<GradNode>>,
@@ -108,8 +109,8 @@ impl GradGraph {
         while let Some(node) = queue.pop_front() {
             for weak_input in &node.inputs {
                 if let Some(input) = weak_input.upgrade() {
-                    if !all_nodes.contains_key(&input.id) {
-                        all_nodes.insert(input.id, Arc::clone(&input));
+                    if let std::collections::hash_map::Entry::Vacant(e) = all_nodes.entry(input.id) {
+                        e.insert(Arc::clone(&input));
                         in_degree.insert(input.id, 0);
                         queue.push_back(Arc::clone(&input));
                     }

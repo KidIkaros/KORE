@@ -13,6 +13,7 @@ use super::activation::softmax;
 /// `output`: [seq_q, d] result buffer
 /// `scores_buf`: [seq_q, seq_k] scratch buffer for attention scores
 /// `causal`: if true, apply causal mask (future positions = -inf)
+#[allow(clippy::too_many_arguments)]
 pub fn attention_head(
     q: &[f32],
     k: &[f32],
@@ -69,6 +70,7 @@ pub fn attention_head(
 /// `output`: [seq_q, n_heads * head_dim]
 /// `scores_buf`: [n_heads, seq_q, seq_k] scratch
 /// Supports GQA: n_heads can be a multiple of n_kv_heads.
+#[allow(clippy::too_many_arguments)]
 pub fn multi_head_attention(
     q: &[f32],
     k: &[f32],

@@ -39,7 +39,7 @@ pub fn ternary_matmul(
         KoreError::UnsupportedDType(b.dtype())
     })?;
 
-    let k_packed = (k + 4) / 5; // base-243: 5 trits per byte
+    let k_packed = k.div_ceil(5); // base-243: 5 trits per byte
 
     if a_packed.len() < m * k_packed {
         return Err(KoreError::StorageError(format!(
@@ -111,13 +111,13 @@ fn compute_row(trits: &[i8], b_data: &[f32], c_row: &mut [f32], scale: f32, n: u
         if t == 0 { continue; }
         let t_f32 = t as f32;
         let b_row = &b_data[ki * n..ki * n + n];
-        for col in 0..n {
-            c_row[col] += t_f32 * b_row[col];
+        for (c_val, &b_val) in c_row.iter_mut().zip(b_row.iter()) {
+            *c_val += t_f32 * b_val;
         }
     }
     // Apply scale
-    for col in 0..n {
-        c_row[col] *= scale;
+    for c_val in c_row.iter_mut() {
+        *c_val *= scale;
     }
 }
 
@@ -135,7 +135,7 @@ pub fn ternary_ternary_matmul(
     n: usize,
     k: usize,
 ) -> Result<Tensor, KoreError> {
-    let k_packed = (k + 4) / 5;
+    let k_packed = k.div_ceil(5);
 
     if a_packed.len() < m * k_packed || b_packed.len() < n * k_packed {
         return Err(KoreError::StorageError(
@@ -144,7 +144,7 @@ pub fn ternary_ternary_matmul(
     }
 
     // Unpack rows into TernaryWord64 chunks
-    let k_words = (k + 63) / 64;
+    let k_words = k.div_ceil(64);
 
     let unpack_row = |packed_row: &[u8]| -> Vec<TernaryWord64> {
         let mut trits = Vec::with_capacity(k_words * 64);
@@ -157,7 +157,7 @@ pub fn ternary_ternary_matmul(
         trits.resize(k_words * 64, 0);
         trits
             .chunks_exact(64)
-            .map(|chunk| TernaryWord64::from_trits(chunk))
+            .map(TernaryWord64::from_trits)
             .collect()
     };
 
@@ -194,7 +194,7 @@ pub fn ternary_ternary_matmul(
 ///
 /// Returns (packed_bytes, scales).
 pub fn pack_weights_ternary(weights: &[f32], m: usize, k: usize, threshold: f32) -> (Vec<u8>, Vec<f32>) {
-    let k_packed = (k + 4) / 5;
+    let k_packed = k.div_ceil(5);
     let mut packed = vec![0u8; m * k_packed];
     let mut scales = vec![0.0f32; m];
 

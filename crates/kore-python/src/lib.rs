@@ -1,3 +1,6 @@
+// PyO3 error conversions use .into() which clippy flags as useless when
+// the source is already PyErr — this is an intentional PyO3 idiom.
+#![allow(clippy::useless_conversion)]
 //! # kore-python
 //!
 //! PyO3 bindings for Kore → `import kore` in Python.
@@ -81,8 +84,8 @@ impl PyTensor {
             .ok_or_else(|| PyValueError::new_err("Cannot convert non-f32 tensor to numpy"))?;
         let shape: Vec<usize> = data.shape().dims().to_vec();
         let flat = PyArray1::from_vec_bound(py, slice.to_vec());
-        Ok(flat.reshape(shape)
-            .map_err(|e| PyValueError::new_err(format!("numpy reshape failed: {}", e)))?)
+        flat.reshape(shape)
+            .map_err(|e| PyValueError::new_err(format!("numpy reshape failed: {}", e)))
     }
 
     /// Element-wise addition.

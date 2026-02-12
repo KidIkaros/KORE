@@ -18,6 +18,8 @@ pub mod loss;
 pub mod geometric;
 pub mod squeezenet;
 pub mod serialization;
+pub mod sampler;
+pub mod prelude;
 
 pub use module::Module;
 pub use linear::Linear;

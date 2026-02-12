@@ -17,6 +17,7 @@ pub mod tensor;
 pub mod ops;
 pub mod error;
 pub mod autograd;
+pub mod prelude;
 
 pub use dtype::DType;
 pub use device::Device;

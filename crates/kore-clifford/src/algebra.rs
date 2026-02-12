@@ -84,9 +84,9 @@ impl CliffordAlgebra {
         // Build Cayley table
         let mut cayley = vec![vec![CayleyEntry { blade: 0, sign: Sign::Zero }; dim]; dim];
 
-        for i in 0..dim {
-            for j in 0..dim {
-                cayley[i][j] = Self::multiply_blades(i, j, p, q, n);
+        for (i, c_row) in cayley.iter_mut().enumerate() {
+            for (j, entry) in c_row.iter_mut().enumerate() {
+                *entry = Self::multiply_blades(i, j, p, q, n);
             }
         }
 

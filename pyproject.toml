@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "kore"
-version = "0.1.0"
-description = "A pure Rust ML framework with Python bindings — tensors, autograd, quantization, and more"
+version = "0.2.0"
+description = "A pure Rust ML engine with Python bindings — tensors, autograd, quantization, and more"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Ikaros Digital LLC" }]

@@ -9,7 +9,7 @@ pub fn relu(data: &mut [f32]) {
 
 /// GELU (tanh approximation): x = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 pub fn gelu(data: &mut [f32]) {
-    const SQRT_2_OVER_PI: f32 = 0.7978845608;
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
     for v in data.iter_mut() {
         let x = *v;
         let inner = SQRT_2_OVER_PI * (x + 0.044715 * x * x * x);

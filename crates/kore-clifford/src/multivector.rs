@@ -89,7 +89,7 @@ impl Multivector {
         let mut result = self.clone();
         for (i, coeff) in result.coeffs.iter_mut().enumerate() {
             let k = alg.grade(i);
-            let sign = if (k * (k.wrapping_sub(1)) / 2) % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if (k * (k.wrapping_sub(1)) / 2).is_multiple_of(2) { 1.0 } else { -1.0 };
             *coeff *= sign;
         }
         result

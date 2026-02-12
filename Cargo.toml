@@ -11,16 +11,13 @@ members = [
     "crates/kore-serve",
     "crates/kore-python",
     "crates/kore-cli",
-    "crates/kore-transformer",
     "crates/kore-edge",
     "crates/kore-data",
-    "crates/kore-mamba",
-    "crates/kore-vljepa",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Ikaros Digital LLC"]
 license = "Apache-2.0"
@@ -87,11 +84,8 @@ kore-btes = { path = "crates/kore-btes" }
 kore-kernels = { path = "crates/kore-kernels" }
 kore-clifford = { path = "crates/kore-clifford" }
 kore-attention = { path = "crates/kore-attention" }
-kore-transformer = { path = "crates/kore-transformer" }
 kore-serve = { path = "crates/kore-serve" }
 kore-edge = { path = "crates/kore-edge" }
-kore-mamba = { path = "crates/kore-mamba" }
-kore-vljepa = { path = "crates/kore-vljepa" }
 
 [profile.release]
 opt-level = 3
