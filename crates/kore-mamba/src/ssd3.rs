@@ -367,8 +367,14 @@ pub fn mamba3_ssm_step(
 /// Returns `None` if CUDA is not available or initialization fails,
 /// allowing callers to fall back to the CPU path.
 ///
-/// Note: RoPE is not yet implemented in the CUDA kernel. If `use_rope`
-/// is true, this function returns `None` to force CPU fallback.
+/// # Fallback conditions
+/// - CUDA device not available
+/// - `use_rope` is true (RoPE not yet in CUDA kernel)
+/// - Any `a_imag` value is non-zero (CUDA kernel does not implement the
+///   imaginary component of A; even with `use_rope=false`, non-zero `a_imag`
+///   would produce divergent results vs the CPU path)
+/// - Input size validation fails
+/// - Any GPU operation fails
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn mamba3_scan_gpu(
@@ -379,6 +385,7 @@ pub fn mamba3_scan_gpu(
     headdim: usize,
     dt: &[f32],
     a_real: &[f32],
+    a_imag: &[f32],
     b: &[f32],
     ngroups: usize,
     d_state: usize,
@@ -397,7 +404,25 @@ pub fn mamba3_scan_gpu(
     // RoPE not yet in CUDA kernel — fall back to CPU
     if use_rope { return None; }
 
+    // CUDA kernel ignores a_imag entirely. If any value is non-zero, the CPU
+    // path would use it for RoPE angle computation (rope_theta = dt * a_imag[h]),
+    // producing different results. Fall back to CPU for correctness.
+    if a_imag.iter().any(|&v| v != 0.0) { return None; }
+
     if !is_cuda_available() { return None; }
+
+    // --- Input size validation ---
+    let expected_x = batch * seq_len * nheads * headdim;
+    let expected_dt = batch * seq_len * nheads;
+    let expected_bc = batch * seq_len * ngroups * d_state;
+    if x.len() != expected_x { return None; }
+    if dt.len() != expected_dt { return None; }
+    if a_real.len() != nheads { return None; }
+    if b.len() != expected_bc { return None; }
+    if c.len() != expected_bc { return None; }
+    if let Some(s) = d { if s.len() != nheads { return None; } }
+    if let Some(s) = z { if s.len() != expected_x { return None; } }
+    if let Some(s) = dt_bias { if s.len() != nheads { return None; } }
 
     let dev_idx = 0;
     let dev = get_device(dev_idx).ok()?;
@@ -420,7 +445,10 @@ pub fn mamba3_scan_gpu(
     let z_gpu = z.and_then(|s| upload(s));
     let d_gpu = d.and_then(|s| upload(s));
 
-    let (output_gpu, _chunk_h, _chunk_bx) = cuda_mamba3_scan_f32(
+    let num_chunks = (seq_len + 127) / 128; // SCAN_CHUNK = 128
+    let state_elems = d_state * headdim;
+
+    let (output_gpu, chunk_h_gpu, chunk_bx_gpu) = cuda_mamba3_scan_f32(
         &dev,
         dev_idx,
         x_gpu.as_cuda_slice(),
@@ -445,14 +473,36 @@ pub fn mamba3_scan_gpu(
     let out_bytes = dev.dtoh_sync_copy(&output_gpu).ok()?;
     let output: Vec<f32> = bytes_to_f32_vec(&out_bytes);
 
-    // GPU path doesn't return per-element state (it's in chunk_last_h/bx format).
-    // For training, the CPU backward pass recomputes state. For inference, state
-    // is managed by mamba3_ssm_step. Return empty vecs as placeholders.
-    let state_size = batch * nheads * d_state * headdim;
+    // Extract real last_state and prev_bx from chunk buffers.
+    // Layout: chunk_last_h[B, H, num_chunks, N*D] — the last chunk holds the
+    // final state for each (batch, head) pair.
+    let chunk_h_bytes = dev.dtoh_sync_copy(&chunk_h_gpu).ok()?;
+    let chunk_bx_bytes = dev.dtoh_sync_copy(&chunk_bx_gpu).ok()?;
+    let chunk_h_all: Vec<f32> = bytes_to_f32_vec(&chunk_h_bytes);
+    let chunk_bx_all: Vec<f32> = bytes_to_f32_vec(&chunk_bx_bytes);
+
+    let total_state = batch * nheads * state_elems;
+    let mut last_state = vec![0.0f32; total_state];
+    let mut prev_bx = vec![0.0f32; total_state];
+    let last_chunk = num_chunks - 1;
+
+    for bi in 0..batch {
+        for h in 0..nheads {
+            let src_base = bi * nheads * num_chunks * state_elems
+                         + h * num_chunks * state_elems
+                         + last_chunk * state_elems;
+            let dst_base = bi * nheads * state_elems + h * state_elems;
+            last_state[dst_base..dst_base + state_elems]
+                .copy_from_slice(&chunk_h_all[src_base..src_base + state_elems]);
+            prev_bx[dst_base..dst_base + state_elems]
+                .copy_from_slice(&chunk_bx_all[src_base..src_base + state_elems]);
+        }
+    }
+
     Some(Mamba3ScanOutput {
         output,
-        last_state: vec![0.0f32; state_size],
-        prev_bx: vec![0.0f32; state_size],
+        last_state,
+        prev_bx,
     })
 }
 
