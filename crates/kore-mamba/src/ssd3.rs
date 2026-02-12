@@ -375,6 +375,20 @@ pub fn mamba3_ssm_step(
 ///   would produce divergent results vs the CPU path)
 /// - Input size validation fails
 /// - Any GPU operation fails
+///
+/// # B/C bias handling
+/// The CUDA kernel does not natively support `b_bias`/`c_bias`. When provided,
+/// biases are pre-added to B and C tensors on the CPU before GPU upload. This
+/// is a lightweight O(batch * seq_len * ngroups * d_state) element-wise add.
+///
+/// # Known limitations
+/// - **H2D/D2H per call**: Data is uploaded to GPU and downloaded each call.
+///   A future persistent-tensor API would avoid this overhead for sequences of
+///   calls where data is already on-device.
+/// - **No GPU backward pass**: `MambaScanBackward` remains CPU-based. A CUDA
+///   backward kernel is needed to avoid a GPU→CPU→GPU round-trip during training.
+/// - **No RoPE in CUDA kernel**: Falls back to CPU when `use_rope=true` or
+///   `a_imag` contains non-zero values.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn mamba3_scan_gpu(
@@ -390,6 +404,8 @@ pub fn mamba3_scan_gpu(
     ngroups: usize,
     d_state: usize,
     c: &[f32],
+    b_bias: Option<&[f32]>,
+    c_bias: Option<&[f32]>,
     d: Option<&[f32]>,
     z: Option<&[f32]>,
     dt_bias: Option<&[f32]>,
@@ -420,9 +436,38 @@ pub fn mamba3_scan_gpu(
     if a_real.len() != nheads { return None; }
     if b.len() != expected_bc { return None; }
     if c.len() != expected_bc { return None; }
+    if let Some(s) = b_bias { if s.len() != ngroups * d_state { return None; } }
+    if let Some(s) = c_bias { if s.len() != ngroups * d_state { return None; } }
     if let Some(s) = d { if s.len() != nheads { return None; } }
     if let Some(s) = z { if s.len() != expected_x { return None; } }
     if let Some(s) = dt_bias { if s.len() != nheads { return None; } }
+
+    // --- Pre-add B/C biases on CPU before GPU upload ---
+    // The CUDA kernel does not support b_bias/c_bias natively. We fuse them
+    // into the B and C tensors here. The bias is (ngroups, d_state) and
+    // broadcasts across (batch, seq_len), so we add bias[g*d_state + n] to
+    // every b[batch, seq, g, n] element.
+    let b_biased: Vec<f32>;
+    let b_upload: &[f32] = if let Some(bb) = b_bias {
+        b_biased = b.iter().enumerate().map(|(i, &v)| {
+            // b layout: [batch, seq_len, ngroups, d_state]
+            // bias index: i % (ngroups * d_state)
+            v + bb[i % (ngroups * d_state)]
+        }).collect();
+        &b_biased
+    } else {
+        b
+    };
+
+    let c_biased: Vec<f32>;
+    let c_upload: &[f32] = if let Some(cb) = c_bias {
+        c_biased = c.iter().enumerate().map(|(i, &v)| {
+            v + cb[i % (ngroups * d_state)]
+        }).collect();
+        &c_biased
+    } else {
+        c
+    };
 
     let dev_idx = 0;
     let dev = get_device(dev_idx).ok()?;
@@ -437,8 +482,8 @@ pub fn mamba3_scan_gpu(
     let x_gpu = upload(x)?;
     let dt_gpu = upload(dt)?;
     let a_gpu = upload(a_real)?;
-    let b_gpu = upload(b)?;
-    let c_gpu = upload(c)?;
+    let b_gpu = upload(b_upload)?;
+    let c_gpu = upload(c_upload)?;
 
     // Upload optional inputs
     let dt_bias_gpu = dt_bias.and_then(|s| upload(s));
