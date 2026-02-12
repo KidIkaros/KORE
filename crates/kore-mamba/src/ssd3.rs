@@ -369,10 +369,6 @@ pub fn mamba3_ssm_step(
 ///
 /// # Fallback conditions
 /// - CUDA device not available
-/// - `use_rope` is true (RoPE not yet in CUDA kernel)
-/// - Any `a_imag` value is non-zero (CUDA kernel does not implement the
-///   imaginary component of A; even with `use_rope=false`, non-zero `a_imag`
-///   would produce divergent results vs the CPU path)
 /// - Input size validation fails
 /// - Any GPU operation fails
 ///
@@ -381,14 +377,16 @@ pub fn mamba3_ssm_step(
 /// biases are pre-added to B and C tensors on the CPU before GPU upload. This
 /// is a lightweight O(batch * seq_len * ngroups * d_state) element-wise add.
 ///
+/// # RoPE support
+/// Data-dependent RoPE is fully supported in the CUDA kernel. When `use_rope`
+/// is true, B and C vectors are rotated by `theta = dt * a_imag[head]` on-device.
+///
 /// # Known limitations
 /// - **H2D/D2H per call**: Data is uploaded to GPU and downloaded each call.
 ///   A future persistent-tensor API would avoid this overhead for sequences of
 ///   calls where data is already on-device.
 /// - **No GPU backward pass**: `MambaScanBackward` remains CPU-based. A CUDA
 ///   backward kernel is needed to avoid a GPU→CPU→GPU round-trip during training.
-/// - **No RoPE in CUDA kernel**: Falls back to CPU when `use_rope=true` or
-///   `a_imag` contains non-zero values.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 pub fn mamba3_scan_gpu(
@@ -417,14 +415,6 @@ pub fn mamba3_scan_gpu(
     use kore_kernels::cuda::memory::CudaBuffer;
     use kore_kernels::cuda::ops::cuda_mamba3_scan_f32;
 
-    // RoPE not yet in CUDA kernel — fall back to CPU
-    if use_rope { return None; }
-
-    // CUDA kernel ignores a_imag entirely. If any value is non-zero, the CPU
-    // path would use it for RoPE angle computation (rope_theta = dt * a_imag[h]),
-    // producing different results. Fall back to CPU for correctness.
-    if a_imag.iter().any(|&v| v != 0.0) { return None; }
-
     if !is_cuda_available() { return None; }
 
     // --- Input size validation ---
@@ -434,6 +424,7 @@ pub fn mamba3_scan_gpu(
     if x.len() != expected_x { return None; }
     if dt.len() != expected_dt { return None; }
     if a_real.len() != nheads { return None; }
+    if a_imag.len() != nheads { return None; }
     if b.len() != expected_bc { return None; }
     if c.len() != expected_bc { return None; }
     if let Some(s) = b_bias { if s.len() != ngroups * d_state { return None; } }
@@ -482,6 +473,7 @@ pub fn mamba3_scan_gpu(
     let x_gpu = upload(x)?;
     let dt_gpu = upload(dt)?;
     let a_gpu = upload(a_real)?;
+    let a_imag_gpu = upload(a_imag)?;
     let b_gpu = upload(b_upload)?;
     let c_gpu = upload(c_upload)?;
 
@@ -499,6 +491,7 @@ pub fn mamba3_scan_gpu(
         x_gpu.as_cuda_slice(),
         dt_gpu.as_cuda_slice(),
         a_gpu.as_cuda_slice(),
+        a_imag_gpu.as_cuda_slice(),
         b_gpu.as_cuda_slice(),
         c_gpu.as_cuda_slice(),
         dt_bias_gpu.as_ref().map(|b| b.as_cuda_slice()),
@@ -512,6 +505,7 @@ pub fn mamba3_scan_gpu(
         d_state,
         alpha,
         dt_softplus,
+        use_rope,
     ).ok()?;
 
     // Download output from GPU
