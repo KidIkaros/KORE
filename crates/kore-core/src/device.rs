@@ -1,9 +1,10 @@
 use std::fmt;
 
 /// Compute device for tensor storage and operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Device {
     /// CPU with optional SIMD acceleration (AVX2, AVX-512, NEON)
+    #[default]
     Cpu,
     /// CUDA GPU with device index
     Cuda(usize),
@@ -26,12 +27,6 @@ impl Device {
             Device::Cuda(idx) => Some(*idx),
             _ => None,
         }
-    }
-}
-
-impl Default for Device {
-    fn default() -> Self {
-        Device::Cpu
     }
 }
 

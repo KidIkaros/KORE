@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[cfg(feature = "loader")]
-use crate::format::{EdgeDType, FormatError, KorefBuilder, KorefModel};
+use crate::format::{FormatError, KorefBuilder, KorefModel};
 
 /// Subset of HuggingFace `config.json` fields.
 #[cfg(all(feature = "loader", feature = "serde"))]
@@ -74,7 +74,7 @@ pub fn load_safetensors_dir(model_dir: &Path) -> Result<KorefModel, FormatError>
         .map_err(|e| FormatError::IoError(format!("Cannot read dir: {}", e)))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "safetensors"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "safetensors"))
         .collect();
     st_files.sort();
 

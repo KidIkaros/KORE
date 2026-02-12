@@ -478,8 +478,8 @@ impl Tensor {
         if self.dtype() == DType::F32 {
             let numel = self.numel();
             let mut data = vec![0.0f32; numel];
-            for i in 0..numel {
-                data[i] = self.get_f32(i)
+            for (i, slot) in data.iter_mut().enumerate() {
+                *slot = self.get_f32(i)
                     .expect("contiguous: index out of bounds during copy");
             }
             let mut t = Tensor::from_f32(&data, self.shape.dims());

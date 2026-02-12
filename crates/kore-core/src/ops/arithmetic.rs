@@ -451,10 +451,10 @@ fn binary_op(a: &Tensor, b: &Tensor, op: impl Fn(f32, f32) -> f32 + Sync) -> Res
         let a_data = a_cont.as_f32_slice().unwrap();
         let b_data = b_cont.as_f32_slice().unwrap();
 
-        for i in 0..numel {
+        for (i, slot) in result.iter_mut().enumerate() {
             let a_idx = broadcast_index(i, &out_shape, a.shape());
             let b_idx = broadcast_index(i, &out_shape, b.shape());
-            result[i] = op(a_data[a_idx], b_data[b_idx]);
+            *slot = op(a_data[a_idx], b_data[b_idx]);
         }
     }
 

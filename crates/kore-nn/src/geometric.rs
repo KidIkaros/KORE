@@ -55,7 +55,7 @@ impl EquivariantLinear {
                 // Xavier-like init scaled by algebra dim
                 let scale = 1.0 / (num_weights as f32 * d as f32).sqrt();
                 // Simple deterministic init for reproducibility
-                let seed = (i as f32 * 0.618033988) % 1.0;
+                let seed = (i as f32 * 0.618_034) % 1.0;
                 (seed - 0.5) * 2.0 * scale
             })
             .collect();
@@ -79,6 +79,7 @@ impl EquivariantLinear {
     ///
     /// `input`: `MultivectorTensor` with shape `[batch, algebra_dim]`.
     /// Returns: `MultivectorTensor` with shape `[batch, algebra_dim]`.
+    #[allow(clippy::needless_range_loop)]
     pub fn forward(&self, input: &MultivectorTensor) -> Result<MultivectorTensor, KoreError> {
         let d = self.algebra.dim;
         let batch = input.batch_size();
@@ -114,7 +115,7 @@ impl EquivariantLinear {
                 let mut w_rev = vec![0.0f32; d];
                 for i in 0..d {
                     let grade = self.algebra.grade(i);
-                    let sign = if (grade * grade.wrapping_sub(1) / 2) % 2 == 0 { 1.0 } else { -1.0 };
+                    let sign = if (grade * grade.wrapping_sub(1) / 2).is_multiple_of(2) { 1.0 } else { -1.0 };
                     w_rev[i] = w[i] * sign;
                 }
 

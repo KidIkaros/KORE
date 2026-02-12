@@ -5,7 +5,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use kore_transformer::sampler::{Rng, SamplerConfig};
+use kore_nn::sampler::{Rng, SamplerConfig};
 
 use crate::state::AppState;
 

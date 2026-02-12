@@ -26,5 +26,3 @@ optional = true
 workspace = true
 optional = true
 
-[dev-dependencies]
-kore-mamba.workspace = true

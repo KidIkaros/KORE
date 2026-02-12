@@ -56,7 +56,7 @@ impl BitLinear {
 
         let (packed_weights, scales) = pack_weights_ternary(w_slice, out_features, in_features, threshold);
 
-        let bias_tensor = bias.map(|b| b.clone());
+        let bias_tensor = bias.cloned();
 
         Self {
             packed_weights,
@@ -136,7 +136,7 @@ impl BitLinear {
 
     /// Dequantize packed weights back to f32 (for inspection/debugging).
     pub fn dequantize_weights(&self) -> Tensor {
-        let k_packed = (self.in_features + 4) / 5;
+        let k_packed = self.in_features.div_ceil(5);
         let mut result = vec![0.0f32; self.out_features * self.in_features];
 
         for row in 0..self.out_features {

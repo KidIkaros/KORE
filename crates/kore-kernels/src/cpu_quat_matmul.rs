@@ -32,7 +32,7 @@ pub fn quat_matmul(
         KoreError::UnsupportedDType(b.dtype())
     })?;
 
-    let k_packed = (k + 3) / 4;
+    let k_packed = k.div_ceil(4);
 
     if a_packed.len() < m * k_packed {
         return Err(KoreError::StorageError(format!(
@@ -70,6 +70,7 @@ pub fn quat_matmul(
 /// Uses A-stationary accumulation: pre-unpack the entire row of quaternary
 /// values, then iterate over K and scatter weighted B values into N outputs.
 /// This is more cache-friendly for the output vector when N is small.
+#[allow(clippy::too_many_arguments)]
 fn quat_matmul_scalar(
     a_packed: &[u8],
     a_scales: &[f32],
@@ -109,6 +110,7 @@ fn quat_matmul_scalar(
 /// AVX2-accelerated quaternary matmul.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn quat_matmul_avx2(
     a_packed: &[u8],
     a_scales: &[f32],
@@ -132,8 +134,8 @@ unsafe fn quat_matmul_avx2(
             let cols_left = (n - col_block).min(8);
             let mut acc = _mm256_setzero_ps();
 
-            for kp in 0..k_packed {
-                let packed = a_row[kp] as i32;
+            for (kp, &packed_byte) in a_row.iter().enumerate() {
+                let packed = packed_byte as i32;
                 let k_base = kp * 4;
 
                 for i in 0..4 {
@@ -170,7 +172,7 @@ unsafe fn quat_matmul_avx2(
 ///
 /// Returns (packed_bytes, scales).
 pub fn pack_weights_quaternary(weights: &[f32], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
-    let k_packed = (k + 3) / 4;
+    let k_packed = k.div_ceil(4);
     let mut packed = vec![0u8; m * k_packed];
     let mut scales = vec![0.0f32; m];
 

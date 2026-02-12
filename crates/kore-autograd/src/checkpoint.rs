@@ -45,6 +45,7 @@ where
 /// 1. Re-runs the forward pass with grad tracking enabled
 /// 2. Runs backward on the recomputed outputs
 /// 3. Returns the gradients w.r.t. the original inputs
+#[allow(dead_code)]
 struct CheckpointBackward {
     /// Saved inputs (detached, no grad tracking).
     saved_inputs: Vec<Tensor>,
@@ -57,7 +58,7 @@ struct CheckpointBackward {
 impl GradFn for CheckpointBackward {
     fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // Re-enable grad tracking for the recomputation
-        let mut inputs_with_grad: Vec<Tensor> = self.saved_inputs.iter().map(|t| {
+        let inputs_with_grad: Vec<Tensor> = self.saved_inputs.iter().map(|t| {
             let mut t = t.clone();
             t.set_requires_grad(true);
             t
@@ -70,7 +71,7 @@ impl GradFn for CheckpointBackward {
         // For simplicity, we handle single-output case (most common)
         if let Some(output) = outputs.first() {
             if let Some(node) = output.grad_node() {
-                kore_core::autograd::backward(&node, grad_output.clone());
+                kore_core::autograd::backward(node, grad_output.clone());
             }
         }
 

@@ -299,8 +299,8 @@ impl TernaryWord64 {
     pub fn from_trits(trits: &[i8]) -> Self {
         let mut result = Self::ZERO;
         let count = trits.len().min(64);
-        for i in 0..count {
-            result.set_trit(i, trits[i]);
+        for (i, &trit) in trits.iter().enumerate().take(count) {
+            result.set_trit(i, trit);
         }
         result
     }
@@ -308,8 +308,8 @@ impl TernaryWord64 {
     /// Convert to an array of 64 trits.
     pub fn to_trits(self) -> [i8; 64] {
         let mut trits = [0i8; 64];
-        for i in 0..64 {
-            trits[i] = self.get_trit(i);
+        for (i, trit) in trits.iter_mut().enumerate() {
+            *trit = self.get_trit(i);
         }
         trits
     }
