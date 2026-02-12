@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 kore-core.workspace = true
+kore-autograd.workspace = true
 kore-nn.workspace = true
 kore-transformer.workspace = true
 kore-attention.workspace = true

@@ -1,6 +1,9 @@
 //! Loss functions for training: cross-entropy, MSE, L1, NLL.
 
+use std::sync::Arc;
+
 use kore_core::{KoreError, Tensor, DType};
+use kore_core::autograd::{self, GradFn, GradNode};
 
 /// Cross-entropy loss: -sum(target * log_softmax(logits)) / batch_size.
 ///
@@ -51,7 +54,22 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Result<Tensor, K
         total_loss -= lp_data[b * num_classes + class_idx];
     }
 
-    Ok(Tensor::scalar(total_loss / batch as f32))
+    let loss = Tensor::scalar(total_loss / batch as f32);
+
+    // Wire fused backward into autograd graph
+    let tracks = autograd::is_grad_enabled() && logits.tracks_grad();
+    if tracks {
+        let mut inputs = Vec::new();
+        if let Some(n) = logits.grad_node() { inputs.push(Arc::clone(n)); }
+        let grad_fn = Box::new(FusedCrossEntropyBackward {
+            logits: logits.clone(),
+            targets: targets.clone(),
+        });
+        let node = GradNode::with_grad_fn(grad_fn, inputs);
+        Ok(loss.with_grad_node(node))
+    } else {
+        Ok(loss)
+    }
 }
 
 /// Cross-entropy with label smoothing.
@@ -136,6 +154,64 @@ pub fn nll_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor, KoreErro
     }
 
     Ok(Tensor::scalar(total / batch as f32))
+}
+
+// ============================================================================
+// Fused backward GradFn wrappers
+// ============================================================================
+
+/// Fused cross-entropy backward: computes d(logits) = (softmax(logits) - one_hot(targets)) / batch.
+struct FusedCrossEntropyBackward {
+    logits: Tensor,
+    targets: Tensor,
+}
+
+impl GradFn for FusedCrossEntropyBackward {
+    fn apply(&self, _grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        // grad_output is a scalar (the loss); the fused kernel already divides by batch.
+        // Scale by grad_output if it's not 1.0.
+        match kore_kernels::cpu_fused_backward::fused_cross_entropy_backward(
+            &self.logits, &self.targets,
+        ) {
+            Ok(d_logits) => {
+                let go_val = _grad_output.get_f32(0).unwrap_or(1.0);
+                if (go_val - 1.0).abs() > 1e-7 {
+                    let scaled = d_logits.mul_scalar(go_val)
+                        .expect("FusedCrossEntropyBackward scale failed");
+                    vec![Some(scaled)]
+                } else {
+                    vec![Some(d_logits)]
+                }
+            }
+            Err(e) => {
+                eprintln!("FusedCrossEntropyBackward failed: {e}");
+                vec![None]
+            }
+        }
+    }
+
+    fn name(&self) -> &str { "FusedCrossEntropyBackward" }
+}
+
+/// Fused softmax backward: dx = y * (dy - sum(y * dy)).
+pub struct FusedSoftmaxBackward {
+    pub output: Tensor,
+}
+
+impl GradFn for FusedSoftmaxBackward {
+    fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
+        match kore_kernels::cpu_fused_backward::fused_softmax_backward(
+            grad_output, &self.output,
+        ) {
+            Ok(dx) => vec![Some(dx)],
+            Err(e) => {
+                eprintln!("FusedSoftmaxBackward failed: {e}");
+                vec![None]
+            }
+        }
+    }
+
+    fn name(&self) -> &str { "FusedSoftmaxBackward" }
 }
 
 #[cfg(test)]
