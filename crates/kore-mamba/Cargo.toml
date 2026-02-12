@@ -10,6 +10,7 @@ license.workspace = true
 kore-core.workspace = true
 kore-autograd.workspace = true
 kore-nn.workspace = true
+kore-kernels.workspace = true
 kore-transformer.workspace = true
 kore-attention.workspace = true
 safetensors.workspace = true
@@ -19,3 +20,11 @@ rand.workspace = true
 half.workspace = true
 num-complex.workspace = true
 rustfft.workspace = true
+
+[dependencies.cudarc]
+workspace = true
+optional = true
+
+[features]
+default = []
+cuda = ["dep:cudarc", "kore-kernels/cuda", "kore-core/cuda"]

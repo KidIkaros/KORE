@@ -333,7 +333,34 @@ impl Mamba3 {
             None
         };
 
-        // 9) Run Mamba-3 SSD scan
+        // 9) Run Mamba-3 SSD scan — try GPU first, fall back to CPU
+        #[cfg(feature = "cuda")]
+        let scan_result = ssd3::mamba3_scan_gpu(
+            &x_scan, batch, seq_len, self.nheads, self.headdim,
+            &dt_scan, &a_real,
+            &b_scan, self.ngroups, self.d_state, &c_scan,
+            Some(&self.d_skip),
+            z_for_scan.as_deref(),
+            Some(&self.dt_bias),
+            true, // dt_softplus
+            self.trapezoidal_alpha,
+            self.use_rope,
+        ).unwrap_or_else(|| {
+            ssd3::mamba3_scan_combined(
+                &x_scan, batch, seq_len, self.nheads, self.headdim,
+                &dt_scan, &a_real, &self.a_imag,
+                &b_scan, self.ngroups, self.d_state, &c_scan,
+                Some(&self.b_bias), Some(&self.c_bias),
+                Some(&self.d_skip),
+                z_for_scan.as_deref(),
+                Some(&self.dt_bias),
+                true,
+                self.trapezoidal_alpha,
+                self.use_rope,
+            )
+        });
+
+        #[cfg(not(feature = "cuda"))]
         let scan_result = ssd3::mamba3_scan_combined(
             &x_scan, batch, seq_len, self.nheads, self.headdim,
             &dt_scan, &a_real, &self.a_imag,
