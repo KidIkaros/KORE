@@ -559,6 +559,34 @@ impl PyDropout {
     }
 }
 
+#[pyclass(name = "RmsNorm")]
+struct PyRmsNorm {
+    inner: kore_nn::RMSNorm,
+}
+
+#[pymethods]
+impl PyRmsNorm {
+    #[new]
+    #[pyo3(signature = (dim, eps=1e-6))]
+    fn new(dim: usize, eps: f32) -> Self {
+        Self { inner: kore_nn::RMSNorm::new(dim, eps) }
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("RmsNorm(dim={}, eps={})", self.inner.dim(), self.inner.eps())
+    }
+}
+
 #[pyclass(name = "Conv2d")]
 struct PyConv2d {
     inner: kore_nn::Conv2d,
@@ -894,12 +922,16 @@ fn load_state_dict(path: String) -> PyResult<std::collections::HashMap<String, P
 enum LayerDesc {
     Linear { in_f: usize, out_f: usize, has_bias: bool },
     LayerNorm { shape: usize, eps: f32 },
+    RmsNorm { dim: usize, eps: f32 },
     Dropout { p: f32 },
     Conv2d { in_ch: usize, out_ch: usize, kernel: usize, stride: usize, pad: usize, has_bias: bool },
     MaxPool2d { kernel: usize, stride: usize, pad: usize },
     AvgPool2d { kernel: usize, stride: usize, pad: usize },
     AdaptiveAvgPool2d { h: usize, w: usize },
     Embedding { num: usize, dim: usize },
+    LoraLinear { in_f: usize, out_f: usize, rank: usize, alpha: f32, has_bias: bool },
+    BitLinear { in_f: usize, out_f: usize, threshold: f32 },
+    QuatLinear { in_f: usize, out_f: usize },
 }
 
 impl LayerDesc {
@@ -910,6 +942,8 @@ impl LayerDesc {
                 Box::new(kore_nn::Linear::new(*in_f, *out_f, *has_bias)),
             LayerDesc::LayerNorm { shape, eps } =>
                 Box::new(kore_nn::LayerNorm::new(*shape, *eps)),
+            LayerDesc::RmsNorm { dim, eps } =>
+                Box::new(kore_nn::RMSNorm::new(*dim, *eps)),
             LayerDesc::Dropout { p } =>
                 Box::new(kore_nn::Dropout::new(*p)),
             LayerDesc::Conv2d { in_ch, out_ch, kernel, stride, pad, has_bias } =>
@@ -922,6 +956,14 @@ impl LayerDesc {
                 Box::new(kore_nn::AdaptiveAvgPool2d::new(*h, *w)),
             LayerDesc::Embedding { num, dim } =>
                 Box::new(kore_nn::Embedding::new(*num, *dim)),
+            LayerDesc::LoraLinear { in_f, out_f, rank, alpha, has_bias } =>
+                Box::new(kore_nn::LoraLinear::new(*in_f, *out_f, *rank, *alpha, *has_bias)),
+            LayerDesc::BitLinear { in_f, out_f, threshold } => {
+                let w = kore_core::Tensor::randn(&[*out_f, *in_f]);
+                Box::new(kore_nn::BitLinear::new(&w, None, *threshold))
+            }
+            LayerDesc::QuatLinear { in_f, out_f } =>
+                Box::new(kore_nn::QuatLinear::random(*in_f, *out_f, false)),
         }
     }
 }
@@ -957,7 +999,15 @@ impl PySequential {
                     let desc = LayerDesc::LayerNorm {
                         shape: l.inner.normalized_shape(), eps: l.inner.eps(),
                     };
-                    seq.push(Box::new(kore_nn::LayerNorm::new(l.inner.normalized_shape(), l.inner.eps())));
+                    seq.push(Box::new(kore_nn::LayerNorm::from_weight(
+                        l.inner.gamma().clone(), l.inner.beta().clone(), l.inner.eps(),
+                    )));
+                    descs.push(desc);
+                } else if let Ok(l) = item.extract::<PyRef<'_, PyRmsNorm>>() {
+                    let desc = LayerDesc::RmsNorm { dim: l.inner.dim(), eps: l.inner.eps() };
+                    seq.push(Box::new(kore_nn::RMSNorm::from_weight(
+                        l.inner.gamma().clone(), l.inner.eps(),
+                    )));
                     descs.push(desc);
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyDropout>>() {
                     let desc = LayerDesc::Dropout { p: l.inner.p() };
@@ -969,10 +1019,9 @@ impl PySequential {
                         kernel: l.inner.kernel_size(), stride: l.inner.stride(),
                         pad: l.inner.padding(), has_bias: l.inner.bias().is_some(),
                     };
-                    seq.push(Box::new(kore_nn::Conv2d::new(
-                        l.inner.in_channels(), l.inner.out_channels(),
-                        l.inner.kernel_size(), l.inner.stride(), l.inner.padding(),
-                        l.inner.bias().is_some(),
+                    seq.push(Box::new(kore_nn::Conv2d::from_weight(
+                        l.inner.weight().clone(), l.inner.bias().cloned(),
+                        l.inner.stride(), l.inner.padding(),
                     )));
                     descs.push(desc);
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyMaxPool2d>>() {
@@ -1003,13 +1052,47 @@ impl PySequential {
                     let desc = LayerDesc::Embedding {
                         num: l.inner.num_embeddings(), dim: l.inner.embedding_dim(),
                     };
-                    seq.push(Box::new(kore_nn::Embedding::new(
-                        l.inner.num_embeddings(), l.inner.embedding_dim(),
+                    seq.push(Box::new(kore_nn::Embedding::from_weight(
+                        l.inner.weight().clone(),
                     )));
+                    descs.push(desc);
+                } else if let Ok(l) = item.extract::<PyRef<'_, PyLoraLinear>>() {
+                    let desc = LayerDesc::LoraLinear {
+                        in_f: l.inner.in_features(), out_f: l.inner.out_features(),
+                        rank: l.inner.rank(), alpha: l.inner.alpha(),
+                        has_bias: kore_nn::Module::parameters(&l.inner).len() > 2,
+                    };
+                    seq.push(desc.build());
+                    // Copy trained params
+                    let src: Vec<_> = kore_nn::Module::parameters(&l.inner).iter().map(|p| (*p).clone()).collect();
+                    if let Some(last) = seq.get_mut(seq.len() - 1) {
+                        kore_nn::Module::set_parameters(last.as_mut(), &src);
+                    }
+                    descs.push(desc);
+                } else if let Ok(l) = item.extract::<PyRef<'_, PyBitLinear>>() {
+                    let desc = LayerDesc::BitLinear {
+                        in_f: l.inner.in_features(), out_f: l.inner.out_features(),
+                        threshold: l.inner.threshold(),
+                    };
+                    seq.push(desc.build());
+                    let src: Vec<_> = kore_nn::Module::parameters(&l.inner).iter().map(|p| (*p).clone()).collect();
+                    if let Some(last) = seq.get_mut(seq.len() - 1) {
+                        kore_nn::Module::set_parameters(last.as_mut(), &src);
+                    }
+                    descs.push(desc);
+                } else if let Ok(l) = item.extract::<PyRef<'_, PyQuatLinear>>() {
+                    let desc = LayerDesc::QuatLinear {
+                        in_f: l.inner.in_features(), out_f: l.inner.out_features(),
+                    };
+                    seq.push(desc.build());
+                    let src: Vec<_> = kore_nn::Module::parameters(&l.inner).iter().map(|p| (*p).clone()).collect();
+                    if let Some(last) = seq.get_mut(seq.len() - 1) {
+                        kore_nn::Module::set_parameters(last.as_mut(), &src);
+                    }
                     descs.push(desc);
                 } else {
                     return Err(pyo3::exceptions::PyTypeError::new_err(
-                        format!("Sequential: unsupported layer type at index {} (supported: Linear, LayerNorm, Dropout, Conv2d, MaxPool2d, AvgPool2d, AdaptiveAvgPool2d, Embedding)", i)
+                        format!("Sequential: unsupported layer type at index {}", i)
                     ));
                 }
             }
@@ -1278,6 +1361,7 @@ fn kore(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     nn.add_class::<PyQuatLinear>()?;
     nn.add_class::<PyEmbedding>()?;
     nn.add_class::<PyDropout>()?;
+    nn.add_class::<PyRmsNorm>()?;
     nn.add_class::<PyConv2d>()?;
     nn.add_class::<PyMaxPool2d>()?;
     nn.add_class::<PyAvgPool2d>()?;

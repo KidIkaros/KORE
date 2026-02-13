@@ -262,6 +262,9 @@ impl Conv2d {
         }
     }
 
+    /// Weight tensor.
+    pub fn weight(&self) -> &Tensor { &self.weight }
+
     /// Input channels.
     pub fn in_channels(&self) -> usize { self.in_channels }
 

@@ -31,6 +31,12 @@ impl LayerNorm {
         }
     }
 
+    /// Create from existing gamma and beta tensors (preserves trained params).
+    pub fn from_weight(gamma: Tensor, beta: Tensor, eps: f32) -> Self {
+        let normalized_shape = gamma.numel();
+        Self { gamma, beta, normalized_shape, eps, training: true }
+    }
+
     /// Create with default eps (1e-5).
     pub fn default_new(normalized_shape: usize) -> Self {
         Self::new(normalized_shape, 1e-5)

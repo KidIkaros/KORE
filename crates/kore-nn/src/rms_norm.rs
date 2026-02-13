@@ -65,6 +65,11 @@ impl RMSNorm {
     pub fn eps(&self) -> f32 {
         self.eps
     }
+
+    /// Scale parameter (gamma).
+    pub fn gamma(&self) -> &Tensor {
+        &self.gamma
+    }
 }
 
 impl std::fmt::Display for RMSNorm {
