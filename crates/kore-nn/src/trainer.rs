@@ -163,8 +163,12 @@ impl Trainer {
                 }
             };
 
-            // Extract scalar loss value
+            // Extract scalar loss value; skip batch on NaN to avoid poisoning
             let loss_val = loss.get_f32(0).unwrap_or(f32::NAN);
+            if loss_val.is_nan() {
+                eprintln!("  warning: NaN loss at batch {}, skipping", num_batches);
+                continue;
+            }
             total_loss += loss_val as f64;
 
             // Zero gradients before backward to prevent accumulation
@@ -244,7 +248,12 @@ impl Trainer {
                 }
             };
 
-            total_loss += loss.get_f32(0).unwrap_or(f32::NAN) as f64;
+            let loss_val = loss.get_f32(0).unwrap_or(f32::NAN);
+            if loss_val.is_nan() {
+                eprintln!("  warning: NaN eval loss at batch {}, skipping", num_batches);
+                continue;
+            }
+            total_loss += loss_val as f64;
             num_batches += 1;
             num_samples += batch.size;
         }
