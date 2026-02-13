@@ -5,6 +5,7 @@ use crate::module::Module;
 
 /// Dropout layer: randomly zeroes elements with probability `p` during training.
 /// During evaluation, acts as identity.
+#[derive(Clone)]
 pub struct Dropout {
     p: f32,
     training: bool,
@@ -34,6 +35,8 @@ impl Dropout {
 }
 
 impl Module for Dropout {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         if !self.training || self.p == 0.0 {
             return Ok(input.clone());

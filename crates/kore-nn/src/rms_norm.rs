@@ -17,6 +17,7 @@ use crate::module::Module;
 ///
 /// Normalizes the last dimension of the input tensor using RMS statistics.
 /// Learnable scale parameter `gamma` (no bias).
+#[derive(Clone)]
 pub struct RMSNorm {
     gamma: Tensor,
     dim: usize,
@@ -79,6 +80,8 @@ impl std::fmt::Display for RMSNorm {
 }
 
 impl Module for RMSNorm {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         if input.dtype() != DType::F32 {
             return Err(KoreError::UnsupportedDType(input.dtype()));

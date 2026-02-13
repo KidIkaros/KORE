@@ -20,6 +20,7 @@ use crate::bit_linear::BitLinear;
 /// LoRA adapter on top of a standard f32 Linear layer.
 ///
 /// Forward: y = W @ x + (alpha/rank) * B @ A @ x + bias
+#[derive(Clone)]
 pub struct LoraLinear {
     /// Frozen base weight: [out_features, in_features]
     base_weight: Tensor,
@@ -110,6 +111,8 @@ impl LoraLinear {
 }
 
 impl Module for LoraLinear {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let scaling = self.alpha / self.rank as f32;
 
@@ -186,6 +189,7 @@ impl Module for LoraLinear {
 /// LoRA adapters A and B remain in f32 (trainable).
 ///
 /// Forward: y = BitLinear(x) + (alpha/rank) * B @ A @ x
+#[derive(Clone)]
 pub struct QLoraLinear {
     /// Frozen ternary base
     base: BitLinear,
@@ -281,6 +285,8 @@ impl QLoraLinear {
 }
 
 impl Module for QLoraLinear {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let scaling = self.alpha / self.rank as f32;
 

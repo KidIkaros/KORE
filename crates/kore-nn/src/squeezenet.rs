@@ -35,6 +35,7 @@ use crate::module::Module;
 /// The squeeze layer reduces channels, then two parallel expand layers
 /// (1×1 and 3×3) increase them back. The outputs are concatenated
 /// along the channel dimension.
+#[derive(Clone)]
 pub struct Fire {
     /// Squeeze: reduce channels with 1×1 conv.
     squeeze: Conv2d,
@@ -107,6 +108,8 @@ impl Fire {
 }
 
 impl Module for Fire {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let squeezed = relu(&self.squeeze.forward(input)?)?;
         let e1 = relu(&self.expand1x1.forward(&squeezed)?)?;
@@ -149,6 +152,7 @@ impl Module for Fire {
 ///
 /// ~1.2M parameters for 1000-class ImageNet classification.
 /// Uses Fire modules to achieve high accuracy with minimal parameters.
+#[derive(Clone)]
 pub struct SqueezeNet {
     // Feature extractor
     conv1: Conv2d,
@@ -286,6 +290,8 @@ impl SqueezeNet {
 }
 
 impl Module for SqueezeNet {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     /// Forward pass.
     ///
     /// Input: `[batch, 3, H, W]` (e.g. `[1, 3, 224, 224]`)

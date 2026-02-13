@@ -917,62 +917,9 @@ fn load_state_dict(path: String) -> PyResult<std::collections::HashMap<String, P
 // Sequential / ModuleList
 // ============================================================================
 
-/// Layer descriptor for reconstructing a Sequential in PyTrainer.
-#[derive(Clone)]
-enum LayerDesc {
-    Linear { in_f: usize, out_f: usize, has_bias: bool },
-    LayerNorm { shape: usize, eps: f32 },
-    RmsNorm { dim: usize, eps: f32 },
-    Dropout { p: f32 },
-    Conv2d { in_ch: usize, out_ch: usize, kernel: usize, stride: usize, pad: usize, has_bias: bool },
-    MaxPool2d { kernel: usize, stride: usize, pad: usize },
-    AvgPool2d { kernel: usize, stride: usize, pad: usize },
-    AdaptiveAvgPool2d { h: usize, w: usize },
-    Embedding { num: usize, dim: usize },
-    LoraLinear { in_f: usize, out_f: usize, rank: usize, alpha: f32, has_bias: bool },
-    BitLinear { in_f: usize, out_f: usize, threshold: f32 },
-    QuatLinear { in_f: usize, out_f: usize },
-}
-
-impl LayerDesc {
-    /// Build a fresh Rust Module from this descriptor.
-    fn build(&self) -> Box<dyn kore_nn::Module> {
-        match self {
-            LayerDesc::Linear { in_f, out_f, has_bias } =>
-                Box::new(kore_nn::Linear::new(*in_f, *out_f, *has_bias)),
-            LayerDesc::LayerNorm { shape, eps } =>
-                Box::new(kore_nn::LayerNorm::new(*shape, *eps)),
-            LayerDesc::RmsNorm { dim, eps } =>
-                Box::new(kore_nn::RMSNorm::new(*dim, *eps)),
-            LayerDesc::Dropout { p } =>
-                Box::new(kore_nn::Dropout::new(*p)),
-            LayerDesc::Conv2d { in_ch, out_ch, kernel, stride, pad, has_bias } =>
-                Box::new(kore_nn::Conv2d::new(*in_ch, *out_ch, *kernel, *stride, *pad, *has_bias)),
-            LayerDesc::MaxPool2d { kernel, stride, pad } =>
-                Box::new(kore_nn::MaxPool2d::new(*kernel, *stride, *pad)),
-            LayerDesc::AvgPool2d { kernel, stride, pad } =>
-                Box::new(kore_nn::AvgPool2d::new(*kernel, *stride, *pad)),
-            LayerDesc::AdaptiveAvgPool2d { h, w } =>
-                Box::new(kore_nn::AdaptiveAvgPool2d::new(*h, *w)),
-            LayerDesc::Embedding { num, dim } =>
-                Box::new(kore_nn::Embedding::new(*num, *dim)),
-            LayerDesc::LoraLinear { in_f, out_f, rank, alpha, has_bias } =>
-                Box::new(kore_nn::LoraLinear::new(*in_f, *out_f, *rank, *alpha, *has_bias)),
-            LayerDesc::BitLinear { in_f, out_f, threshold } => {
-                let w = kore_core::Tensor::randn(&[*out_f, *in_f]);
-                Box::new(kore_nn::BitLinear::new(&w, None, *threshold))
-            }
-            LayerDesc::QuatLinear { in_f, out_f } =>
-                Box::new(kore_nn::QuatLinear::random(*in_f, *out_f, false)),
-        }
-    }
-}
-
 #[pyclass(name = "Sequential")]
 struct PySequential {
     inner: kore_nn::Sequential,
-    /// Layer descriptors for cloning/reconstruction.
-    descs: Vec<LayerDesc>,
 }
 
 #[pymethods]
@@ -981,115 +928,35 @@ impl PySequential {
     #[pyo3(signature = (layers=None))]
     fn new(layers: Option<Bound<'_, pyo3::types::PyList>>) -> PyResult<Self> {
         let mut seq = kore_nn::Sequential::empty();
-        let mut descs = Vec::new();
         if let Some(list) = layers {
             for i in 0..list.len() {
                 let item = list.get_item(i)?;
+                // Use clone_box() uniformly — preserves all internal state
+                // including packed quantized weights for BitLinear/QuatLinear.
                 if let Ok(l) = item.extract::<PyRef<'_, PyLinear>>() {
-                    let w = l.inner.weight();
-                    let dims = w.shape().dims();
-                    let desc = LayerDesc::Linear {
-                        in_f: dims[1], out_f: dims[0], has_bias: l.inner.bias().is_some(),
-                    };
-                    seq.push(Box::new(kore_nn::Linear::from_weight(
-                        w.clone(), l.inner.bias().cloned(),
-                    )));
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyLayerNorm>>() {
-                    let desc = LayerDesc::LayerNorm {
-                        shape: l.inner.normalized_shape(), eps: l.inner.eps(),
-                    };
-                    seq.push(Box::new(kore_nn::LayerNorm::from_weight(
-                        l.inner.gamma().clone(), l.inner.beta().clone(), l.inner.eps(),
-                    )));
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyRmsNorm>>() {
-                    let desc = LayerDesc::RmsNorm { dim: l.inner.dim(), eps: l.inner.eps() };
-                    seq.push(Box::new(kore_nn::RMSNorm::from_weight(
-                        l.inner.gamma().clone(), l.inner.eps(),
-                    )));
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyDropout>>() {
-                    let desc = LayerDesc::Dropout { p: l.inner.p() };
-                    seq.push(Box::new(kore_nn::Dropout::new(l.inner.p())));
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyConv2d>>() {
-                    let desc = LayerDesc::Conv2d {
-                        in_ch: l.inner.in_channels(), out_ch: l.inner.out_channels(),
-                        kernel: l.inner.kernel_size(), stride: l.inner.stride(),
-                        pad: l.inner.padding(), has_bias: l.inner.bias().is_some(),
-                    };
-                    seq.push(Box::new(kore_nn::Conv2d::from_weight(
-                        l.inner.weight().clone(), l.inner.bias().cloned(),
-                        l.inner.stride(), l.inner.padding(),
-                    )));
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyMaxPool2d>>() {
-                    let desc = LayerDesc::MaxPool2d {
-                        kernel: l.inner.kernel_size(), stride: l.inner.stride(), pad: l.inner.padding(),
-                    };
-                    seq.push(Box::new(kore_nn::MaxPool2d::new(
-                        l.inner.kernel_size(), l.inner.stride(), l.inner.padding(),
-                    )));
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyAvgPool2d>>() {
-                    let desc = LayerDesc::AvgPool2d {
-                        kernel: l.inner.kernel_size(), stride: l.inner.stride(), pad: l.inner.padding(),
-                    };
-                    seq.push(Box::new(kore_nn::AvgPool2d::new(
-                        l.inner.kernel_size(), l.inner.stride(), l.inner.padding(),
-                    )));
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyAdaptiveAvgPool2d>>() {
-                    let desc = LayerDesc::AdaptiveAvgPool2d {
-                        h: l.inner.output_h(), w: l.inner.output_w(),
-                    };
-                    seq.push(Box::new(kore_nn::AdaptiveAvgPool2d::new(
-                        l.inner.output_h(), l.inner.output_w(),
-                    )));
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyEmbedding>>() {
-                    let desc = LayerDesc::Embedding {
-                        num: l.inner.num_embeddings(), dim: l.inner.embedding_dim(),
-                    };
-                    seq.push(Box::new(kore_nn::Embedding::from_weight(
-                        l.inner.weight().clone(),
-                    )));
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyLoraLinear>>() {
-                    let desc = LayerDesc::LoraLinear {
-                        in_f: l.inner.in_features(), out_f: l.inner.out_features(),
-                        rank: l.inner.rank(), alpha: l.inner.alpha(),
-                        has_bias: kore_nn::Module::parameters(&l.inner).len() > 2,
-                    };
-                    seq.push(desc.build());
-                    // Copy trained params
-                    let src: Vec<_> = kore_nn::Module::parameters(&l.inner).iter().map(|p| (*p).clone()).collect();
-                    if let Some(last) = seq.get_mut(seq.len() - 1) {
-                        kore_nn::Module::set_parameters(last.as_mut(), &src);
-                    }
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyBitLinear>>() {
-                    let desc = LayerDesc::BitLinear {
-                        in_f: l.inner.in_features(), out_f: l.inner.out_features(),
-                        threshold: l.inner.threshold(),
-                    };
-                    seq.push(desc.build());
-                    let src: Vec<_> = kore_nn::Module::parameters(&l.inner).iter().map(|p| (*p).clone()).collect();
-                    if let Some(last) = seq.get_mut(seq.len() - 1) {
-                        kore_nn::Module::set_parameters(last.as_mut(), &src);
-                    }
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else if let Ok(l) = item.extract::<PyRef<'_, PyQuatLinear>>() {
-                    let desc = LayerDesc::QuatLinear {
-                        in_f: l.inner.in_features(), out_f: l.inner.out_features(),
-                    };
-                    seq.push(desc.build());
-                    let src: Vec<_> = kore_nn::Module::parameters(&l.inner).iter().map(|p| (*p).clone()).collect();
-                    if let Some(last) = seq.get_mut(seq.len() - 1) {
-                        kore_nn::Module::set_parameters(last.as_mut(), &src);
-                    }
-                    descs.push(desc);
+                    seq.push(kore_nn::Module::clone_box(&l.inner));
                 } else {
                     return Err(pyo3::exceptions::PyTypeError::new_err(
                         format!("Sequential: unsupported layer type at index {}", i)
@@ -1097,7 +964,7 @@ impl PySequential {
                 }
             }
         }
-        Ok(Self { inner: seq, descs })
+        Ok(Self { inner: seq })
     }
 
     fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
@@ -1256,19 +1123,9 @@ impl PyTrainer {
         log_every: usize,
         grad_clip_norm: f32,
     ) -> PyResult<Self> {
-        // Reconstruct Sequential from layer descriptors, then load current params.
-        let layers: Vec<Box<dyn kore_nn::Module>> = model.descs
-            .iter()
-            .map(|d| d.build())
-            .collect();
-        let mut seq = kore_nn::Sequential::new(layers);
-
-        // Copy the source model's trained parameters into the fresh Sequential
-        let src_params: Vec<kore_core::Tensor> = kore_nn::Module::parameters(&model.inner)
-            .iter()
-            .map(|p| (*p).clone())
-            .collect();
-        kore_nn::Module::set_parameters(&mut seq, &src_params);
+        // Deep-clone the model — preserves all internal state including
+        // packed quantized weights for BitLinear/QuatLinear.
+        let seq = model.inner.deep_clone();
 
         // Extract optimizer
         let opt: Box<dyn kore_optim::Optimizer> = if let Ok(adam) = optimizer.extract::<PyRef<'_, PyAdam>>() {

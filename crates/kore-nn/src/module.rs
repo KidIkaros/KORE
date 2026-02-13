@@ -22,6 +22,11 @@ pub trait Module: Send + Sync {
     /// as `parameters()` returns them. Returns how many were consumed.
     fn set_parameters(&mut self, _params: &[Tensor]) -> usize { 0 }
 
+    /// Deep-clone this module into a boxed trait object.
+    ///
+    /// Preserves all internal state including packed/quantized weights.
+    fn clone_box(&self) -> Box<dyn Module>;
+
     /// Set training/eval mode.
     fn train(&mut self, _mode: bool) {}
 

@@ -22,6 +22,7 @@ use crate::module::Module;
 ///
 /// Stores weights in base-243 packed format with per-row scales.
 /// Forward pass uses VT-ALU-accelerated ternary matmul from kore-kernels.
+#[derive(Clone)]
 pub struct BitLinear {
     /// Packed ternary weights: [out_features, ceil(in_features/5)] bytes
     packed_weights: Vec<u8>,
@@ -161,6 +162,8 @@ impl BitLinear {
 }
 
 impl Module for BitLinear {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     /// Forward pass: y = ternary_matmul(W_packed, scales, x) + bias
     ///
     /// Input shape: [batch, in_features] or [in_features]

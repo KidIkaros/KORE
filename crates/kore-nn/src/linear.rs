@@ -5,6 +5,7 @@ use kore_core::{DType, Tensor};
 use crate::module::Module;
 
 /// Fully connected linear layer: y = x @ W^T + b
+#[derive(Clone)]
 pub struct Linear {
     weight: Tensor,
     bias: Option<Tensor>,
@@ -71,6 +72,8 @@ impl Linear {
 }
 
 impl Module for Linear {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         // y = x @ W^T
         let wt = self.weight.transpose()?;

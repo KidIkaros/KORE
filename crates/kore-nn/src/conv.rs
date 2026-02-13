@@ -10,6 +10,7 @@ use crate::module::Module;
 /// Input shape: [batch, in_channels, length]
 /// Output shape: [batch, out_channels, out_length]
 /// where out_length = (length - kernel_size + 2*padding) / stride + 1
+#[derive(Clone)]
 pub struct Conv1d {
     weight: Tensor,  // [out_channels, in_channels, kernel_size]
     bias: Option<Tensor>,  // [out_channels]
@@ -77,6 +78,8 @@ impl Conv1d {
 }
 
 impl Module for Conv1d {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let data = input.contiguous();
         let dims = data.shape().dims().to_vec();
@@ -175,6 +178,7 @@ impl Module for Conv1d {
 ///
 /// Input shape: [batch, in_channels, height, width]
 /// Output shape: [batch, out_channels, out_h, out_w]
+#[derive(Clone)]
 pub struct Conv2d {
     weight: Tensor,  // [out_channels, in_channels, kh, kw]
     bias: Option<Tensor>,
@@ -300,6 +304,8 @@ impl Conv2d {
 }
 
 impl Module for Conv2d {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let data = input.contiguous();
         let dims = data.shape().dims().to_vec();

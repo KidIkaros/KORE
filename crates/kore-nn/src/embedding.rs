@@ -4,6 +4,7 @@ use kore_core::Tensor;
 use crate::module::Module;
 
 /// Embedding lookup table: maps integer token IDs to dense vectors.
+#[derive(Clone)]
 pub struct Embedding {
     weight: Tensor,
     num_embeddings: usize,
@@ -87,6 +88,8 @@ impl Embedding {
 }
 
 impl Module for Embedding {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         // Input is expected to be a 1D tensor of token IDs (as f32, cast to usize)
         let data = input.contiguous();

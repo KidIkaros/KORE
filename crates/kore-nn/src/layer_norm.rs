@@ -6,6 +6,7 @@ use kore_core::{DType, KoreError, Tensor};
 use crate::module::Module;
 
 /// Layer Normalization over the last dimension.
+#[derive(Clone)]
 pub struct LayerNorm {
     normalized_shape: usize,
     eps: f32,
@@ -64,6 +65,8 @@ impl LayerNorm {
 }
 
 impl Module for LayerNorm {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let data = input.contiguous();
         let dims = data.shape().dims().to_vec();

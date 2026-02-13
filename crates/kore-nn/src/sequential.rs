@@ -58,9 +58,25 @@ impl Sequential {
     pub fn get_mut(&mut self, index: usize) -> Option<&mut Box<dyn Module>> {
         self.layers.get_mut(index)
     }
+
+    /// Deep-clone this Sequential, preserving all internal layer state
+    /// (including packed quantized weights for BitLinear/QuatLinear).
+    pub fn deep_clone(&self) -> Self {
+        let cloned_layers: Vec<Box<dyn Module>> = self.layers.iter()
+            .map(|l| l.clone_box())
+            .collect();
+        Self { layers: cloned_layers, training: self.training }
+    }
 }
 
 impl Module for Sequential {
+    fn clone_box(&self) -> Box<dyn Module> {
+        let cloned_layers: Vec<Box<dyn Module>> = self.layers.iter()
+            .map(|l| l.clone_box())
+            .collect();
+        Box::new(Sequential { layers: cloned_layers, training: self.training })
+    }
+
     fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let mut x = input.clone();
         for layer in &self.layers {

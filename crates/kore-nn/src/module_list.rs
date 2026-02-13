@@ -90,6 +90,13 @@ impl std::ops::Index<usize> for ModuleList {
 }
 
 impl Module for ModuleList {
+    fn clone_box(&self) -> Box<dyn Module> {
+        let cloned: Vec<Box<dyn Module>> = self.modules.iter()
+            .map(|m| m.clone_box())
+            .collect();
+        Box::new(ModuleList { modules: cloned, training: self.training })
+    }
+
     /// Forward is **not** automatically chained. This is a no-op that returns
     /// the input unchanged. Use `ModuleList` inside your own `Module::forward`.
     fn forward(&self, input: &Tensor) -> Result<Tensor> {

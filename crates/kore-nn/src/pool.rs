@@ -11,6 +11,7 @@ use crate::module::Module;
 /// Input shape: `[batch, channels, height, width]`
 /// Output shape: `[batch, channels, out_h, out_w]`
 /// where `out_h = (height + 2*padding - kernel_size) / stride + 1`
+#[derive(Clone)]
 pub struct MaxPool2d {
     kernel_size: usize,
     stride: usize,
@@ -54,6 +55,8 @@ impl MaxPool2d {
 }
 
 impl Module for MaxPool2d {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let data = input.contiguous();
         let dims = data.shape().dims().to_vec();
@@ -118,6 +121,7 @@ impl Module for MaxPool2d {
 ///
 /// Input shape: `[batch, channels, height, width]`
 /// Output shape: `[batch, channels, out_h, out_w]`
+#[derive(Clone)]
 pub struct AvgPool2d {
     kernel_size: usize,
     stride: usize,
@@ -161,6 +165,8 @@ impl AvgPool2d {
 }
 
 impl Module for AvgPool2d {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let data = input.contiguous();
         let dims = data.shape().dims().to_vec();
@@ -230,6 +236,7 @@ impl Module for AvgPool2d {
 ///
 /// Commonly used with `output_size = (1, 1)` for global average pooling
 /// before a classifier head.
+#[derive(Clone)]
 pub struct AdaptiveAvgPool2d {
     output_h: usize,
     output_w: usize,
@@ -254,6 +261,8 @@ impl AdaptiveAvgPool2d {
 }
 
 impl Module for AdaptiveAvgPool2d {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let data = input.contiguous();
         let dims = data.shape().dims().to_vec();

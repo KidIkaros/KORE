@@ -24,6 +24,7 @@ use crate::module::Module;
 ///
 /// Stores weights in 2-bit packed format with per-row scales.
 /// Forward pass uses AVX2-accelerated quaternary matmul from kore-kernels.
+#[derive(Clone)]
 pub struct QuatLinear {
     /// Packed quaternary weights: [out_features, ceil(in_features/4)] bytes
     packed_weights: Vec<u8>,
@@ -232,6 +233,8 @@ impl std::fmt::Display for QuatLinear {
 }
 
 impl Module for QuatLinear {
+    fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
     /// Forward pass: y = quat_matmul(W_packed, scales, x) + bias
     ///
     /// Input shape: [batch, in_features] or [in_features]
