@@ -15,5 +15,6 @@ kore-core.workspace = true
 kore-autograd.workspace = true
 kore-nn.workspace = true
 kore-optim.workspace = true
+kore-data.workspace = true
 pyo3.workspace = true
 numpy.workspace = true

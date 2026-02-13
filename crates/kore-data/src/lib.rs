@@ -10,7 +10,9 @@
 pub mod multipack;
 pub mod dataset;
 pub mod batcher;
+pub mod dataloader;
 
 pub use multipack::MultipackSampler;
 pub use dataset::StreamingDataset;
 pub use batcher::TokenBatcher;
+pub use dataloader::{Dataset, Sample, TensorDataset, DataLoader, DataLoaderIter, Batch};

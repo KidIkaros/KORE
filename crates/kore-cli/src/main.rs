@@ -1,6 +1,11 @@
 use clap::Parser;
 use std::time::Instant;
-use serde::Deserialize;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 use kore_core::Tensor;
 
@@ -14,11 +19,20 @@ const BANNER: &str = r#"
 #[derive(Parser)]
 #[command(
     name = "kore",
-    about = "Kore ML Engine CLI",
-    long_about = "A pure-Rust ML engine — from training to edge inference.\n\nBuild any architecture on top of KORE primitives: tensors, autograd,\nquantization, attention, and more. Model implementations live in Xura.",
+    about = "Kore CLI",
+    long_about = "A workflow-first CLI for Kore (inspect → shard/export → run/serve).",
+    after_long_help = "Typical workflow:\n  1) kore inspect --path ./model\n  2) kore shard --model ./model --output ./shards\n  3) kore export --model ./model --output model.koref\n  4) kore run --model model.koref --tokenizer tokenizer.json --prompt \"Hello\"\n  5) kore serve --addr 0.0.0.0:8080",
     version,
 )]
 struct Cli {
+    /// Increase logging verbosity (-v, -vv)
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
+    verbose: u8,
+
+    /// Silence non-error output
+    #[arg(long = "quiet", default_value_t = false, global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -27,6 +41,39 @@ struct Cli {
 enum Commands {
     /// Show system info (GPU, SIMD capabilities)
     Info,
+    /// Inspect .koref/.safetensors/model-dir metadata
+    Inspect {
+        /// Path to .koref file, .safetensors file, or model directory
+        #[arg(long)]
+        path: String,
+    },
+    /// Shard HuggingFace safetensors into per-layer files for layered inference
+    Shard {
+        /// HF model directory containing config.json + *.safetensors
+        #[arg(long)]
+        model: String,
+        /// Output directory for per-layer shards
+        #[arg(long)]
+        output: String,
+    },
+    /// Run local generation from a .koref model
+    Run {
+        /// .koref model file path
+        #[arg(long)]
+        model: String,
+        /// Tokenizer JSON path (Kore simple tokenizer format)
+        #[arg(long)]
+        tokenizer: Option<String>,
+        /// Prompt text (requires --tokenizer)
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Raw token IDs (comma separated). Use instead of --prompt.
+        #[arg(long)]
+        tokens: Option<String>,
+        /// Max new tokens
+        #[arg(long, default_value_t = 64)]
+        max_new_tokens: usize,
+    },
     /// Run performance benchmarks
     Bench {
         /// Matrix sizes to benchmark (comma-separated)
@@ -68,16 +115,185 @@ enum Commands {
     },
 }
 
-fn main() {
+fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_logging(cli.verbose, cli.quiet);
 
     match cli.command {
         Commands::Info => cmd_info(),
+        Commands::Inspect { path } => cmd_inspect(&path)?,
+        Commands::Shard { model, output } => cmd_shard(&model, &output)?,
+        Commands::Run { model, tokenizer, prompt, tokens, max_new_tokens } => {
+            cmd_run(&model, tokenizer.as_deref(), prompt.as_deref(), tokens.as_deref(), max_new_tokens)?
+        }
         Commands::Bench { sizes } => cmd_bench(&sizes),
-        Commands::Serve { addr } => cmd_serve(&addr),
+        Commands::Serve { addr } => cmd_serve(&addr)?,
         Commands::Train { steps, lr, scheduler, warmup_pct } => cmd_train(steps, lr, &scheduler, warmup_pct),
-        Commands::Export { model, output, quantize } => cmd_export(&model, &output, &quantize),
+        Commands::Export { model, output, quantize } => cmd_export(&model, &output, &quantize)?,
     }
+
+    Ok(())
+}
+
+fn init_logging(verbose: u8, quiet: bool) {
+    use tracing_subscriber::EnvFilter;
+
+    let default = if quiet {
+        "error"
+    } else if verbose >= 2 {
+        "debug"
+    } else if verbose == 1 {
+        "info"
+    } else {
+        "warn"
+    };
+
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| default.to_string());
+    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::new(filter)).try_init();
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct XuraTokenizer {
+    stoi: HashMap<String, usize>,
+    itos: Vec<String>,
+    unk_token: String,
+    bos_token: Option<String>,
+    eos_token: Option<String>,
+}
+
+impl XuraTokenizer {
+    fn from_file(path: &Path) -> Result<Self> {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("failed to read tokenizer file {}", path.display()))?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse tokenizer JSON {}", path.display()))
+    }
+
+    fn encode(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        if let Some(bos) = &self.bos_token {
+            if let Some(&id) = self.stoi.get(bos) {
+                out.push(id as u32);
+            }
+        }
+
+        let unk_id = self.stoi.get(&self.unk_token).copied().unwrap_or(0) as u32;
+        for tok in text.split_whitespace() {
+            out.push(self.stoi.get(tok).copied().map(|v| v as u32).unwrap_or(unk_id));
+        }
+
+        out
+    }
+
+    fn decode(&self, tokens: &[u32]) -> String {
+        tokens
+            .iter()
+            .filter_map(|&t| self.itos.get(t as usize))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn cmd_inspect(path: &str) -> Result<()> {
+    let p = PathBuf::from(path);
+    if p.is_dir() {
+        println!("Inspecting model directory: {}", p.display());
+        let cfg = p.join("config.json");
+        println!("  config.json: {}", if cfg.exists() { "found" } else { "missing" });
+        let st_count = fs::read_dir(&p)
+            .with_context(|| format!("failed to read dir {}", p.display()))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
+            .count();
+        println!("  .safetensors files: {}", st_count);
+        return Ok(());
+    }
+
+    if p.extension().is_some_and(|e| e == "koref") {
+        let bytes = fs::read(&p).with_context(|| format!("failed to read {}", p.display()))?;
+        let model = kore_edge::format::KorefModel::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("failed to parse .koref: {e}"))?;
+        println!("Model: {}", p.display());
+        println!("  type: {}", model.header.model_type);
+        println!("  layers: {}", model.header.n_layers);
+        println!("  d_model: {}", model.header.d_model);
+        println!("  vocab: {}", model.header.vocab_size);
+        println!("  tensors: {}", model.header.tensors.len());
+        let plan = kore_edge::plan::ExecutionPlan::from_header(&model.header);
+        println!("  est runtime memory: {:.1} MB", plan.peak_memory_mb());
+        return Ok(());
+    }
+
+    if p.extension().is_some_and(|e| e == "safetensors") {
+        let data = fs::read(&p).with_context(|| format!("failed to read {}", p.display()))?;
+        let tensors = safetensors::SafeTensors::deserialize(&data)
+            .map_err(|e| anyhow::anyhow!("failed to parse safetensors: {e}"))?;
+        println!("Safetensors: {}", p.display());
+        for (name, view) in tensors.tensors() {
+            println!("  {:<50} {:?} {:?}", name, view.dtype(), view.shape());
+        }
+        return Ok(());
+    }
+
+    bail!("unsupported path type: {}", p.display())
+}
+
+fn cmd_shard(model_dir: &str, output_dir: &str) -> Result<()> {
+    let model = PathBuf::from(model_dir);
+    let output = PathBuf::from(output_dir);
+    let cfg_path = model.join("config.json");
+
+    let config = kore_serve::layered::LayeredConfig::from_hf_config(&cfg_path, output.clone())
+        .ok_or_else(|| anyhow::anyhow!("failed to parse {}", cfg_path.display()))?;
+
+    let count = kore_serve::layered::sharder::shard_model(&model, &output, &config)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    println!("Sharding complete");
+    println!("  output: {}", output.display());
+    println!("  shard files: {}", count);
+    Ok(())
+}
+
+fn cmd_run(model_path: &str, tokenizer_path: Option<&str>, prompt: Option<&str>, tokens_csv: Option<&str>, max_new_tokens: usize) -> Result<()> {
+    let bytes = fs::read(model_path)
+        .with_context(|| format!("failed to read model file {}", model_path))?;
+    let model = kore_edge::format::KorefModel::from_bytes(&bytes)
+        .map_err(|e| anyhow::anyhow!("failed to parse .koref: {e}"))?;
+
+    let mut session = kore_edge::Session::new(model);
+
+    let (input_tokens, tokenizer) = if let Some(csv) = tokens_csv {
+        let tokens = parse_u32_csv(csv)?;
+        (tokens, None)
+    } else {
+        let prompt = prompt.ok_or_else(|| anyhow::anyhow!("provide either --tokens or (--prompt and --tokenizer)"))?;
+        let tok_path = tokenizer_path.ok_or_else(|| anyhow::anyhow!("--prompt requires --tokenizer"))?;
+        let tok = XuraTokenizer::from_file(Path::new(tok_path))?;
+        (tok.encode(prompt), Some(tok))
+    };
+
+    if input_tokens.is_empty() {
+        bail!("input token sequence is empty");
+    }
+
+    let t0 = Instant::now();
+    let out = session.generate(&input_tokens, max_new_tokens);
+    let dt = t0.elapsed().as_secs_f64().max(1e-6);
+
+    println!("Generated {} tokens in {:.2}s ({:.2} tok/s)", out.len(), dt, out.len() as f64 / dt);
+    if let Some(tok) = tokenizer {
+        println!("\n{}", tok.decode(&out));
+    } else {
+        println!("\n{:?}", out);
+    }
+    Ok(())
+}
+
+fn parse_u32_csv(csv: &str) -> Result<Vec<u32>> {
+    csv.split(',')
+        .map(|s| s.trim().parse::<u32>().with_context(|| format!("invalid token id '{s}'")))
+        .collect()
 }
 
 fn cmd_info() {
@@ -212,9 +428,7 @@ fn time_it(iters: usize, mut f: impl FnMut()) -> f64 {
     start.elapsed().as_secs_f64() / iters as f64
 }
 
-fn cmd_serve(addr: &str) {
-    tracing_subscriber::fmt::init();
-
+fn cmd_serve(addr: &str) -> Result<()> {
     let state = kore_serve::state::AppState::empty();
 
     println!("{}", BANNER);
@@ -226,17 +440,16 @@ fn cmd_serve(addr: &str) {
     println!("    POST /v1/chat/completions");
     println!("    GET  /v1/models");
     println!("    GET  /health\n");
-    println!("  To serve a model, implement kore_serve::InferenceModel:");
-    println!("    use kore_serve::{{InferenceModel, state::AppState}};");
-    println!("    let state = AppState::with_model(my_model, name);");
-    println!("    kore_serve::server::serve_with_state(addr, state).await;\n");
+    println!("  Use kore run for local validation before deployment.\n");
 
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     rt.block_on(async {
         if let Err(e) = kore_serve::server::serve_with_state(addr, state).await {
             eprintln!("Server error: {}", e);
         }
     });
+
+    Ok(())
 }
 
 fn cmd_train(steps: usize, lr: f32, scheduler_name: &str, warmup_pct: f32) {
@@ -300,23 +513,8 @@ fn cmd_train(steps: usize, lr: f32, scheduler_name: &str, warmup_pct: f32) {
     println!("\nTraining complete.");
 }
 
-/// Generic HuggingFace config.json fields used for .koref export.
-#[derive(Deserialize, Default)]
-struct HfExportConfig {
-    vocab_size: Option<usize>,
-    hidden_size: Option<usize>,
-    num_attention_heads: Option<usize>,
-    num_key_value_heads: Option<usize>,
-    num_hidden_layers: Option<usize>,
-    intermediate_size: Option<usize>,
-    max_position_embeddings: Option<usize>,
-    rms_norm_eps: Option<f64>,
-    rope_theta: Option<f64>,
-}
-
-fn cmd_export(model_path: &str, output_path: &str, quantize: &str) {
-    use kore_edge::format::{KorefBuilder, EdgeDType};
-    use std::path::Path;
+fn cmd_export(model_path: &str, output_path: &str, quantize: &str) -> Result<()> {
+    use kore_edge::format::EdgeDType;
 
     println!("=== Kore Export → .koref ===");
     println!("Model:    {}", model_path);
@@ -324,109 +522,32 @@ fn cmd_export(model_path: &str, output_path: &str, quantize: &str) {
     println!("Quantize: {}", quantize);
     println!();
 
-    let model_dir = Path::new(model_path);
-
-    // Load config.json
-    let config_path = model_dir.join("config.json");
-    if !config_path.exists() {
-        eprintln!("Error: config.json not found at {}", config_path.display());
-        eprintln!("Expected a HuggingFace model directory with config.json + *.safetensors");
-        return;
-    }
-
-    let config: HfExportConfig = match std::fs::read_to_string(&config_path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(e) => {
-            eprintln!("Error loading config: {}", e);
-            return;
-        }
-    };
-
-    let vocab_size = config.vocab_size.unwrap_or(32000);
-    let d_model = config.hidden_size.unwrap_or(4096);
-    let n_heads = config.num_attention_heads.unwrap_or(32);
-    let n_kv_heads = config.num_key_value_heads.unwrap_or(n_heads);
-    let n_layers = config.num_hidden_layers.unwrap_or(32);
-    let d_ff = config.intermediate_size.unwrap_or(11008);
-    let max_seq_len = config.max_position_embeddings.unwrap_or(2048);
-    let norm_eps = config.rms_norm_eps.unwrap_or(1e-5) as f32;
-    let rope_base = config.rope_theta.unwrap_or(10000.0) as f32;
-
-    println!("Config: vocab={} d={} heads={} kv_heads={} layers={} ff={} max_seq={}",
-        vocab_size, d_model, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len);
-
     let _target_dtype = match quantize {
         "f32" => EdgeDType::F32,
         "f16" => EdgeDType::F16,
         "ternary" => EdgeDType::Ternary,
         "quaternary" => EdgeDType::Quaternary,
         other => {
-            eprintln!("Unknown quantization: {}. Use f32, f16, ternary, or quaternary.", other);
-            return;
+            bail!("unknown quantization: {other}. Use f32, f16, ternary, or quaternary.");
         }
     };
 
-    let mut builder = KorefBuilder::new(
-        "llama", vocab_size, d_model, n_heads, n_kv_heads,
-        n_layers, d_ff, max_seq_len, norm_eps, rope_base,
-    );
-
-    // Find safetensors files
-    let st_files: Vec<_> = std::fs::read_dir(model_dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "safetensors"))
-        .map(|e| e.path())
-        .collect();
-
-    if st_files.is_empty() {
-        eprintln!("No .safetensors files found in {}", model_path);
-        eprintln!("Creating demo .koref with random weights instead...");
-
-        // Demo: create a tiny model
-        let demo_builder = KorefBuilder::new(
-            "demo", 256, 64, 4, 4, 2, 128, 128, 1e-5, 10000.0,
-        );
-        let model = demo_builder.build();
-        let bytes = model.to_bytes();
-        std::fs::write(output_path, &bytes).expect("Failed to write .koref");
-        println!("Wrote demo .koref ({} bytes) to {}", bytes.len(), output_path);
-        return;
-    }
-
-    println!("Found {} safetensors file(s)", st_files.len());
-
-    let mut tensor_count = 0usize;
-    let mut total_bytes = 0usize;
-
-    for st_path in &st_files {
-        let data = std::fs::read(st_path).expect("Failed to read safetensors");
-        let tensors = safetensors::SafeTensors::deserialize(&data).expect("Failed to parse safetensors");
-
-        for (name, view) in tensors.tensors() {
-            let shape: Vec<usize> = view.shape().to_vec();
-            let raw = view.data();
-
-            // For now, store as f32 (quantization conversion would go here)
-            builder.add_tensor(&name, EdgeDType::F32, &shape, raw);
-            total_bytes += raw.len();
-            tensor_count += 1;
-        }
-    }
-
-    let model = builder.build();
+    let model = kore_edge::loader::load_safetensors_dir(Path::new(model_path))
+        .map_err(|e| anyhow::anyhow!("export failed: {e}"))?;
     let bytes = model.to_bytes();
-    std::fs::write(output_path, &bytes).expect("Failed to write .koref");
+    fs::write(output_path, &bytes)
+        .with_context(|| format!("failed to write {}", output_path))?;
 
     println!();
     println!("Export complete:");
-    println!("  Tensors:    {}", tensor_count);
-    println!("  Weight data: {:.1} MB", total_bytes as f64 / (1024.0 * 1024.0));
+    println!("  Tensors:    {}", model.header.tensors.len());
     println!("  .koref size: {:.1} MB", bytes.len() as f64 / (1024.0 * 1024.0));
     println!("  Output:     {}", output_path);
 
     // Print estimated edge memory
     let plan = kore_edge::plan::ExecutionPlan::from_header(&model.header);
     println!("  Est. runtime memory: {:.1} MB", plan.peak_memory_mb());
+
+    Ok(())
 }
 

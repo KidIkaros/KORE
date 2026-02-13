@@ -886,6 +886,294 @@ fn load_state_dict(path: String) -> PyResult<std::collections::HashMap<String, P
 }
 
 // ============================================================================
+// Sequential / ModuleList
+// ============================================================================
+
+#[pyclass(name = "Sequential")]
+struct PySequential {
+    inner: kore_nn::Sequential,
+}
+
+#[pymethods]
+impl PySequential {
+    #[new]
+    #[pyo3(signature = (layers=None))]
+    fn new(layers: Option<Bound<'_, pyo3::types::PyList>>) -> PyResult<Self> {
+        let mut seq = kore_nn::Sequential::empty();
+        if let Some(list) = layers {
+            for i in 0..list.len() {
+                let item = list.get_item(i)?;
+                // Try to extract each known layer type
+                if let Ok(l) = item.extract::<PyRef<'_, PyLinear>>() {
+                    let layer = kore_nn::Linear::from_weight(
+                        l.inner.weight().clone(),
+                        l.inner.bias().cloned(),
+                    );
+                    seq.push(Box::new(layer));
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        format!("Sequential: unsupported layer type at index {}", i)
+                    ));
+                }
+            }
+        }
+        Ok(Self { inner: seq })
+    }
+
+    fn forward(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        let result = kore_nn::Module::forward(&self.inner, &input.inner)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        Ok(PyTensor { inner: result })
+    }
+
+    fn __call__(&self, input: &PyTensor) -> PyResult<PyTensor> {
+        self.forward(input)
+    }
+
+    fn parameters(&self) -> Vec<PyTensor> {
+        kore_nn::Module::parameters(&self.inner)
+            .into_iter()
+            .map(|t| PyTensor { inner: t.clone() })
+            .collect()
+    }
+
+    fn train(&mut self, mode: bool) {
+        kore_nn::Module::train(&mut self.inner, mode);
+    }
+
+    fn eval(&mut self) {
+        kore_nn::Module::train(&mut self.inner, false);
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Sequential({} layers)", self.inner.len())
+    }
+}
+
+// ============================================================================
+// Data: TensorDataset / DataLoader
+// ============================================================================
+
+#[pyclass(name = "TensorDataset")]
+struct PyTensorDataset {
+    inner: std::sync::Arc<kore_data::TensorDataset>,
+}
+
+#[pymethods]
+impl PyTensorDataset {
+    #[new]
+    fn new(inputs: &PyTensor, targets: &PyTensor) -> Self {
+        Self {
+            inner: std::sync::Arc::new(kore_data::TensorDataset::new(&inputs.inner, &targets.inner)),
+        }
+    }
+
+    fn __len__(&self) -> usize {
+        kore_data::Dataset::len(self.inner.as_ref())
+    }
+
+    fn __repr__(&self) -> String {
+        format!("TensorDataset(n={})", kore_data::Dataset::len(self.inner.as_ref()))
+    }
+}
+
+#[pyclass(name = "DataLoader")]
+struct PyDataLoader {
+    dataset: std::sync::Arc<kore_data::TensorDataset>,
+    batch_size: usize,
+    shuffle: bool,
+    drop_last: bool,
+    seed: Option<u64>,
+}
+
+#[pymethods]
+impl PyDataLoader {
+    #[new]
+    #[pyo3(signature = (dataset, batch_size=32, shuffle=false, drop_last=false, seed=None))]
+    fn new(
+        dataset: &PyTensorDataset,
+        batch_size: usize,
+        shuffle: bool,
+        drop_last: bool,
+        seed: Option<u64>,
+    ) -> Self {
+        Self {
+            dataset: std::sync::Arc::clone(&dataset.inner),
+            batch_size,
+            shuffle,
+            drop_last,
+            seed,
+        }
+    }
+
+    fn __len__(&self) -> usize {
+        let n = kore_data::Dataset::len(self.dataset.as_ref());
+        if self.drop_last {
+            n / self.batch_size
+        } else {
+            (n + self.batch_size - 1) / self.batch_size
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DataLoader(batch_size={}, shuffle={}, drop_last={})",
+            self.batch_size, self.shuffle, self.drop_last
+        )
+    }
+}
+
+impl PyDataLoader {
+    fn to_rust_loader(&self) -> kore_data::DataLoader {
+        // Clone the TensorDataset into a new Box<dyn Dataset>
+        let ds = kore_data::TensorDataset::from_vecs(
+            (0..kore_data::Dataset::len(self.dataset.as_ref()))
+                .map(|i| kore_data::Dataset::get(self.dataset.as_ref(), i).input)
+                .collect(),
+            (0..kore_data::Dataset::len(self.dataset.as_ref()))
+                .map(|i| kore_data::Dataset::get(self.dataset.as_ref(), i).target)
+                .collect(),
+        );
+        kore_data::DataLoader::new(
+            Box::new(ds),
+            self.batch_size,
+            self.shuffle,
+            self.drop_last,
+            self.seed,
+        )
+    }
+}
+
+// ============================================================================
+// Trainer
+// ============================================================================
+
+#[pyclass(name = "Trainer")]
+struct PyTrainer {
+    inner: kore_nn::Trainer,
+}
+
+#[pymethods]
+impl PyTrainer {
+    #[new]
+    #[pyo3(signature = (model, optimizer, loss="mse", log_every=1, grad_clip_norm=0.0))]
+    fn new(
+        model: &PySequential,
+        optimizer: &Bound<'_, pyo3::types::PyAny>,
+        loss: &str,
+        log_every: usize,
+        grad_clip_norm: f32,
+    ) -> PyResult<Self> {
+        // Reconstruct the Sequential model from parameters
+        // We need to clone the model's layers via state_dict
+        let state = kore_nn::Module::state_dict(&model.inner);
+        let _ = state; // state dict available for reload
+
+        // Build a fresh Sequential from the Python model's layer shapes
+        // For now, clone the Sequential by re-creating layers from parameters
+        let params = kore_nn::Module::parameters(&model.inner);
+        let mut layers: Vec<Box<dyn kore_nn::Module>> = Vec::new();
+
+        // Parse weight tensors to reconstruct Linear layers
+        let mut i = 0;
+        while i < params.len() {
+            let w = params[i];
+            let w_dims = w.shape().dims();
+            if w_dims.len() == 2 {
+                let out_f = w_dims[0];
+                let _in_f = w_dims[1];
+                // Check if next param is a bias (1D with out_features)
+                let has_bias = i + 1 < params.len()
+                    && params[i + 1].shape().dims().len() == 1
+                    && params[i + 1].shape().dims()[0] == out_f;
+                let bias = if has_bias {
+                    i += 1;
+                    Some(params[i].clone())
+                } else {
+                    None
+                };
+                layers.push(Box::new(kore_nn::Linear::from_weight(w.clone(), bias)));
+            }
+            i += 1;
+        }
+
+        let seq = kore_nn::Sequential::new(layers);
+
+        // Extract optimizer
+        let opt: Box<dyn kore_optim::Optimizer> = if let Ok(adam) = optimizer.extract::<PyRef<'_, PyAdam>>() {
+            Box::new(kore_optim::Adam::new(
+                adam.inner.lr(), adam.inner.beta1(), adam.inner.beta2(),
+                adam.inner.eps(), adam.inner.weight_decay(),
+            ))
+        } else if let Ok(sgd) = optimizer.extract::<PyRef<'_, PySGD>>() {
+            Box::new(kore_optim::SGD::new(
+                sgd.inner.lr(), sgd.inner.momentum(), sgd.inner.weight_decay(),
+            ))
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "Trainer: optimizer must be kore.optim.Adam or kore.optim.SGD"
+            ));
+        };
+
+        // Resolve loss function
+        let loss_fn: kore_nn::LossFn = match loss {
+            "mse" => |p, t| kore_nn::mse_loss(p, t),
+            "l1" => |p, t| kore_nn::l1_loss(p, t),
+            "cross_entropy" => |p, t| kore_nn::cross_entropy_loss(p, t),
+            "nll" => |p, t| kore_nn::nll_loss(p, t),
+            _ => return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Unknown loss '{}'. Use: mse, l1, cross_entropy, nll", loss)
+            )),
+        };
+
+        let config = kore_nn::TrainerConfig { log_every, grad_clip_norm };
+        Ok(Self {
+            inner: kore_nn::Trainer::new(seq, opt, loss_fn, config),
+        })
+    }
+
+    /// Train the model. Returns list of per-epoch average losses.
+    fn fit(&mut self, loader: &PyDataLoader, epochs: usize) -> Vec<f32> {
+        let rust_loader = loader.to_rust_loader();
+        let history = self.inner.fit(&rust_loader, epochs);
+        history.losses()
+    }
+
+    /// Evaluate the model. Returns average loss.
+    fn evaluate(&mut self, loader: &PyDataLoader) -> f32 {
+        let rust_loader = loader.to_rust_loader();
+        self.inner.evaluate(&rust_loader).avg_loss
+    }
+
+    /// Run predictions. Returns list of output Tensors.
+    fn predict(&mut self, loader: &PyDataLoader) -> Vec<PyTensor> {
+        let rust_loader = loader.to_rust_loader();
+        self.inner.predict(&rust_loader)
+            .into_iter()
+            .map(|t| PyTensor { inner: t })
+            .collect()
+    }
+
+    #[getter]
+    fn lr(&self) -> f32 {
+        self.inner.lr()
+    }
+
+    #[setter]
+    fn set_lr(&mut self, lr: f32) {
+        self.inner.set_lr(lr);
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Trainer(lr={:.6})", self.inner.lr())
+    }
+}
+
+// ============================================================================
 // Module entry point
 // ============================================================================
 
@@ -910,6 +1198,7 @@ fn kore(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     nn.add_class::<PyMaxPool2d>()?;
     nn.add_class::<PyAvgPool2d>()?;
     nn.add_class::<PyAdaptiveAvgPool2d>()?;
+    nn.add_class::<PySequential>()?;
     m.add_submodule(&nn)?;
 
     // optim submodule
@@ -917,6 +1206,17 @@ fn kore(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     optim.add_class::<PyAdam>()?;
     optim.add_class::<PySGD>()?;
     m.add_submodule(&optim)?;
+
+    // data submodule
+    let data = PyModule::new_bound(py, "data")?;
+    data.add_class::<PyTensorDataset>()?;
+    data.add_class::<PyDataLoader>()?;
+    m.add_submodule(&data)?;
+
+    // training submodule
+    let training = PyModule::new_bound(py, "training")?;
+    training.add_class::<PyTrainer>()?;
+    m.add_submodule(&training)?;
 
     // functional submodule (loss functions + activations)
     let functional = PyModule::new_bound(py, "functional")?;

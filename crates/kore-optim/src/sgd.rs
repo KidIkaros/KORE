@@ -29,6 +29,9 @@ impl SGD {
     /// Weight decay coefficient.
     pub fn weight_decay(&self) -> f32 { self.weight_decay }
 
+    /// Set the learning rate.
+    pub fn set_lr(&mut self, lr: f32) { self.lr = lr; }
+
     /// Perform one optimization step.
     ///
     /// `params` and `grads` must be the same length and correspond 1:1.

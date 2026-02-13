@@ -62,7 +62,7 @@ loss.backward()
 print(w.grad.shape)              # [4, 2]
 ```
 
-### Layers & Training
+### Layers & Training (low-level)
 
 ```python
 model = kore.nn.Linear(16, 1)
@@ -74,6 +74,35 @@ y = kore.Tensor.randn([32, 1])
 pred = model(x)
 loss = kore.functional.mse_loss(pred, y)
 print(f"loss = {loss.numpy().item():.4f}")
+```
+
+### High-Level Training (PyTorch-style)
+
+```python
+import kore
+
+# 1. Define model
+model = kore.nn.Sequential([
+    kore.nn.Linear(16, 64),
+    kore.nn.Linear(64, 1),
+])
+
+# 2. Prepare data
+x = kore.Tensor.randn([200, 16])
+y = kore.Tensor.randn([200, 1])
+dataset = kore.data.TensorDataset(x, y)
+loader  = kore.data.DataLoader(dataset, batch_size=32, shuffle=True)
+
+# 3. Train
+trainer = kore.training.Trainer(
+    model, kore.optim.Adam(lr=0.001), loss="mse"
+)
+losses = trainer.fit(loader, epochs=10)
+print(f"final loss: {losses[-1]:.4f}")
+
+# 4. Evaluate / predict
+val_loss = trainer.evaluate(loader)
+preds    = trainer.predict(loader)
 ```
 
 ### Quantized Layers
@@ -105,18 +134,33 @@ Add KORE crates to your `Cargo.toml`:
 [dependencies]
 kore-core    = { path = "crates/kore-core" }
 kore-nn      = { path = "crates/kore-nn" }
-kore-autograd = { path = "crates/kore-autograd" }
 kore-optim   = { path = "crates/kore-optim" }
+kore-data    = { path = "crates/kore-data" }
 ```
 
 ```rust
-use kore_core::prelude::*;
+use kore_core::Tensor;
 use kore_nn::prelude::*;
+use kore_data::{TensorDataset, DataLoader};
 
-let x = Tensor::randn(&[32, 16]);
-let model = Linear::new(16, 1, true);
-let out = model.forward(&x).unwrap();
-println!("output shape: {:?}", out.shape().dims());
+// Build a model
+let model = Sequential::new(vec![
+    Box::new(Linear::new(16, 64, true)),
+    Box::new(Linear::new(64, 1, true)),
+]);
+
+// Prepare data
+let x = Tensor::randn(&[100, 16]);
+let y = Tensor::randn(&[100, 1]);
+let ds = TensorDataset::new(&x, &y);
+let loader = DataLoader::new(Box::new(ds), 32, true, true, Some(42));
+
+// Train
+let optimizer = kore_optim::Adam::default_with_lr(0.001);
+let config = TrainerConfig { log_every: 1, grad_clip_norm: 0.0 };
+let mut trainer = Trainer::new(model, optimizer, kore_nn::mse_loss, config);
+let history = trainer.fit(&loader, 10);
+println!("final loss: {:.4}", history.losses().last().unwrap());
 ```
 
 ### Build & Test
@@ -131,11 +175,14 @@ cargo clippy --workspace -- -D warnings
 
 ## CLI
 
-The `kore` CLI provides built-in tools for benchmarking, training, serving, and exporting.
+The `kore` CLI provides built-in tools for inspection, training, serving, and exporting.
 
 | Command | Description |
 |---------|-------------|
 | `kore info` | System info — SIMD capabilities, supported dtypes, available crates |
+| `kore inspect --path model.koref` | Inspect `.koref`, `.safetensors`, or model directory metadata |
+| `kore shard --model ./hf_model --output ./shards` | Shard HuggingFace safetensors into per-layer files |
+| `kore run --model model.koref --prompt "Hello"` | Local generation from a `.koref` model |
 | `kore bench --sizes 128,256,512` | Matrix multiply & Flash Attention benchmarks |
 | `kore train --steps 100 --lr 0.001 --scheduler warmup_cosine` | Demo training loop with LR schedulers |
 | `kore serve --addr 0.0.0.0:8080` | OpenAI-compatible inference server (model-agnostic) |
@@ -255,17 +302,17 @@ See `kore_serve::layered` for the full API.
 |-------|-------------|
 | `kore-core` | Tensor, DType, Device, Storage, shape ops, SIMD |
 | `kore-autograd` | Computation graph, backward pass, gradient tape |
-| `kore-nn` | Module trait, Linear, Conv, LayerNorm, RMSNorm, BitLinear, QuatLinear, LoRA, SqueezeNet, Sampler |
+| `kore-nn` | Module trait, Sequential, ModuleList, Trainer, Linear, Conv, LayerNorm, RMSNorm, BitLinear, QuatLinear, LoRA, SqueezeNet, Sampler |
 | `kore-optim` | SGD, Adam, LR schedulers (cosine, warmup, one-cycle, step), gradient clipping |
 | `kore-btes` | Binary/Ternary/Quaternary encoding, VT-ALU, matmul |
 | `kore-kernels` | CUDA kernels (cudarc + PTX), ROCm/HIP, CPU SIMD (AVX2, NEON) |
 | `kore-clifford` | Geometric algebra engine |
 | `kore-attention` | Flash Attention, paged KV-cache |
 | `kore-edge` | No-std inference runtime: WASM, iOS, Android |
-| `kore-data` | StreamingDataset, MultipackSampler, TokenBatcher |
+| `kore-data` | StreamingDataset, TensorDataset, DataLoader, MultipackSampler, TokenBatcher |
 | `kore-serve` | Model-agnostic inference server (axum, OpenAI-compatible) |
-| `kore-python` | PyO3 bindings — `import kore` (maturin) |
-| `kore-cli` | CLI: info, bench, train, serve, export |
+| `kore-python` | PyO3 bindings — `import kore` with nn, optim, data, training submodules |
+| `kore-cli` | CLI: info, inspect, shard, run, bench, train, serve, export |
 
 ---
 
