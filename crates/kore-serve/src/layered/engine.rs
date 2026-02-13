@@ -111,8 +111,15 @@ impl KvCache {
     ///
     /// Returns tensors covering all cached positions for this layer.
     pub fn update(&mut self, layer: usize, new_k: Tensor, new_v: Tensor) -> Result<(Tensor, Tensor), String> {
-        let new_tokens = new_k.shape().dims()[0];
-        let dim = new_k.shape().dims().get(1).copied().unwrap_or(new_k.numel() / new_tokens.max(1));
+        let dims = new_k.shape().dims();
+        if dims.len() != 2 {
+            return Err(format!(
+                "KV cache: expected 2D tensor [seq_len, kv_dim], got shape {:?}",
+                dims
+            ));
+        }
+        let new_tokens = dims[0];
+        let dim = dims[1];
 
         let entry = &mut self.layers[layer];
         entry.ensure_capacity(self.max_seq_len, dim);
@@ -162,6 +169,9 @@ pub struct LayeredEngine {
     cache: Arc<LayerCache>,
     /// Persistent KV cache used across generation steps.
     kv_cache: KvCache,
+    /// Pre-computed RoPE inverse frequencies: `1 / (base^(2i / head_dim))`
+    /// for `i` in `0..head_dim/2`. Computed once; reused every token.
+    rope_inv_freq: Vec<f32>,
 }
 
 impl LayeredEngine {
@@ -192,10 +202,14 @@ impl LayeredEngine {
 
         let kv_cache = KvCache::new(config.num_layers, config.max_seq_len);
 
+        let head_dim = config.d_model / config.num_heads;
+        let rope_inv_freq = precompute_rope_inv_freq(head_dim, config.rope_theta);
+
         Ok(Self {
             config,
             cache: Arc::new(cache),
             kv_cache,
+            rope_inv_freq,
         })
     }
 
@@ -267,6 +281,7 @@ impl LayeredEngine {
                 i,
                 start_pos,
                 &mut self.kv_cache,
+                &self.rope_inv_freq,
             )?;
 
             drop(layer_weights);
@@ -437,6 +452,7 @@ fn apply_transformer_block(
     layer_idx: usize,
     start_pos: usize,
     kv_cache: &mut KvCache,
+    rope_inv_freq: &[f32],
 ) -> Result<Tensor, String> {
     let d = config.d_model;
     let eps = config.norm_eps;
@@ -444,7 +460,6 @@ fn apply_transformer_block(
     let n_kv_heads = config.num_kv_heads;
     let head_dim = d / n_heads;
     let intermediate = config.intermediate_size;
-    let rope_theta = config.rope_theta;
 
     // ── Pre-attention norm ─────────────────────────────────────
     let attn_norm = build_rms_norm(weights, "input_layernorm.weight", d, eps)?;
@@ -468,12 +483,12 @@ fn apply_transformer_block(
     let k_new_heads = split_heads(&k_new, n_kv_heads, head_dim, seq_len);
     let v_new_heads = split_heads(&v_new, n_kv_heads, head_dim, seq_len);
 
-    // Apply RoPE to Q and K heads
+    // Apply RoPE to Q and K heads (using pre-computed inverse frequencies)
     let q_heads: Vec<Tensor> = q_heads.into_iter()
-        .map(|h| apply_rope(&h, start_pos, head_dim, rope_theta))
+        .map(|h| apply_rope(&h, start_pos, head_dim, rope_inv_freq))
         .collect();
     let k_new_heads: Vec<Tensor> = k_new_heads.into_iter()
-        .map(|h| apply_rope(&h, start_pos, head_dim, rope_theta))
+        .map(|h| apply_rope(&h, start_pos, head_dim, rope_inv_freq))
         .collect();
 
     // Reassemble K for KV cache update: [seq_len, n_kv_heads * head_dim]
@@ -577,23 +592,30 @@ fn concat_heads(heads: &[Tensor], seq_len: usize, n_heads: usize, head_dim: usiz
     Tensor::from_f32(&result, &[seq_len, total_dim])
 }
 
+/// Pre-compute the RoPE inverse frequency table for a given `head_dim` and `base`.
+///
+/// Returns `head_dim / 2` frequencies: `1 / (base^(2i / head_dim))`.
+/// This only needs to be computed once per engine lifetime.
+fn precompute_rope_inv_freq(head_dim: usize, base: f32) -> Vec<f32> {
+    (0..head_dim / 2)
+        .map(|i| 1.0 / base.powf(2.0 * i as f32 / head_dim as f32))
+        .collect()
+}
+
 /// Apply Rotary Position Embedding (RoPE) to a single head tensor
 /// of shape `[seq_len, head_dim]`.
 ///
-/// Each consecutive pair of dimensions is rotated by an angle that depends
-/// on the absolute position and the dimension index:
-///   `theta_i = 1 / (base^(2i / head_dim))`
-///   `x_rot[2i]   = x[2i]   * cos(pos * theta_i) - x[2i+1] * sin(pos * theta_i)`
-///   `x_rot[2i+1] = x[2i]   * sin(pos * theta_i) + x[2i+1] * cos(pos * theta_i)`
-fn apply_rope(x: &Tensor, start_pos: usize, head_dim: usize, base: f32) -> Tensor {
+/// Uses a pre-computed `inv_freq` table (from [`precompute_rope_inv_freq`])
+/// so that no `powf` calls happen on the hot path — only `sin`/`cos` of
+/// the position-dependent angles.
+fn apply_rope(x: &Tensor, start_pos: usize, head_dim: usize, inv_freq: &[f32]) -> Tensor {
     let data = x.as_f32_slice().expect("apply_rope: F32 required");
     let seq_len = x.shape().dims()[0];
     let mut result = vec![0.0f32; data.len()];
 
     for pos_idx in 0..seq_len {
         let abs_pos = (start_pos + pos_idx) as f32;
-        for pair in 0..head_dim / 2 {
-            let freq = 1.0 / base.powf(2.0 * pair as f32 / head_dim as f32);
+        for (pair, &freq) in inv_freq.iter().enumerate() {
             let angle = abs_pos * freq;
             let cos_val = angle.cos();
             let sin_val = angle.sin();
@@ -802,8 +824,9 @@ mod tests {
     #[test]
     fn test_rope_identity_at_pos_zero() {
         // At position 0, all angles are 0 → cos=1, sin=0 → no rotation
+        let inv_freq = precompute_rope_inv_freq(4, 10000.0);
         let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
-        let rotated = apply_rope(&x, 0, 4, 10000.0);
+        let rotated = apply_rope(&x, 0, 4, &inv_freq);
         let data = rotated.as_f32_slice().unwrap();
         assert!((data[0] - 1.0).abs() < 1e-5);
         assert!((data[1] - 2.0).abs() < 1e-5);
@@ -814,10 +837,11 @@ mod tests {
     #[test]
     fn test_rope_preserves_norm() {
         // RoPE is a rotation, so it should preserve the L2 norm
+        let inv_freq = precompute_rope_inv_freq(4, 10000.0);
         let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
         let norm_before: f32 = x.as_f32_slice().unwrap().iter().map(|v| v * v).sum::<f32>().sqrt();
 
-        let rotated = apply_rope(&x, 42, 4, 10000.0);
+        let rotated = apply_rope(&x, 42, 4, &inv_freq);
         let norm_after: f32 = rotated.as_f32_slice().unwrap().iter().map(|v| v * v).sum::<f32>().sqrt();
 
         assert!((norm_before - norm_after).abs() < 1e-4, "RoPE should preserve norm: {} vs {}", norm_before, norm_after);
@@ -825,13 +849,26 @@ mod tests {
 
     #[test]
     fn test_rope_different_positions_differ() {
+        let inv_freq = precompute_rope_inv_freq(4, 10000.0);
         let x = Tensor::from_f32(&[1.0, 0.0, 1.0, 0.0], &[1, 4]);
-        let r0 = apply_rope(&x, 0, 4, 10000.0);
-        let r5 = apply_rope(&x, 5, 4, 10000.0);
+        let r0 = apply_rope(&x, 0, 4, &inv_freq);
+        let r5 = apply_rope(&x, 5, 4, &inv_freq);
         let d0 = r0.as_f32_slice().unwrap();
         let d5 = r5.as_f32_slice().unwrap();
         // They should differ (rotation at different positions)
         assert!((d0[0] - d5[0]).abs() > 1e-4 || (d0[1] - d5[1]).abs() > 1e-4);
+    }
+
+    #[test]
+    fn test_precompute_rope_inv_freq() {
+        let inv_freq = precompute_rope_inv_freq(8, 10000.0);
+        assert_eq!(inv_freq.len(), 4); // head_dim/2
+        // First freq = 1 / 10000^0 = 1.0
+        assert!((inv_freq[0] - 1.0).abs() < 1e-6);
+        // Each subsequent freq should be smaller
+        for i in 1..inv_freq.len() {
+            assert!(inv_freq[i] < inv_freq[i - 1]);
+        }
     }
 
     #[test]

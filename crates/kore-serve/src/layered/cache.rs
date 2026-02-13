@@ -84,22 +84,33 @@ impl LruList {
     }
 
     /// Move an existing node to the tail (MRU). O(1).
+    ///
+    /// Directly unlinks and relinks without touching the free list.
     fn move_to_back(&mut self, idx: usize) {
         if idx == self.tail {
             return; // already MRU
         }
-        self.remove(idx);
-        // Re-insert at tail (reuse the slot directly)
+
+        // Unlink from current position
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+
+        if prev != NONE {
+            self.nodes[prev].next = next;
+        } else {
+            self.head = next;
+        }
+        if next != NONE {
+            self.nodes[next].prev = prev;
+        }
+        // Note: idx != self.tail is guaranteed by the early return above,
+        // so `next` is always valid and we don't need to update self.tail here.
+
+        // Link at tail
         self.nodes[idx].prev = self.tail;
         self.nodes[idx].next = NONE;
-        // Reclaim from free list since we're reusing it
-        if let Some(pos) = self.free.iter().position(|&f| f == idx) {
-            self.free.swap_remove(pos);
-        }
         if self.tail != NONE {
             self.nodes[self.tail].next = idx;
-        } else {
-            self.head = idx;
         }
         self.tail = idx;
     }

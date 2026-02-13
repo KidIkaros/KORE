@@ -194,8 +194,11 @@ impl LayerPrefetcher {
         let profiling = self.profiling;
         let profile = self.profile.clone();
 
-        handle.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
+        // Capture the JoinHandle so task panics are detected.
+        // If the outer spawn panics or is cancelled, `tx` is dropped and
+        // the receiver gets a clear error instead of hanging indefinitely.
+        let _join = handle.spawn(async move {
+            let result = match tokio::task::spawn_blocking(move || {
                 let t_start = std::time::Instant::now();
                 let weights = load_layer_from_disk(&shard_dir, &layer_name);
                 if profiling {
@@ -205,10 +208,13 @@ impl LayerPrefetcher {
                 weights
             })
             .await
-            .map_err(|e| format!("spawn_blocking failed: {e}"))?;
+            {
+                Ok(inner) => inner,
+                Err(e) => Err(format!("prefetch task for layer {idx} panicked or was cancelled: {e}")),
+            };
 
+            // If the receiver has been dropped (e.g. caller timed out), this is a no-op.
             let _ = tx.send(result);
-            Ok::<(), String>(())
         });
     }
 }
