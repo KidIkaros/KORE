@@ -20,6 +20,60 @@ use super::cache::{LayerCache, LayerWeights};
 use super::config::LayeredConfig;
 use super::prefetcher::LayerPrefetcher;
 
+/// KV cache for autoregressive generation.
+///
+/// Stores the key and value tensors for each transformer layer so that
+/// previously computed positions do not need to be recomputed. Each entry
+/// holds a tensor of shape `[cached_seq_len, n_kv_heads * head_dim]`.
+#[derive(Debug, Clone)]
+pub struct KvCache {
+    /// Per-layer key cache.
+    k: Vec<Option<Tensor>>,
+    /// Per-layer value cache.
+    v: Vec<Option<Tensor>>,
+}
+
+impl KvCache {
+    /// Create an empty KV cache for `num_layers` transformer layers.
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            k: vec![None; num_layers],
+            v: vec![None; num_layers],
+        }
+    }
+
+    /// Append new key/value tensors for a given layer, concatenating with
+    /// any previously cached values along the sequence dimension (axis 0).
+    pub fn update(&mut self, layer: usize, new_k: Tensor, new_v: Tensor) -> Result<(Tensor, Tensor), String> {
+        let full_k = match self.k[layer].take() {
+            Some(prev) => Tensor::cat(&[&prev, &new_k], 0)
+                .map_err(|e| format!("kv cache cat k: {e}"))?,
+            None => new_k,
+        };
+        let full_v = match self.v[layer].take() {
+            Some(prev) => Tensor::cat(&[&prev, &new_v], 0)
+                .map_err(|e| format!("kv cache cat v: {e}"))?,
+            None => new_v,
+        };
+        self.k[layer] = Some(full_k.clone());
+        self.v[layer] = Some(full_v.clone());
+        Ok((full_k, full_v))
+    }
+
+    /// Clear the cache (e.g. between different prompts).
+    pub fn clear(&mut self) {
+        for slot in &mut self.k { *slot = None; }
+        for slot in &mut self.v { *slot = None; }
+    }
+
+    /// Number of cached positions (from the first populated layer).
+    pub fn seq_len(&self) -> usize {
+        self.k.iter()
+            .find_map(|opt| opt.as_ref().map(|t| t.shape().dims()[0]))
+            .unwrap_or(0)
+    }
+}
+
 /// Layered inference engine for running large models on limited VRAM.
 ///
 /// Instead of loading the entire model into memory, this engine loads one
@@ -42,6 +96,8 @@ use super::prefetcher::LayerPrefetcher;
 pub struct LayeredEngine {
     config: LayeredConfig,
     cache: Arc<LayerCache>,
+    /// Persistent KV cache used across generation steps.
+    kv_cache: KvCache,
 }
 
 impl LayeredEngine {
@@ -70,9 +126,12 @@ impl LayeredEngine {
             config.shard_dir.display(),
         );
 
+        let kv_cache = KvCache::new(config.num_layers);
+
         Ok(Self {
             config,
             cache: Arc::new(cache),
+            kv_cache,
         })
     }
 
@@ -88,12 +147,26 @@ impl LayeredEngine {
 
     /// Run a full forward pass through the model, producing logits.
     ///
+    /// Uses the internal KV cache — call [`Self::clear_kv_cache`] between
+    /// independent prompts. For the first call the full sequence is processed
+    /// (prefill); subsequent calls only process new tokens.
+    ///
     /// This is the core layer-by-layer inference loop:
     /// 1. Embed input tokens
     /// 2. For each transformer layer: load weights → compute → release
     /// 3. Apply final norm
     /// 4. Project to vocabulary (lm_head)
-    pub fn forward(&self, input_ids: &[usize]) -> Result<Vec<f32>, String> {
+    pub fn forward(&mut self, input_ids: &[usize]) -> Result<Vec<f32>, String> {
+        let start_pos = self.kv_cache.seq_len();
+        self.forward_inner(input_ids, start_pos)
+    }
+
+    /// Clear the KV cache (call between independent prompts).
+    pub fn clear_kv_cache(&mut self) {
+        self.kv_cache.clear();
+    }
+
+    fn forward_inner(&mut self, input_ids: &[usize], start_pos: usize) -> Result<Vec<f32>, String> {
         let layer_names = self.config.layer_names();
 
         let prefetcher = LayerPrefetcher::new(
@@ -111,7 +184,7 @@ impl LayeredEngine {
         drop(embed_weights);
         prefetcher.release(0);
 
-        tracing::debug!("embed → shape {:?}", hidden.shape().dims());
+        tracing::debug!("embed → shape {:?}, start_pos={}", hidden.shape().dims(), start_pos);
 
         // ── 2. Transformer layers ─────────────────────────────────
         let mut hidden = hidden;
@@ -124,6 +197,8 @@ impl LayeredEngine {
                 &hidden,
                 &self.config,
                 i,
+                start_pos,
+                &mut self.kv_cache,
             )?;
 
             drop(layer_weights);
@@ -165,15 +240,17 @@ impl LayeredEngine {
         let start = (seq_len - 1) * vocab;
         let end = start + vocab;
         if end > logits_data.len() {
-            // If shape is [seq_len, vocab], extract last row
-            // Otherwise return everything (single token case)
             Ok(logits_data[logits_data.len() - vocab..].to_vec())
         } else {
             Ok(logits_data[start..end].to_vec())
         }
     }
 
-    /// Autoregressive generation loop using layered forward passes.
+    /// Autoregressive generation loop using the KV cache.
+    ///
+    /// On the first step the entire prompt is processed (prefill).
+    /// Each subsequent step processes only the newly generated token,
+    /// reusing cached key/value tensors from previous positions.
     fn generate_tokens(
         &mut self,
         prompt_tokens: &[usize],
@@ -181,13 +258,14 @@ impl LayeredEngine {
         config: &SamplerConfig,
         rng: &mut Rng,
     ) -> Result<Vec<usize>, String> {
+        self.clear_kv_cache();
         let mut tokens = prompt_tokens.to_vec();
 
+        // Prefill: process full prompt
+        let logits = self.forward(&tokens)?;
+        let mut next_token = sampler::sample(&logits, &tokens, config, rng);
+
         for step in 0..max_tokens {
-            let logits = self.forward(&tokens)?;
-
-            let next_token = sampler::sample(&logits, &tokens, config, rng);
-
             // Check for EOS
             if let Some(eos) = config.eos_token_id {
                 if next_token == eos {
@@ -197,6 +275,10 @@ impl LayeredEngine {
             }
 
             tokens.push(next_token);
+
+            // Decode: only process the new token (KV cache has the rest)
+            let logits = self.forward(&[next_token])?;
+            next_token = sampler::sample(&logits, &tokens, config, rng);
         }
 
         Ok(tokens)
@@ -278,15 +360,15 @@ fn apply_embedding(
     Ok(embed.lookup(input_ids))
 }
 
-/// Apply a single transformer block (LLaMA-style: pre-norm → attn → residual → pre-norm → MLP → residual).
-///
-/// This is a simplified implementation suitable for demonstrating layered inference.
-/// For production, model-specific blocks should be implemented in the model crate (e.g. Xura).
+/// Apply a single transformer block (LLaMA-style):
+/// pre-norm → multi-head GQA attention with RoPE → residual → pre-norm → SwiGLU MLP → residual.
 fn apply_transformer_block(
     weights: &LayerWeights,
     hidden: &Tensor,
     config: &LayeredConfig,
-    _layer_idx: usize,
+    layer_idx: usize,
+    start_pos: usize,
+    kv_cache: &mut KvCache,
 ) -> Result<Tensor, String> {
     let d = config.d_model;
     let eps = config.norm_eps;
@@ -294,41 +376,90 @@ fn apply_transformer_block(
     let n_kv_heads = config.num_kv_heads;
     let head_dim = d / n_heads;
     let intermediate = config.intermediate_size;
+    let rope_theta = config.rope_theta;
 
     // ── Pre-attention norm ─────────────────────────────────────
     let attn_norm = build_rms_norm(weights, "input_layernorm.weight", d, eps)?;
     let normed = attn_norm.forward(hidden).map_err(|e| format!("attn norm: {e}"))?;
 
-    // ── Self-attention (simplified: Q·K^T·V, no KV cache, no RoPE) ──
+    // ── Self-attention with multi-head GQA, RoPE, and KV cache ──
     let q_proj = build_linear(weights, "self_attn.q_proj.weight", "self_attn.q_proj.bias", d, n_heads * head_dim)?;
     let k_proj = build_linear(weights, "self_attn.k_proj.weight", "self_attn.k_proj.bias", d, n_kv_heads * head_dim)?;
     let v_proj = build_linear(weights, "self_attn.v_proj.weight", "self_attn.v_proj.bias", d, n_kv_heads * head_dim)?;
     let o_proj = build_linear(weights, "self_attn.o_proj.weight", "self_attn.o_proj.bias", n_heads * head_dim, d)?;
 
-    let q = q_proj.forward(&normed).map_err(|e| format!("q_proj: {e}"))?;
-    let k = k_proj.forward(&normed).map_err(|e| format!("k_proj: {e}"))?;
-    let v = v_proj.forward(&normed).map_err(|e| format!("v_proj: {e}"))?;
+    // Project: [seq_len, d] → Q:[seq_len, n_heads*hd], K:[seq_len, n_kv*hd], V:[seq_len, n_kv*hd]
+    let q_full = q_proj.forward(&normed).map_err(|e| format!("q_proj: {e}"))?;
+    let k_new = k_proj.forward(&normed).map_err(|e| format!("k_proj: {e}"))?;
+    let v_new = v_proj.forward(&normed).map_err(|e| format!("v_proj: {e}"))?;
 
-    // Simplified attention: softmax(Q·K^T / sqrt(d_k)) · V
-    let scale = (head_dim as f32).sqrt();
-    let k_t = k.transpose().map_err(|e| format!("k transpose: {e}"))?;
-    let attn_scores = q.matmul(&k_t)
-        .map_err(|e| format!("QK matmul: {e}"))?;
-    let attn_scores = attn_scores.mul_scalar(1.0 / scale)
-        .map_err(|e| format!("attn scale: {e}"))?;
-    let attn_weights = attn_scores.softmax(-1).map_err(|e| format!("softmax: {e}"))?;
-    let attn_out = attn_weights.matmul(&v).map_err(|e| format!("attn·V: {e}"))?;
+    let seq_len = hidden.shape().dims()[0];
 
-    let attn_projected = o_proj.forward(&attn_out).map_err(|e| format!("o_proj: {e}"))?;
+    // Split into per-head tensors: each [seq_len, head_dim]
+    let q_heads = split_heads(&q_full, n_heads, head_dim, seq_len);
+    let k_new_heads = split_heads(&k_new, n_kv_heads, head_dim, seq_len);
+    let v_new_heads = split_heads(&v_new, n_kv_heads, head_dim, seq_len);
+
+    // Apply RoPE to Q and K heads
+    let q_heads: Vec<Tensor> = q_heads.into_iter()
+        .map(|h| apply_rope(&h, start_pos, head_dim, rope_theta))
+        .collect();
+    let k_new_heads: Vec<Tensor> = k_new_heads.into_iter()
+        .map(|h| apply_rope(&h, start_pos, head_dim, rope_theta))
+        .collect();
+
+    // Reassemble K for KV cache update: [seq_len, n_kv_heads * head_dim]
+    let k_new_assembled = concat_heads(&k_new_heads, seq_len, n_kv_heads, head_dim);
+    let v_new_assembled = concat_heads(&v_new_heads, seq_len, n_kv_heads, head_dim);
+
+    // Update KV cache: returns [full_seq_len, n_kv_heads * head_dim]
+    let (k_full, v_full) = kv_cache.update(layer_idx, k_new_assembled, v_new_assembled)?;
+    let full_seq_len = k_full.shape().dims()[0];
+
+    // Re-split full K and V into per-head tensors
+    let k_heads = split_heads(&k_full, n_kv_heads, head_dim, full_seq_len);
+    let v_heads = split_heads(&v_full, n_kv_heads, head_dim, full_seq_len);
+
+    // Compute attention per head with GQA
+    let heads_per_kv = n_heads / n_kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut attn_outputs = Vec::with_capacity(n_heads);
+
+    for (h, q_h) in q_heads.iter().enumerate() {
+        let kv_idx = h / heads_per_kv;
+        let k_h = &k_heads[kv_idx];    // [full_seq_len, head_dim]
+        let v_h = &v_heads[kv_idx];    // [full_seq_len, head_dim]
+
+        // scores = Q · K^T / sqrt(head_dim)  →  [seq_len, full_seq_len]
+        let k_t = k_h.transpose().map_err(|e| format!("k transpose h{h}: {e}"))?;
+        let scores = q_h.matmul(&k_t).map_err(|e| format!("QK h{h}: {e}"))?;
+        let scores = scores.mul_scalar(scale).map_err(|e| format!("scale h{h}: {e}"))?;
+
+        // Causal mask (only needed during prefill when seq_len > 1)
+        let scores = if seq_len > 1 {
+            apply_causal_mask(&scores, start_pos)?
+        } else {
+            scores
+        };
+
+        let weights = scores.softmax(-1).map_err(|e| format!("softmax h{h}: {e}"))?;
+        let out = weights.matmul(v_h).map_err(|e| format!("attn·V h{h}: {e}"))?;
+        attn_outputs.push(out);
+    }
+
+    // Concat heads → [seq_len, n_heads * head_dim]
+    let attn_concat = concat_heads(&attn_outputs, seq_len, n_heads, head_dim);
+
+    // Output projection
+    let attn_projected = o_proj.forward(&attn_concat).map_err(|e| format!("o_proj: {e}"))?;
 
     // Residual connection
     let hidden_post_attn = hidden.add(&attn_projected).map_err(|e| format!("attn residual: {e}"))?;
 
-    // ── Post-attention norm + MLP ──────────────────────────────
+    // ── Post-attention norm + SwiGLU MLP ──────────────────────
     let mlp_norm = build_rms_norm(weights, "post_attention_layernorm.weight", d, eps)?;
     let normed_mlp = mlp_norm.forward(&hidden_post_attn).map_err(|e| format!("mlp norm: {e}"))?;
 
-    // SwiGLU MLP: gate_proj, up_proj, down_proj
     let gate_proj = build_linear(weights, "mlp.gate_proj.weight", "mlp.gate_proj.bias", d, intermediate)?;
     let up_proj = build_linear(weights, "mlp.up_proj.weight", "mlp.up_proj.bias", d, intermediate)?;
     let down_proj = build_linear(weights, "mlp.down_proj.weight", "mlp.down_proj.bias", intermediate, d)?;
@@ -336,13 +467,102 @@ fn apply_transformer_block(
     let gate = gate_proj.forward(&normed_mlp).map_err(|e| format!("gate: {e}"))?;
     let up = up_proj.forward(&normed_mlp).map_err(|e| format!("up: {e}"))?;
 
-    // SiLU(gate) * up
     let gate_activated = silu(&gate);
     let mlp_inner = gate_activated.mul(&up).map_err(|e| format!("gate*up: {e}"))?;
     let mlp_out = down_proj.forward(&mlp_inner).map_err(|e| format!("down: {e}"))?;
 
-    // Residual
     hidden_post_attn.add(&mlp_out).map_err(|e| format!("mlp residual: {e}"))
+}
+
+// ============================================================================
+// Multi-head attention helpers
+// ============================================================================
+
+/// Split a projected tensor `[seq_len, n_heads * head_dim]` into per-head
+/// tensors, each of shape `[seq_len, head_dim]`.
+fn split_heads(tensor: &Tensor, n_heads: usize, head_dim: usize, seq_len: usize) -> Vec<Tensor> {
+    let data = tensor.as_f32_slice().expect("split_heads: F32 required");
+    let total_dim = n_heads * head_dim;
+    (0..n_heads).map(|h| {
+        let mut head_data = Vec::with_capacity(seq_len * head_dim);
+        for pos in 0..seq_len {
+            let start = pos * total_dim + h * head_dim;
+            head_data.extend_from_slice(&data[start..start + head_dim]);
+        }
+        Tensor::from_f32(&head_data, &[seq_len, head_dim])
+    }).collect()
+}
+
+/// Concatenate per-head tensors `[seq_len, head_dim]` back into
+/// `[seq_len, n_heads * head_dim]`.
+fn concat_heads(heads: &[Tensor], seq_len: usize, n_heads: usize, head_dim: usize) -> Tensor {
+    let total_dim = n_heads * head_dim;
+    let mut result = vec![0.0f32; seq_len * total_dim];
+    for (h, head) in heads.iter().enumerate() {
+        let data = head.as_f32_slice().expect("concat_heads: F32 required");
+        for pos in 0..seq_len {
+            let src = pos * head_dim;
+            let dst = pos * total_dim + h * head_dim;
+            result[dst..dst + head_dim].copy_from_slice(&data[src..src + head_dim]);
+        }
+    }
+    Tensor::from_f32(&result, &[seq_len, total_dim])
+}
+
+/// Apply Rotary Position Embedding (RoPE) to a single head tensor
+/// of shape `[seq_len, head_dim]`.
+///
+/// Each consecutive pair of dimensions is rotated by an angle that depends
+/// on the absolute position and the dimension index:
+///   `theta_i = 1 / (base^(2i / head_dim))`
+///   `x_rot[2i]   = x[2i]   * cos(pos * theta_i) - x[2i+1] * sin(pos * theta_i)`
+///   `x_rot[2i+1] = x[2i]   * sin(pos * theta_i) + x[2i+1] * cos(pos * theta_i)`
+fn apply_rope(x: &Tensor, start_pos: usize, head_dim: usize, base: f32) -> Tensor {
+    let data = x.as_f32_slice().expect("apply_rope: F32 required");
+    let seq_len = x.shape().dims()[0];
+    let mut result = vec![0.0f32; data.len()];
+
+    for pos_idx in 0..seq_len {
+        let abs_pos = (start_pos + pos_idx) as f32;
+        for pair in 0..head_dim / 2 {
+            let freq = 1.0 / base.powf(2.0 * pair as f32 / head_dim as f32);
+            let angle = abs_pos * freq;
+            let cos_val = angle.cos();
+            let sin_val = angle.sin();
+
+            let i = pos_idx * head_dim + 2 * pair;
+            let x0 = data[i];
+            let x1 = data[i + 1];
+            result[i] = x0 * cos_val - x1 * sin_val;
+            result[i + 1] = x0 * sin_val + x1 * cos_val;
+        }
+    }
+
+    Tensor::from_f32(&result, x.shape().dims())
+}
+
+/// Build a causal attention mask and apply it to `scores`.
+///
+/// `scores` has shape `[q_len, kv_len]` where `kv_len = start_pos + q_len`.
+/// Position `q_i` (absolute position `start_pos + q_i`) may only attend to
+/// key positions `≤ start_pos + q_i`, so the mask sets future entries to `-inf`.
+fn apply_causal_mask(scores: &Tensor, start_pos: usize) -> Result<Tensor, String> {
+    let dims = scores.shape().dims();
+    let q_len = dims[0];
+    let kv_len = dims[1];
+    let data = scores.as_f32_slice().ok_or("causal mask: F32 required")?;
+    let mut masked = data.to_vec();
+
+    for qi in 0..q_len {
+        let abs_pos = start_pos + qi;
+        for ki in 0..kv_len {
+            if ki > abs_pos {
+                masked[qi * kv_len + ki] = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    Ok(Tensor::from_f32(&masked, dims))
 }
 
 /// Apply RMS norm from raw weight bytes.
@@ -476,5 +696,134 @@ mod tests {
         let data = vec![0u8; 12]; // 3 f32s
         let result = bytes_to_tensor_f32(&data, &[2, 2]); // expects 4 f32s
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_split_concat_heads_roundtrip() {
+        // [2 positions, 4 heads * 3 head_dim = 12]
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        let t = Tensor::from_f32(&data, &[2, 12]);
+
+        let heads = split_heads(&t, 4, 3, 2);
+        assert_eq!(heads.len(), 4);
+        for h in &heads {
+            assert_eq!(h.shape().dims(), &[2, 3]);
+        }
+        // Head 0 should have cols [0..3] from each row
+        let h0 = heads[0].as_f32_slice().unwrap();
+        assert_eq!(h0, &[0.0, 1.0, 2.0, 12.0, 13.0, 14.0]);
+
+        let reconstructed = concat_heads(&heads, 2, 4, 3);
+        assert_eq!(reconstructed.shape().dims(), &[2, 12]);
+        let r = reconstructed.as_f32_slice().unwrap();
+        assert_eq!(r, &data);
+    }
+
+    #[test]
+    fn test_rope_identity_at_pos_zero() {
+        // At position 0, all angles are 0 → cos=1, sin=0 → no rotation
+        let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
+        let rotated = apply_rope(&x, 0, 4, 10000.0);
+        let data = rotated.as_f32_slice().unwrap();
+        assert!((data[0] - 1.0).abs() < 1e-5);
+        assert!((data[1] - 2.0).abs() < 1e-5);
+        assert!((data[2] - 3.0).abs() < 1e-5);
+        assert!((data[3] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rope_preserves_norm() {
+        // RoPE is a rotation, so it should preserve the L2 norm
+        let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
+        let norm_before: f32 = x.as_f32_slice().unwrap().iter().map(|v| v * v).sum::<f32>().sqrt();
+
+        let rotated = apply_rope(&x, 42, 4, 10000.0);
+        let norm_after: f32 = rotated.as_f32_slice().unwrap().iter().map(|v| v * v).sum::<f32>().sqrt();
+
+        assert!((norm_before - norm_after).abs() < 1e-4, "RoPE should preserve norm: {} vs {}", norm_before, norm_after);
+    }
+
+    #[test]
+    fn test_rope_different_positions_differ() {
+        let x = Tensor::from_f32(&[1.0, 0.0, 1.0, 0.0], &[1, 4]);
+        let r0 = apply_rope(&x, 0, 4, 10000.0);
+        let r5 = apply_rope(&x, 5, 4, 10000.0);
+        let d0 = r0.as_f32_slice().unwrap();
+        let d5 = r5.as_f32_slice().unwrap();
+        // They should differ (rotation at different positions)
+        assert!((d0[0] - d5[0]).abs() > 1e-4 || (d0[1] - d5[1]).abs() > 1e-4);
+    }
+
+    #[test]
+    fn test_causal_mask_blocks_future() {
+        // scores: [3, 3] — 3 query positions, 3 key positions, start_pos=0
+        let scores = Tensor::from_f32(&[1.0; 9], &[3, 3]);
+        let masked = apply_causal_mask(&scores, 0).unwrap();
+        let data = masked.as_f32_slice().unwrap();
+        // Row 0 (pos 0): can see [0], not [1,2]
+        assert_eq!(data[0], 1.0);
+        assert_eq!(data[1], f32::NEG_INFINITY);
+        assert_eq!(data[2], f32::NEG_INFINITY);
+        // Row 1 (pos 1): can see [0,1], not [2]
+        assert_eq!(data[3], 1.0);
+        assert_eq!(data[4], 1.0);
+        assert_eq!(data[5], f32::NEG_INFINITY);
+        // Row 2 (pos 2): can see [0,1,2]
+        assert_eq!(data[6], 1.0);
+        assert_eq!(data[7], 1.0);
+        assert_eq!(data[8], 1.0);
+    }
+
+    #[test]
+    fn test_causal_mask_with_start_pos() {
+        // 1 query at absolute position 5, 6 keys (positions 0..5)
+        let scores = Tensor::from_f32(&[1.0; 6], &[1, 6]);
+        let masked = apply_causal_mask(&scores, 5).unwrap();
+        let data = masked.as_f32_slice().unwrap();
+        // Position 5 can attend to all positions 0..5
+        assert!(data.iter().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn test_kv_cache_update_and_concat() {
+        let mut kv = KvCache::new(2);
+        assert_eq!(kv.seq_len(), 0);
+
+        // First update: 3 positions
+        let k1 = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]);
+        let v1 = Tensor::from_f32(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[3, 2]);
+        let (fk, fv) = kv.update(0, k1, v1).unwrap();
+        assert_eq!(fk.shape().dims(), &[3, 2]);
+        assert_eq!(fv.shape().dims(), &[3, 2]);
+        assert_eq!(kv.seq_len(), 3);
+
+        // Second update: 1 more position
+        let k2 = Tensor::from_f32(&[7.0, 8.0], &[1, 2]);
+        let v2 = Tensor::from_f32(&[70.0, 80.0], &[1, 2]);
+        let (fk, fv) = kv.update(0, k2, v2).unwrap();
+        assert_eq!(fk.shape().dims(), &[4, 2]);
+        assert_eq!(fv.shape().dims(), &[4, 2]);
+        assert_eq!(kv.seq_len(), 4);
+
+        // Verify concatenated data
+        let kd = fk.as_f32_slice().unwrap();
+        assert_eq!(kd, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+
+        // Clear
+        kv.clear();
+        assert_eq!(kv.seq_len(), 0);
+    }
+
+    #[test]
+    fn test_gqa_head_mapping() {
+        // n_heads=4, n_kv_heads=2 → heads_per_kv=2
+        // Q heads 0,1 should map to KV head 0; Q heads 2,3 to KV head 1
+        let n_heads = 4;
+        let n_kv_heads = 2;
+        let heads_per_kv = n_heads / n_kv_heads;
+        assert_eq!(0 / heads_per_kv, 0);
+        assert_eq!(1 / heads_per_kv, 0);
+        assert_eq!(2 / heads_per_kv, 1);
+        assert_eq!(3 / heads_per_kv, 1);
     }
 }

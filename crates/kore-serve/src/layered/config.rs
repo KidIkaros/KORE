@@ -36,6 +36,9 @@ pub struct LayeredConfig {
     /// RMS norm epsilon.
     pub norm_eps: f32,
 
+    /// RoPE base frequency (theta). Default: 10000.0 for LLaMA.
+    pub rope_theta: f32,
+
     /// Fraction of available RAM to use for layer caching (0.0–1.0).
     /// Set to 0.0 to disable caching.
     pub cache_fraction: f32,
@@ -70,6 +73,7 @@ impl LayeredConfig {
             intermediate_size,
             max_seq_len: 2048,
             norm_eps: 1e-5,
+            rope_theta: 10000.0,
             cache_fraction: 0.3,
             prefetch_lookahead: 2,
             embed_name: "model.embed_tokens".into(),
@@ -102,6 +106,9 @@ impl LayeredConfig {
         let norm_eps = json.get("rms_norm_eps")
             .and_then(|v| v.as_f64())
             .unwrap_or(1e-5) as f32;
+        let rope_theta = json.get("rope_theta")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10000.0) as f32;
 
         Some(Self {
             shard_dir,
@@ -113,6 +120,7 @@ impl LayeredConfig {
             intermediate_size,
             max_seq_len,
             norm_eps,
+            rope_theta,
             cache_fraction: 0.3,
             prefetch_lookahead: 2,
             embed_name: "model.embed_tokens".into(),

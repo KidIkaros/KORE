@@ -31,4 +31,4 @@ pub mod engine;
 pub use config::LayeredConfig;
 pub use cache::LayerCache;
 pub use prefetcher::LayerPrefetcher;
-pub use engine::LayeredEngine;
+pub use engine::{LayeredEngine, KvCache};
