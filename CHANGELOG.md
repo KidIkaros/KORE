@@ -2,7 +2,7 @@
 
 All notable changes to KORE will be documented in this file.
 
-## [0.2.0] — 2025-07-11
+## [0.2.0] — 2026-02-12
 
 ### Architecture Refactor — Pure ML Engine
 
@@ -47,5 +47,5 @@ First hardened release of the KORE ML Training Framework.
 - `Result`-based error propagation throughout core/nn/optim crates
 
 ### Stats
-- **588 tests passing**, zero failures
-- 16 crates, 59 files changed, +12,136 lines
+- **439 tests passing**, zero failures
+- 13 crates, 59 files changed, +12,136 lines
