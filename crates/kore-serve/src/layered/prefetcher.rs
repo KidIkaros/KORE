@@ -229,7 +229,7 @@ impl std::fmt::Display for PrefetcherStats {
 ///
 /// Expects the file at `<shard_dir>/<layer_name>.safetensors`.
 pub fn load_layer_from_disk(shard_dir: &Path, layer_name: &str) -> Result<LayerWeights, String> {
-    let safe_name = layer_name.replace('.', "_");
+    let safe_name = sanitize_layer_name(layer_name);
     let path = shard_dir.join(format!("{safe_name}.safetensors"));
 
     if !path.exists() {
@@ -247,5 +247,17 @@ pub fn load_layer_from_disk(shard_dir: &Path, layer_name: &str) -> Result<LayerW
         weights.push((name.to_string(), view.data().to_vec()));
     }
 
-    Ok(weights)
+    Ok(Arc::new(weights))
+}
+
+/// Sanitize a layer name into a filesystem-safe filename component.
+///
+/// Replaces dots, slashes, colons, and other unsafe characters with underscores.
+fn sanitize_layer_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '.' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' => '_',
+            _ => c,
+        })
+        .collect()
 }

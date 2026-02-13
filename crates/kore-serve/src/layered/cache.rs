@@ -6,10 +6,14 @@
 //! disk I/O.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use parking_lot::Mutex;
 
 /// A single cached layer: mapping from parameter name to raw weight bytes.
-pub type LayerWeights = Vec<(String, Vec<u8>)>;
+///
+/// Wrapped in `Arc` to allow cheap cloning when layers are shared between
+/// the cache, prefetcher, and engine without duplicating multi-GB buffers.
+pub type LayerWeights = Arc<Vec<(String, Vec<u8>)>>;
 
 /// LRU cache for layer state dicts in RAM.
 ///
@@ -114,16 +118,16 @@ impl LayerCache {
             // Move to end (most recently used)
             let entry = inner.entries.remove(idx);
             let weights = entry.weights.clone();
+            let new_idx = inner.entries.len();
             inner.entries.push(entry);
-            // Rebuild index: collect names first to avoid split borrow
-            let new_index: Vec<(String, usize)> = inner.entries.iter()
-                .enumerate()
-                .map(|(i, e)| (e.name.clone(), i))
+            // Incremental index update: only entries that shifted down
+            let shifted: Vec<(String, usize)> = (idx..new_idx)
+                .map(|i| (inner.entries[i].name.clone(), i))
                 .collect();
-            inner.index.clear();
-            for (name, i) in new_index {
+            for (name, i) in shifted {
                 inner.index.insert(name, i);
             }
+            inner.index.insert(layer_name.to_string(), new_idx);
             Some(weights)
         } else {
             inner.misses += 1;
@@ -149,13 +153,12 @@ impl LayerCache {
             let evicted = inner.entries.remove(0);
             inner.current_bytes = inner.current_bytes.saturating_sub(evicted.size_bytes);
             inner.index.remove(&evicted.name);
-            // Rebuild index
-            let new_index: Vec<(String, usize)> = inner.entries.iter()
+            // Incremental index update: all entries shifted down by 1
+            let shifted: Vec<(String, usize)> = inner.entries.iter()
                 .enumerate()
                 .map(|(i, e)| (e.name.clone(), i))
                 .collect();
-            inner.index.clear();
-            for (name, i) in new_index {
+            for (name, i) in shifted {
                 inner.index.insert(name, i);
             }
         }
@@ -234,7 +237,7 @@ fn needs_eviction(inner: &CacheInner, new_size: usize) -> bool {
 }
 
 fn estimate_weights_size(weights: &LayerWeights) -> usize {
-    weights.iter().map(|(name, data)| name.len() + data.len()).sum()
+    weights.as_ref().iter().map(|(name, data)| name.len() + data.len()).sum()
 }
 
 fn available_ram_bytes() -> usize {
@@ -252,9 +255,9 @@ mod tests {
     fn test_cache_put_get() {
         let cache = LayerCache::new(2);
 
-        let w1 = vec![("w.weight".into(), vec![1u8; 100])];
-        let w2 = vec![("w.weight".into(), vec![2u8; 100])];
-        let w3 = vec![("w.weight".into(), vec![3u8; 100])];
+        let w1 = Arc::new(vec![("w.weight".into(), vec![1u8; 100])]);
+        let w2 = Arc::new(vec![("w.weight".into(), vec![2u8; 100])]);
+        let w3 = Arc::new(vec![("w.weight".into(), vec![3u8; 100])]);
 
         cache.put("layer.0".into(), w1.clone());
         cache.put("layer.1".into(), w2.clone());
@@ -273,9 +276,9 @@ mod tests {
     fn test_cache_lru_order() {
         let cache = LayerCache::new(2);
 
-        let w1 = vec![("w".into(), vec![1u8; 10])];
-        let w2 = vec![("w".into(), vec![2u8; 10])];
-        let w3 = vec![("w".into(), vec![3u8; 10])];
+        let w1 = Arc::new(vec![("w".into(), vec![1u8; 10])]);
+        let w2 = Arc::new(vec![("w".into(), vec![2u8; 10])]);
+        let w3 = Arc::new(vec![("w".into(), vec![3u8; 10])]);
 
         cache.put("a".into(), w1);
         cache.put("b".into(), w2);
@@ -293,7 +296,7 @@ mod tests {
     #[test]
     fn test_cache_stats() {
         let cache = LayerCache::new(4);
-        cache.put("x".into(), vec![("w".into(), vec![0u8; 50])]);
+        cache.put("x".into(), Arc::new(vec![("w".into(), vec![0u8; 50])]));
 
         let _ = cache.get("x"); // hit
         let _ = cache.get("y"); // miss

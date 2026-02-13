@@ -220,12 +220,23 @@ impl InferenceModel for LayeredEngine {
 // ============================================================================
 
 /// Synchronously load a layer from the prefetcher (blocks on the async channel).
+///
+/// If a Tokio runtime is available, uses `block_in_place` to avoid blocking
+/// the async executor. Otherwise, creates a temporary runtime for the load.
 fn load_layer_sync(prefetcher: &LayerPrefetcher, idx: usize) -> Result<LayerWeights, String> {
-    // Use a minimal tokio runtime to bridge async→sync.
-    // This is safe because we're inside a spawn_blocking context or single-threaded.
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(prefetcher.get_layer(idx))
-    })
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(prefetcher.get_layer(idx)))
+        }
+        Err(_) => {
+            // No active runtime — spin up a lightweight one for this call.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
+            rt.block_on(prefetcher.get_layer(idx))
+        }
+    }
 }
 
 /// Convert raw weight bytes (F32 little-endian) into a kore Tensor.
@@ -383,11 +394,8 @@ fn build_rms_norm(
 ) -> Result<RMSNorm, String> {
     let w_data = find_weight(weights, suffix)
         .ok_or_else(|| format!("missing norm weight '{suffix}'"))?;
-    let _w = bytes_to_tensor_f32(w_data, &[dim])?;
-    // RMSNorm::new creates with ones; we need to set the actual gamma.
-    // For now, create and trust that the weights match.
-    // TODO: Add RMSNorm::from_weight(gamma, eps) constructor upstream.
-    Ok(RMSNorm::new(dim, eps))
+    let gamma = bytes_to_tensor_f32(w_data, &[dim])?;
+    Ok(RMSNorm::from_weight(gamma, eps))
 }
 
 fn build_linear(
@@ -407,11 +415,18 @@ fn build_linear(
     Ok(Linear::from_weight(w, bias))
 }
 
-/// SiLU activation: x * sigmoid(x)
+/// SiLU activation: x * sigmoid(x), numerically stable for large |x|.
 fn silu(x: &Tensor) -> Tensor {
     let data = x.as_f32_slice().expect("silu: input must be F32");
     let result: Vec<f32> = data.iter()
-        .map(|&v| v * (1.0 / (1.0 + (-v).exp())))
+        .map(|&v| {
+            if v >= 0.0 {
+                v / (1.0 + (-v).exp())
+            } else {
+                let exp_v = v.exp();
+                (v * exp_v) / (1.0 + exp_v)
+            }
+        })
         .collect();
     Tensor::from_f32(&result, x.shape().dims())
 }

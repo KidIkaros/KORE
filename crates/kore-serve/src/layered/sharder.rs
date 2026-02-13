@@ -114,10 +114,16 @@ fn classify_tensor(
     // Fallback: use the first two segments as the key
     let parts: Vec<&str> = tensor_name.splitn(3, '.').collect();
     if parts.len() >= 2 {
+        tracing::warn!(
+            "tensor '{}' did not match any known layer pattern, grouping by prefix '{}.{}'",
+            tensor_name, parts[0], parts[1]
+        );
         format!("{}.{}", parts[0], parts[1])
     } else {
-        // Use first layer name as fallback to avoid silently dropping tensors
-        tracing::warn!("unclassified tensor: {tensor_name}, assigning to first layer");
+        tracing::warn!(
+            "tensor '{}' could not be classified, assigning to first layer",
+            tensor_name
+        );
         layer_names.first()
             .cloned()
             .unwrap_or_else(|| "unknown".to_string())
