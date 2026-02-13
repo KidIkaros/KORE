@@ -116,6 +116,24 @@ impl Trainer {
     /// Returns a `TrainHistory` with per-epoch metrics.
     pub fn fit(&mut self, train_loader: &DataLoader, epochs: usize) -> TrainHistory {
         self.model.train(true);
+
+        // Warn about non-trainable quantized weights (BitLinear/QuatLinear)
+        let num_trainable: usize = self.model.parameters()
+            .iter()
+            .map(|p| p.shape().dims().iter().product::<usize>())
+            .sum();
+        let num_quantized = self.model.num_quantized_params();
+        if num_quantized > 0 {
+            eprintln!(
+                "warning: model contains {} quantized (frozen) weight parameters \
+                 that cannot be updated via backpropagation. \
+                 Only {} differentiable parameters will be trained. \
+                 To train quantized layer weights, first train a full-precision \
+                 model then quantize with from_linear().",
+                num_quantized, num_trainable,
+            );
+        }
+
         let mut history = TrainHistory::new();
 
         for epoch in 0..epochs {

@@ -129,6 +129,10 @@ impl Module for ModuleList {
         offset
     }
 
+    fn num_quantized_params(&self) -> usize {
+        self.modules.iter().map(|m| m.num_quantized_params()).sum()
+    }
+
     fn train(&mut self, mode: bool) {
         self.training = mode;
         for module in &mut self.modules {

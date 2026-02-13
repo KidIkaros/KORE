@@ -34,6 +34,15 @@ pub trait Module: Send + Sync {
     /// Preserves all internal state including packed/quantized weights.
     fn clone_box(&self) -> Box<dyn Module>;
 
+    /// Number of non-differentiable (quantized/packed) weight elements in this module.
+    ///
+    /// Quantized layers like `BitLinear` and `QuatLinear` store weights in
+    /// packed integer formats that are not `Tensor` parameters and cannot be
+    /// updated via backpropagation. This method returns the count of such
+    /// elements so that callers (e.g. `Trainer`) can warn users about layers
+    /// whose weights are frozen during training. Default is 0.
+    fn num_quantized_params(&self) -> usize { 0 }
+
     /// Set training/eval mode.
     fn train(&mut self, _mode: bool) {}
 

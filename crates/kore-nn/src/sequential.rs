@@ -111,6 +111,10 @@ impl Module for Sequential {
         offset
     }
 
+    fn num_quantized_params(&self) -> usize {
+        self.layers.iter().map(|l| l.num_quantized_params()).sum()
+    }
+
     fn train(&mut self, mode: bool) {
         self.training = mode;
         for layer in &mut self.layers {

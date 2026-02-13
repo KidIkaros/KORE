@@ -10,6 +10,13 @@
 //!
 //! For QAT (Quantization-Aware Training), use `BitLinear::from_linear()` which
 //! quantizes an existing f32 Linear layer's weights to ternary.
+//!
+//! # Training
+//!
+//! **Quantized weights are frozen during backpropagation.** Only the optional
+//! bias parameter is a differentiable `Tensor` that the optimizer can update.
+//! To train the weight matrix, first train a full-precision `Linear` layer,
+//! then quantize it with `BitLinear::from_linear()`.
 
 use std::collections::HashMap;
 
@@ -255,6 +262,10 @@ impl Module for BitLinear {
             params.push(("bias".into(), b));
         }
         params
+    }
+
+    fn num_quantized_params(&self) -> usize {
+        self.in_features * self.out_features
     }
 
     fn set_parameters(&mut self, params: &[Tensor]) -> usize {
