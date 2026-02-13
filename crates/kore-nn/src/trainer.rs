@@ -215,14 +215,12 @@ impl Trainer {
             // copy-on-write overhead from Arc-based Tensor storage)
             let mut params_mut = self.model.parameters_mut();
 
-            // Optional gradient clipping
+            // Optional gradient clipping (in-place)
+            let mut grads = grads;
             if self.config.grad_clip_norm > 0.0 {
-                let mut clipped_grads = grads;
-                let _ = kore_optim::clip_grad_norm_(&mut clipped_grads, self.config.grad_clip_norm);
-                self.optimizer.step(&mut params_mut, &clipped_grads);
-            } else {
-                self.optimizer.step(&mut params_mut, &grads);
+                let _ = kore_optim::clip_grad_norm_(&mut grads, self.config.grad_clip_norm);
             }
+            self.optimizer.step(&mut params_mut, &grads);
 
             num_batches += 1;
             num_samples += batch.size;
