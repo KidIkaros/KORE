@@ -48,6 +48,10 @@ pub struct TrainerConfig {
     pub log_every: usize,
     /// Gradient clipping max norm (0.0 = no clipping).
     pub grad_clip_norm: f32,
+    /// Enable diagnostic messages (quantized-param warnings, etc.).
+    /// Set to `false` for production or notebook use where stderr output
+    /// is undesirable. Default: `true`.
+    pub verbose: bool,
 }
 
 impl Default for TrainerConfig {
@@ -55,6 +59,7 @@ impl Default for TrainerConfig {
         Self {
             log_every: 1,
             grad_clip_norm: 0.0,
+            verbose: true,
         }
     }
 }
@@ -118,20 +123,22 @@ impl Trainer {
         self.model.train(true);
 
         // Warn about non-trainable quantized weights (BitLinear/QuatLinear)
-        let num_trainable: usize = self.model.parameters()
-            .iter()
-            .map(|p| p.shape().dims().iter().product::<usize>())
-            .sum();
-        let num_quantized = self.model.num_quantized_params();
-        if num_quantized > 0 {
-            eprintln!(
-                "warning: model contains {} quantized (frozen) weight parameters \
-                 that cannot be updated via backpropagation. \
-                 Only {} differentiable parameters will be trained. \
-                 To train quantized layer weights, first train a full-precision \
-                 model then quantize with from_linear().",
-                num_quantized, num_trainable,
-            );
+        if self.config.verbose {
+            let num_trainable: usize = self.model.parameters()
+                .iter()
+                .map(|p| p.shape().dims().iter().product::<usize>())
+                .sum();
+            let num_quantized = self.model.num_quantized_params();
+            if num_quantized > 0 {
+                eprintln!(
+                    "warning: model contains {} quantized (frozen) weight parameters \
+                     that cannot be updated via backpropagation. \
+                     Only {} differentiable parameters will be trained. \
+                     To train quantized layer weights, first train a full-precision \
+                     model then quantize with from_linear().",
+                    num_quantized, num_trainable,
+                );
+            }
         }
 
         let mut history = TrainHistory::new();
@@ -346,7 +353,7 @@ mod tests {
             Box::new(Linear::new(4, 2, true)),
         ]);
         let optimizer = kore_optim::SGD::new(0.01, 0.0, 0.0);
-        let config = TrainerConfig { log_every: 0, grad_clip_norm: 0.0 };
+        let config = TrainerConfig { log_every: 0, grad_clip_norm: 0.0, verbose: false };
         let mut trainer = Trainer::new(model, optimizer, mse_loss, config);
 
         let x = Tensor::ones(&[8, 4]);
@@ -368,7 +375,7 @@ mod tests {
             Box::new(Linear::new(4, 2, true)),
         ]);
         let optimizer = kore_optim::SGD::new(0.01, 0.0, 0.0);
-        let config = TrainerConfig { log_every: 0, grad_clip_norm: 0.0 };
+        let config = TrainerConfig { log_every: 0, grad_clip_norm: 0.0, verbose: false };
         let mut trainer = Trainer::new(model, optimizer, mse_loss, config);
 
         let x = Tensor::ones(&[8, 4]);
@@ -386,7 +393,7 @@ mod tests {
             Box::new(Linear::new(4, 2, true)),
         ]);
         let optimizer = kore_optim::SGD::new(0.01, 0.0, 0.0);
-        let config = TrainerConfig { log_every: 0, grad_clip_norm: 0.0 };
+        let config = TrainerConfig { log_every: 0, grad_clip_norm: 0.0, verbose: false };
         let mut trainer = Trainer::new(model, optimizer, mse_loss, config);
 
         let x = Tensor::ones(&[8, 4]);

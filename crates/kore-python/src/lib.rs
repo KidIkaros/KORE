@@ -1117,13 +1117,14 @@ struct PyTrainer {
 #[pymethods]
 impl PyTrainer {
     #[new]
-    #[pyo3(signature = (model, optimizer, loss="mse", log_every=1, grad_clip_norm=0.0))]
+    #[pyo3(signature = (model, optimizer, loss="mse", log_every=1, grad_clip_norm=0.0, verbose=true))]
     fn new(
         model: &PySequential,
         optimizer: &Bound<'_, pyo3::types::PyAny>,
         loss: &str,
         log_every: usize,
         grad_clip_norm: f32,
+        verbose: bool,
     ) -> PyResult<Self> {
         // Deep-clone the model — preserves all internal state including
         // packed quantized weights for BitLinear/QuatLinear.
@@ -1156,7 +1157,7 @@ impl PyTrainer {
             )),
         };
 
-        let config = kore_nn::TrainerConfig { log_every, grad_clip_norm };
+        let config = kore_nn::TrainerConfig { log_every, grad_clip_norm, verbose };
         Ok(Self {
             inner: kore_nn::Trainer::new(seq, opt, loss_fn, config),
         })
