@@ -277,6 +277,9 @@ impl Conv2d {
     /// Padding.
     pub fn padding(&self) -> usize { self.padding }
 
+    /// Bias tensor (if present).
+    pub fn bias(&self) -> Option<&Tensor> { self.bias.as_ref() }
+
     /// Compute output dimensions.
     pub fn output_size(&self, in_h: usize, in_w: usize) -> kore_core::Result<(usize, usize)> {
         let padded_h = in_h + 2 * self.padding;

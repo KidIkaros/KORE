@@ -183,6 +183,16 @@ impl DataLoader {
         self.batch_size
     }
 
+    /// Current epoch counter (incremented each `iter()` call).
+    pub fn epoch(&self) -> u64 {
+        self.epoch_counter.get()
+    }
+
+    /// Set the epoch counter (useful when resuming training).
+    pub fn set_epoch(&self, epoch: u64) {
+        self.epoch_counter.set(epoch);
+    }
+
     /// Return an iterator over batches for one epoch.
     pub fn iter(&self) -> DataLoaderIter<'_> {
         let n = self.dataset.len();
