@@ -224,6 +224,7 @@ impl Trainer {
     ///
     /// Returns metrics with average loss over all batches.
     pub fn evaluate(&mut self, eval_loader: &DataLoader) -> EpochMetrics {
+        let was_training = self.model.is_training();
         self.model.train(false);
         let mut total_loss = 0.0f64;
         let mut num_batches = 0usize;
@@ -258,7 +259,7 @@ impl Trainer {
             num_samples += batch.size;
         }
 
-        self.model.train(true);
+        self.model.train(was_training);
 
         let avg_loss = if num_batches > 0 {
             (total_loss / num_batches as f64) as f32
@@ -271,6 +272,7 @@ impl Trainer {
 
     /// Run inference on all batches and collect predictions.
     pub fn predict(&mut self, loader: &DataLoader) -> Vec<Tensor> {
+        let was_training = self.model.is_training();
         self.model.train(false);
         let _no_grad = kore_core::autograd::NoGradGuard::new();
 
@@ -282,7 +284,7 @@ impl Trainer {
             }
         }
 
-        self.model.train(true);
+        self.model.train(was_training);
         predictions
     }
 
