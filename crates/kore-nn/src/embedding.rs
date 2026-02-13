@@ -104,6 +104,10 @@ impl Module for Embedding {
         vec![&self.weight]
     }
 
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        vec![&mut self.weight]
+    }
+
     fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         vec![("weight".into(), &self.weight)]
     }

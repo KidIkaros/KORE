@@ -89,6 +89,10 @@ impl Module for Sequential {
         self.layers.iter().flat_map(|m| m.parameters()).collect()
     }
 
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        self.layers.iter_mut().flat_map(|m| m.parameters_mut()).collect()
+    }
+
     fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = Vec::new();
         for (i, module) in self.layers.iter().enumerate() {

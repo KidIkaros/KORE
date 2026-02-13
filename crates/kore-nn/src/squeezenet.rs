@@ -125,6 +125,13 @@ impl Module for Fire {
         params
     }
 
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut params = self.squeeze.parameters_mut();
+        params.extend(self.expand1x1.parameters_mut());
+        params.extend(self.expand3x3.parameters_mut());
+        params
+    }
+
     fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = Vec::new();
         for (name, t) in self.squeeze.named_parameters() {
@@ -339,6 +346,20 @@ impl Module for SqueezeNet {
         params.extend(self.fire8.parameters());
         params.extend(self.fire9.parameters());
         params.extend(self.classifier_conv.parameters());
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut params = self.conv1.parameters_mut();
+        params.extend(self.fire2.parameters_mut());
+        params.extend(self.fire3.parameters_mut());
+        params.extend(self.fire4.parameters_mut());
+        params.extend(self.fire5.parameters_mut());
+        params.extend(self.fire6.parameters_mut());
+        params.extend(self.fire7.parameters_mut());
+        params.extend(self.fire8.parameters_mut());
+        params.extend(self.fire9.parameters_mut());
+        params.extend(self.classifier_conv.parameters_mut());
         params
     }
 

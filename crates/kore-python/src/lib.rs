@@ -753,7 +753,8 @@ impl PyAdam {
             let t: PyRef<'_, PyTensor> = item.extract()?;
             p.push(t.inner.clone());
         }
-        self.inner.step(&mut p, &g);
+        let mut refs: Vec<&mut kore_core::Tensor> = p.iter_mut().collect();
+        self.inner.step(&mut refs, &g);
         // Write updated tensors back into the Python objects
         for i in 0..len {
             let item = params.get_item(i)?;
@@ -795,7 +796,8 @@ impl PySGD {
             let t: PyRef<'_, PyTensor> = item.extract()?;
             p.push(t.inner.clone());
         }
-        self.inner.step(&mut p, &g);
+        let mut refs: Vec<&mut kore_core::Tensor> = p.iter_mut().collect();
+        self.inner.step(&mut refs, &g);
         for i in 0..len {
             let item = params.get_item(i)?;
             let mut t: PyRefMut<'_, PyTensor> = item.extract()?;

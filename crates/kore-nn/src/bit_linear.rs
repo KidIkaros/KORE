@@ -241,6 +241,14 @@ impl Module for BitLinear {
         params
     }
 
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut params = Vec::new();
+        if let Some(ref mut b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
     fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = Vec::new();
         if let Some(ref b) = self.bias {

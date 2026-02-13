@@ -20,7 +20,7 @@ use kore_core::Tensor;
 /// signature used by both `SGD` and `Adam`.
 pub trait Optimizer: Send {
     /// Perform one optimization step given current parameters and their gradients.
-    fn step(&mut self, params: &mut [Tensor], grads: &[Tensor]);
+    fn step(&mut self, params: &mut [&mut Tensor], grads: &[Tensor]);
 
     /// Get the current learning rate.
     fn lr(&self) -> f32;
@@ -30,7 +30,7 @@ pub trait Optimizer: Send {
 }
 
 impl Optimizer for SGD {
-    fn step(&mut self, params: &mut [Tensor], grads: &[Tensor]) {
+    fn step(&mut self, params: &mut [&mut Tensor], grads: &[Tensor]) {
         SGD::step(self, params, grads);
     }
     fn lr(&self) -> f32 { SGD::lr(self) }
@@ -38,7 +38,7 @@ impl Optimizer for SGD {
 }
 
 impl Optimizer for Adam {
-    fn step(&mut self, params: &mut [Tensor], grads: &[Tensor]) {
+    fn step(&mut self, params: &mut [&mut Tensor], grads: &[Tensor]) {
         Adam::step(self, params, grads);
     }
     fn lr(&self) -> f32 { Adam::lr(self) }
@@ -46,7 +46,7 @@ impl Optimizer for Adam {
 }
 
 impl Optimizer for Box<dyn Optimizer> {
-    fn step(&mut self, params: &mut [Tensor], grads: &[Tensor]) {
+    fn step(&mut self, params: &mut [&mut Tensor], grads: &[Tensor]) {
         (**self).step(params, grads);
     }
     fn lr(&self) -> f32 { (**self).lr() }

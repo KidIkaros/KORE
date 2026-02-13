@@ -35,7 +35,7 @@ impl SGD {
     /// Perform one optimization step.
     ///
     /// `params` and `grads` must be the same length and correspond 1:1.
-    pub fn step(&mut self, params: &mut [Tensor], grads: &[Tensor]) {
+    pub fn step(&mut self, params: &mut [&mut Tensor], grads: &[Tensor]) {
         if !self.initialized {
             self.velocities = grads
                 .iter()
@@ -91,7 +91,8 @@ mod tests {
         let grads = vec![Tensor::from_f32(&[0.1, 0.2, 0.3], &[3])];
 
         let mut opt = SGD::new(0.1, 0.0, 0.0);
-        opt.step(&mut params, &grads);
+        let mut refs: Vec<&mut Tensor> = params.iter_mut().collect();
+        opt.step(&mut refs, &grads);
 
         let data = params[0].as_f32_slice().unwrap();
         assert!((data[0] - 0.99).abs() < 1e-6);

@@ -114,6 +114,7 @@ impl Module for MaxPool2d {
     }
 
     fn parameters(&self) -> Vec<&Tensor> { vec![] }
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> { vec![] }
     fn named_parameters(&self) -> Vec<(String, &Tensor)> { vec![] }
 }
 
@@ -226,6 +227,7 @@ impl Module for AvgPool2d {
     }
 
     fn parameters(&self) -> Vec<&Tensor> { vec![] }
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> { vec![] }
     fn named_parameters(&self) -> Vec<(String, &Tensor)> { vec![] }
 }
 
@@ -320,6 +322,7 @@ impl Module for AdaptiveAvgPool2d {
     }
 
     fn parameters(&self) -> Vec<&Tensor> { vec![] }
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> { vec![] }
     fn named_parameters(&self) -> Vec<(String, &Tensor)> { vec![] }
 }
 

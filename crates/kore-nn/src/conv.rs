@@ -150,6 +150,14 @@ impl Module for Conv1d {
         params
     }
 
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut params = vec![&mut self.weight];
+        if let Some(ref mut b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
     fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = vec![("weight".into(), &self.weight)];
         if let Some(ref b) = self.bias {
@@ -379,6 +387,14 @@ impl Module for Conv2d {
     fn parameters(&self) -> Vec<&Tensor> {
         let mut params = vec![&self.weight];
         if let Some(ref b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut params = vec![&mut self.weight];
+        if let Some(ref mut b) = self.bias {
             params.push(b);
         }
         params

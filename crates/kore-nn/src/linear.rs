@@ -95,6 +95,14 @@ impl Module for Linear {
         params
     }
 
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut params = vec![&mut self.weight];
+        if let Some(ref mut b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
     fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = vec![("weight".into(), &self.weight)];
         if let Some(ref b) = self.bias {

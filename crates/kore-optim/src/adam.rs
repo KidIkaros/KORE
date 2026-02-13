@@ -87,7 +87,7 @@ impl Adam {
     pub fn step_count(&self) -> usize { self.t }
 
     /// Perform one optimization step (all params use global hyperparameters).
-    pub fn step(&mut self, params: &mut [Tensor], grads: &[Tensor]) {
+    pub fn step(&mut self, params: &mut [&mut Tensor], grads: &[Tensor]) {
         if !self.initialized {
             self.m = grads
                 .iter()
@@ -149,7 +149,7 @@ impl Adam {
     /// Parameters not in any group are skipped.
     pub fn step_groups(
         &mut self,
-        params: &mut [Tensor],
+        params: &mut [&mut Tensor],
         grads: &[Tensor],
         groups: &[ParamGroup],
     ) {
@@ -244,7 +244,8 @@ mod tests {
         let grads = vec![Tensor::from_f32(&[0.1, 0.2, 0.3], &[3])];
 
         let mut opt = Adam::default_with_lr(0.001);
-        opt.step(&mut params, &grads);
+        let mut refs: Vec<&mut Tensor> = params.iter_mut().collect();
+        opt.step(&mut refs, &grads);
 
         // After one step, params should have decreased
         let data = params[0].as_f32_slice().unwrap();
@@ -260,7 +261,8 @@ mod tests {
 
         let mut opt = Adam::default_with_lr(0.1);
         for _ in 0..10 {
-            opt.step(&mut params, &grads);
+            let mut refs: Vec<&mut Tensor> = params.iter_mut().collect();
+            opt.step(&mut refs, &grads);
         }
 
         // Should have moved significantly toward 0
@@ -287,7 +289,8 @@ mod tests {
 
         let mut opt = Adam::default_with_lr(0.01);
         for _ in 0..10 {
-            opt.step_groups(&mut params, &grads, &groups);
+            let mut refs: Vec<&mut Tensor> = params.iter_mut().collect();
+            opt.step_groups(&mut refs, &grads, &groups);
         }
 
         let v0 = params[0].get_f32(0).unwrap();
@@ -313,7 +316,8 @@ mod tests {
         ];
 
         let mut opt = Adam::default_with_lr(0.01);
-        opt.step_groups(&mut params, &grads, &groups);
+        let mut refs: Vec<&mut Tensor> = params.iter_mut().collect();
+        opt.step_groups(&mut refs, &grads, &groups);
 
         let v0 = params[0].get_f32(0).unwrap();
         let v1 = params[1].get_f32(0).unwrap();
@@ -339,7 +343,8 @@ mod tests {
         ];
 
         let mut opt = Adam::default_with_lr(0.01);
-        opt.step_groups(&mut params, &grads, &groups);
+        let mut refs: Vec<&mut Tensor> = params.iter_mut().collect();
+        opt.step_groups(&mut refs, &grads, &groups);
     }
 
     #[test]
@@ -352,7 +357,8 @@ mod tests {
         ];
 
         let mut opt = Adam::default_with_lr(0.01);
-        opt.step_groups(&mut params, &grads, &groups);
+        let mut refs: Vec<&mut Tensor> = params.iter_mut().collect();
+        opt.step_groups(&mut refs, &grads, &groups);
 
         let v = params[0].get_f32(0).unwrap();
         // With zero grad but weight decay, param should shrink

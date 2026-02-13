@@ -113,6 +113,14 @@ impl LoraLinear {
 impl Module for LoraLinear {
     fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
 
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut params = vec![&mut self.lora_a, &mut self.lora_b];
+        if let Some(ref mut b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
+
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let scaling = self.alpha / self.rank as f32;
 
@@ -286,6 +294,14 @@ impl QLoraLinear {
 
 impl Module for QLoraLinear {
     fn clone_box(&self) -> Box<dyn Module> { Box::new(self.clone()) }
+
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        let mut params = vec![&mut self.lora_a, &mut self.lora_b];
+        if let Some(ref mut b) = self.bias {
+            params.push(b);
+        }
+        params
+    }
 
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let scaling = self.alpha / self.rank as f32;

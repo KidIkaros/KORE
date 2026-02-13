@@ -107,6 +107,10 @@ impl Module for ModuleList {
         self.modules.iter().flat_map(|m| m.parameters()).collect()
     }
 
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        self.modules.iter_mut().flat_map(|m| m.parameters_mut()).collect()
+    }
+
     fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = Vec::new();
         for (i, module) in self.modules.iter().enumerate() {

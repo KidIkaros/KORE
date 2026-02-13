@@ -13,6 +13,13 @@ pub trait Module: Send + Sync {
     /// Get all trainable parameters.
     fn parameters(&self) -> Vec<&Tensor>;
 
+    /// Get mutable references to all trainable parameters.
+    ///
+    /// Returns parameters in the same order as `parameters()`. This enables
+    /// in-place optimizer updates without cloning, avoiding copy-on-write
+    /// overhead from the Arc-based Tensor storage.
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor>;
+
     /// Get named parameters (for state_dict).
     fn named_parameters(&self) -> Vec<(String, &Tensor)>;
 

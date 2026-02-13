@@ -130,6 +130,10 @@ impl Module for RMSNorm {
         vec![&self.gamma]
     }
 
+    fn parameters_mut(&mut self) -> Vec<&mut Tensor> {
+        vec![&mut self.gamma]
+    }
+
     fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         vec![("gamma".into(), &self.gamma)]
     }

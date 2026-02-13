@@ -182,10 +182,8 @@ impl Trainer {
                 continue;
             }
 
-            // Collect parameters and gradients
-            let params_refs = self.model.parameters();
-            let mut params: Vec<Tensor> = params_refs.iter().map(|p| (*p).clone()).collect();
-            let grads: Vec<Tensor> = params_refs
+            // Collect gradients (immutable borrow, then released)
+            let grads: Vec<Tensor> = self.model.parameters()
                 .iter()
                 .map(|p| {
                     p.grad().unwrap_or_else(|| {
@@ -193,19 +191,20 @@ impl Trainer {
                     })
                 })
                 .collect();
-            drop(params_refs); // release borrows before mutable set_parameters
+
+            // Get mutable refs to model parameters for in-place update
+            // (no clone needed — optimizer mutates directly, avoiding
+            // copy-on-write overhead from Arc-based Tensor storage)
+            let mut params_mut = self.model.parameters_mut();
 
             // Optional gradient clipping
             if self.config.grad_clip_norm > 0.0 {
                 let mut clipped_grads = grads;
                 let _ = kore_optim::clip_grad_norm_(&mut clipped_grads, self.config.grad_clip_norm);
-                self.optimizer.step(&mut params, &clipped_grads);
+                self.optimizer.step(&mut params_mut, &clipped_grads);
             } else {
-                self.optimizer.step(&mut params, &grads);
+                self.optimizer.step(&mut params_mut, &grads);
             }
-
-            // Write updated parameters back into the model
-            self.model.set_parameters(&params);
 
             num_batches += 1;
             num_samples += batch.size;
