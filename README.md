@@ -110,8 +110,8 @@ kore-optim   = { path = "crates/kore-optim" }
 ```
 
 ```rust
-use kore_core::Tensor;
-use kore_nn::{Linear, Module};
+use kore_core::prelude::*;
+use kore_nn::prelude::*;
 
 let x = Tensor::randn(&[32, 16]);
 let model = Linear::new(16, 1, true);
@@ -143,6 +143,88 @@ The `kore` CLI provides built-in tools for benchmarking, training, serving, and 
 
 ---
 
+## Inference Server
+
+KORE ships a model-agnostic inference server with an **OpenAI-compatible REST API**. Any model that implements the `InferenceModel` trait can be served instantly.
+
+### Implement `InferenceModel`
+
+```rust
+use kore_serve::{InferenceModel, state::AppState};
+use kore_nn::sampler::{SamplerConfig, Rng};
+
+struct MyModel { /* your weights */ }
+
+impl InferenceModel for MyModel {
+    fn generate_with_config(
+        &mut self,
+        prompt_tokens: &[usize],
+        max_tokens: usize,
+        config: &SamplerConfig,
+        rng: &mut Rng,
+    ) -> Result<Vec<usize>, String> {
+        // Your generation logic here
+        Ok(prompt_tokens.to_vec())
+    }
+}
+
+// Wire it up
+let model = MyModel { /* ... */ };
+let state = AppState::with_model(model, "my-model".into());
+kore_serve::server::serve_with_state("0.0.0.0:8080", state).await?;
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/completions` | Text completion (+ SSE streaming) |
+| `POST` | `/v1/chat/completions` | Chat completion (+ SSE streaming) |
+| `GET`  | `/v1/models` | List loaded models |
+| `GET`  | `/health` | Health check |
+
+### curl Examples
+
+```bash
+# Health check
+curl http://localhost:8080/health
+
+# Text completion
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"my-model","prompt":"Hello, ","max_tokens":50}'
+
+# Chat completion with streaming
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"my-model","messages":[{"role":"user","content":"Hi"}],"stream":true}'
+```
+
+---
+
+## Layered Inference (Large Model Support)
+
+Run **70B+ parameter models on 4GB VRAM** using layer-by-layer sharded inference — inspired by [AirLLM](https://github.com/lyogavin/airllm), rebuilt in Rust.
+
+**How it works:** Instead of loading the entire model into GPU memory, KORE loads one layer at a time, runs the forward pass, frees VRAM, and moves to the next layer. Combined with KORE's ternary/quaternary compression (8–16× smaller files), disk I/O becomes the bottleneck — which async prefetching solves.
+
+```
+Time →
+Layer N:   [====COMPUTE====]
+Layer N+1:      [LOAD][DECOMPRESS][GPU_XFER]
+Layer N+2:                  [LOAD][DECOMPRESS][GPU_XFER]
+```
+
+Key features:
+- **Async double-buffered prefetching** — loads layer N+1 while computing on layer N
+- **LRU RAM cache** — keeps frequently-used layers in memory for faster autoregressive generation
+- **BTES compression** — ternary (1.58-bit) and quaternary (2-bit) layer shards via `kore-btes`
+- **Model sharding** — one-time conversion from HuggingFace safetensors to per-layer shards
+
+See `kore_serve::layered` for the full API.
+
+---
+
 ## Architecture
 
 ```
@@ -163,7 +245,7 @@ The `kore` CLI provides built-in tools for benchmarking, training, serving, and 
 │           Tensor, DType, Device, Storage, SIMD               │
 ├──────────────────────────────────────────────────────────────┤
 │                    kore-kernels                              │
-│          CUDA (cudarc + PTX) │ CPU (AVX2/512, NEON)         │
+│      CUDA (cudarc + PTX) │ ROCm (HIP) │ CPU (AVX2/512, NEON)│
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -176,7 +258,7 @@ The `kore` CLI provides built-in tools for benchmarking, training, serving, and 
 | `kore-nn` | Module trait, Linear, Conv, LayerNorm, RMSNorm, BitLinear, QuatLinear, LoRA, SqueezeNet, Sampler |
 | `kore-optim` | SGD, Adam, LR schedulers (cosine, warmup, one-cycle, step), gradient clipping |
 | `kore-btes` | Binary/Ternary/Quaternary encoding, VT-ALU, matmul |
-| `kore-kernels` | CUDA kernels (cudarc + PTX), CPU SIMD (AVX2, NEON) |
+| `kore-kernels` | CUDA kernels (cudarc + PTX), ROCm/HIP, CPU SIMD (AVX2, NEON) |
 | `kore-clifford` | Geometric algebra engine |
 | `kore-attention` | Flash Attention, paged KV-cache |
 | `kore-edge` | No-std inference runtime: WASM, iOS, Android |

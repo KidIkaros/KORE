@@ -8,7 +8,7 @@ Thanks for your interest in contributing! Here's how to get started.
 # Build all crates
 cargo build --workspace
 
-# Run all tests (588+)
+# Run all tests (439+)
 cargo test --workspace
 
 # Lint

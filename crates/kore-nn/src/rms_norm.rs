@@ -41,6 +41,21 @@ impl RMSNorm {
         }
     }
 
+    /// Create an RMSNorm layer from a pre-trained gamma (scale) tensor.
+    ///
+    /// # Arguments
+    /// * `gamma` - Scale parameter tensor of shape `[dim]`
+    /// * `eps` - Small constant for numerical stability
+    pub fn from_weight(gamma: Tensor, eps: f32) -> Self {
+        let dim = gamma.numel();
+        Self {
+            gamma,
+            dim,
+            eps,
+            training: false,
+        }
+    }
+
     /// Dimension being normalized.
     pub fn dim(&self) -> usize {
         self.dim
