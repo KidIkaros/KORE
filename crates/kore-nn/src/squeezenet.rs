@@ -122,18 +122,26 @@ impl Module for Fire {
         params
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = Vec::new();
-        for (_name, t) in self.squeeze.named_parameters() {
-            params.push(("squeeze.weight", t));
+        for (name, t) in self.squeeze.named_parameters() {
+            params.push((format!("squeeze.{}", name), t));
         }
-        for (_name, t) in self.expand1x1.named_parameters() {
-            params.push(("expand1x1.weight", t));
+        for (name, t) in self.expand1x1.named_parameters() {
+            params.push((format!("expand1x1.{}", name), t));
         }
-        for (_name, t) in self.expand3x3.named_parameters() {
-            params.push(("expand3x3.weight", t));
+        for (name, t) in self.expand3x3.named_parameters() {
+            params.push((format!("expand3x3.{}", name), t));
         }
         params
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        let mut n = 0;
+        n += self.squeeze.set_parameters(&params[n..]);
+        n += self.expand1x1.set_parameters(&params[n..]);
+        n += self.expand3x3.set_parameters(&params[n..]);
+        n
     }
 }
 
@@ -328,15 +336,10 @@ impl Module for SqueezeNet {
         params
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
-        // Simplified: return all parameters with generic names
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         self.parameters().into_iter()
             .enumerate()
-            .map(|(i, t)| {
-                // Leak a string for the name — acceptable for debugging
-                let name: &str = Box::leak(format!("param_{}", i).into_boxed_str());
-                (name, t)
-            })
+            .map(|(i, t)| (format!("param_{}", i), t))
             .collect()
     }
 

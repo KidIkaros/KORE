@@ -14,7 +14,13 @@ pub trait Module: Send + Sync {
     fn parameters(&self) -> Vec<&Tensor>;
 
     /// Get named parameters (for state_dict).
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)>;
+    fn named_parameters(&self) -> Vec<(String, &Tensor)>;
+
+    /// Write updated parameters back into the module.
+    ///
+    /// Consumes parameters from the front of the slice in the same order
+    /// as `parameters()` returns them. Returns how many were consumed.
+    fn set_parameters(&mut self, _params: &[Tensor]) -> usize { 0 }
 
     /// Set training/eval mode.
     fn train(&mut self, _mode: bool) {}
@@ -28,7 +34,7 @@ pub trait Module: Send + Sync {
     fn state_dict(&self) -> HashMap<String, Tensor> {
         self.named_parameters()
             .into_iter()
-            .map(|(name, t)| (name.to_string(), t.clone()))
+            .map(|(name, t)| (name, t.clone()))
             .collect()
     }
 }

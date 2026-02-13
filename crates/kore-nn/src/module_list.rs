@@ -100,15 +100,22 @@ impl Module for ModuleList {
         self.modules.iter().flat_map(|m| m.parameters()).collect()
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = Vec::new();
         for (i, module) in self.modules.iter().enumerate() {
             for (name, tensor) in module.named_parameters() {
-                let prefixed = format!("{}.{}", i, name);
-                params.push((prefixed.leak() as &str, tensor));
+                params.push((format!("{}.{}", i, name), tensor));
             }
         }
         params
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        let mut offset = 0;
+        for module in &mut self.modules {
+            offset += module.set_parameters(&params[offset..]);
+        }
+        offset
     }
 
     fn train(&mut self, mode: bool) {

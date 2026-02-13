@@ -960,7 +960,8 @@ impl PySequential {
 
 #[pyclass(name = "TensorDataset")]
 struct PyTensorDataset {
-    inner: std::sync::Arc<kore_data::TensorDataset>,
+    inputs: kore_core::Tensor,
+    targets: kore_core::Tensor,
 }
 
 #[pymethods]
@@ -968,22 +969,26 @@ impl PyTensorDataset {
     #[new]
     fn new(inputs: &PyTensor, targets: &PyTensor) -> Self {
         Self {
-            inner: std::sync::Arc::new(kore_data::TensorDataset::new(&inputs.inner, &targets.inner)),
+            inputs: inputs.inner.clone(),
+            targets: targets.inner.clone(),
         }
     }
 
     fn __len__(&self) -> usize {
-        kore_data::Dataset::len(self.inner.as_ref())
+        self.inputs.shape().dims()[0]
     }
 
     fn __repr__(&self) -> String {
-        format!("TensorDataset(n={})", kore_data::Dataset::len(self.inner.as_ref()))
+        format!("TensorDataset(n={})", self.inputs.shape().dims()[0])
     }
 }
 
 #[pyclass(name = "DataLoader")]
 struct PyDataLoader {
-    dataset: std::sync::Arc<kore_data::TensorDataset>,
+    /// Raw input tensor — kept to build Rust DataLoader cheaply via Tensor clone.
+    inputs: kore_core::Tensor,
+    /// Raw target tensor.
+    targets: kore_core::Tensor,
     batch_size: usize,
     shuffle: bool,
     drop_last: bool,
@@ -1002,7 +1007,8 @@ impl PyDataLoader {
         seed: Option<u64>,
     ) -> Self {
         Self {
-            dataset: std::sync::Arc::clone(&dataset.inner),
+            inputs: dataset.inputs.clone(),
+            targets: dataset.targets.clone(),
             batch_size,
             shuffle,
             drop_last,
@@ -1011,11 +1017,11 @@ impl PyDataLoader {
     }
 
     fn __len__(&self) -> usize {
-        let n = kore_data::Dataset::len(self.dataset.as_ref());
+        let n = self.inputs.shape().dims()[0];
         if self.drop_last {
             n / self.batch_size
         } else {
-            (n + self.batch_size - 1) / self.batch_size
+            n.div_ceil(self.batch_size)
         }
     }
 
@@ -1029,15 +1035,8 @@ impl PyDataLoader {
 
 impl PyDataLoader {
     fn to_rust_loader(&self) -> kore_data::DataLoader {
-        // Clone the TensorDataset into a new Box<dyn Dataset>
-        let ds = kore_data::TensorDataset::from_vecs(
-            (0..kore_data::Dataset::len(self.dataset.as_ref()))
-                .map(|i| kore_data::Dataset::get(self.dataset.as_ref(), i).input)
-                .collect(),
-            (0..kore_data::Dataset::len(self.dataset.as_ref()))
-                .map(|i| kore_data::Dataset::get(self.dataset.as_ref(), i).target)
-                .collect(),
-        );
+        // Build DataLoader from tensor clones (cheap Arc-based clone, not sample-by-sample)
+        let ds = kore_data::TensorDataset::new(&self.inputs, &self.targets);
         kore_data::DataLoader::new(
             Box::new(ds),
             self.batch_size,
@@ -1068,37 +1067,24 @@ impl PyTrainer {
         log_every: usize,
         grad_clip_norm: f32,
     ) -> PyResult<Self> {
-        // Reconstruct the Sequential model from parameters
-        // We need to clone the model's layers via state_dict
+        // Reconstruct Sequential by cloning each layer from the state dict.
+        // Group named params by layer index (e.g. "0.weight", "0.bias" → layer 0).
         let state = kore_nn::Module::state_dict(&model.inner);
-        let _ = state; // state dict available for reload
+        let num_layers = model.inner.len();
+        let mut layers: Vec<Box<dyn kore_nn::Module>> = Vec::with_capacity(num_layers);
 
-        // Build a fresh Sequential from the Python model's layer shapes
-        // For now, clone the Sequential by re-creating layers from parameters
-        let params = kore_nn::Module::parameters(&model.inner);
-        let mut layers: Vec<Box<dyn kore_nn::Module>> = Vec::new();
+        for idx in 0..num_layers {
+            let prefix = format!("{}.", idx);
+            let weight_key = format!("{}weight", prefix);
+            let bias_key = format!("{}bias", prefix);
 
-        // Parse weight tensors to reconstruct Linear layers
-        let mut i = 0;
-        while i < params.len() {
-            let w = params[i];
-            let w_dims = w.shape().dims();
-            if w_dims.len() == 2 {
-                let out_f = w_dims[0];
-                let _in_f = w_dims[1];
-                // Check if next param is a bias (1D with out_features)
-                let has_bias = i + 1 < params.len()
-                    && params[i + 1].shape().dims().len() == 1
-                    && params[i + 1].shape().dims()[0] == out_f;
-                let bias = if has_bias {
-                    i += 1;
-                    Some(params[i].clone())
-                } else {
-                    None
-                };
-                layers.push(Box::new(kore_nn::Linear::from_weight(w.clone(), bias)));
-            }
-            i += 1;
+            let weight = state.get(&weight_key).ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    format!("Trainer: layer {} missing 'weight' in state_dict", idx)
+                )
+            })?;
+            let bias = state.get(&bias_key).cloned();
+            layers.push(Box::new(kore_nn::Linear::from_weight(weight.clone(), bias)));
         }
 
         let seq = kore_nn::Sequential::new(layers);

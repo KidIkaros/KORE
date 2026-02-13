@@ -92,12 +92,21 @@ impl Module for Linear {
         params
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
-        let mut params = vec![("weight", &self.weight)];
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        let mut params = vec![("weight".into(), &self.weight)];
         if let Some(ref b) = self.bias {
-            params.push(("bias", b));
+            params.push(("bias".into(), b));
         }
         params
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        let mut n = 0;
+        self.weight = params[n].clone(); n += 1;
+        if self.bias.is_some() {
+            self.bias = Some(params[n].clone()); n += 1;
+        }
+        n
     }
 
     fn train(&mut self, mode: bool) {

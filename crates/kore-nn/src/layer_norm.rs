@@ -106,8 +106,14 @@ impl Module for LayerNorm {
         vec![&self.gamma, &self.beta]
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
-        vec![("gamma", &self.gamma), ("beta", &self.beta)]
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        vec![("gamma".into(), &self.gamma), ("beta".into(), &self.beta)]
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        self.gamma = params[0].clone();
+        self.beta = params[1].clone();
+        2
     }
 
     fn train(&mut self, mode: bool) {

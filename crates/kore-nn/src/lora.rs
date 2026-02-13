@@ -141,15 +141,23 @@ impl Module for LoraLinear {
         params
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = vec![
-            ("lora_a", &self.lora_a),
-            ("lora_b", &self.lora_b),
+            ("lora_a".into(), &self.lora_a),
+            ("lora_b".into(), &self.lora_b),
         ];
         if let Some(ref b) = self.bias {
-            params.push(("bias", b));
+            params.push(("bias".into(), b));
         }
         params
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        let mut n = 0;
+        self.lora_a = params[n].clone(); n += 1;
+        self.lora_b = params[n].clone(); n += 1;
+        if self.bias.is_some() { self.bias = Some(params[n].clone()); n += 1; }
+        n
     }
 
     fn train(&mut self, mode: bool) {
@@ -303,15 +311,23 @@ impl Module for QLoraLinear {
         params
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = vec![
-            ("lora_a", &self.lora_a),
-            ("lora_b", &self.lora_b),
+            ("lora_a".into(), &self.lora_a),
+            ("lora_b".into(), &self.lora_b),
         ];
         if let Some(ref b) = self.bias {
-            params.push(("bias", b));
+            params.push(("bias".into(), b));
         }
         params
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        let mut n = 0;
+        self.lora_a = params[n].clone(); n += 1;
+        self.lora_b = params[n].clone(); n += 1;
+        if self.bias.is_some() { self.bias = Some(params[n].clone()); n += 1; }
+        n
     }
 
     fn train(&mut self, mode: bool) {

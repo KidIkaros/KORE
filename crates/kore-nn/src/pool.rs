@@ -111,7 +111,7 @@ impl Module for MaxPool2d {
     }
 
     fn parameters(&self) -> Vec<&Tensor> { vec![] }
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> { vec![] }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { vec![] }
 }
 
 /// 2D average pooling layer.
@@ -220,7 +220,7 @@ impl Module for AvgPool2d {
     }
 
     fn parameters(&self) -> Vec<&Tensor> { vec![] }
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> { vec![] }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { vec![] }
 }
 
 /// Adaptive 2D average pooling — outputs a fixed spatial size.
@@ -311,7 +311,7 @@ impl Module for AdaptiveAvgPool2d {
     }
 
     fn parameters(&self) -> Vec<&Tensor> { vec![] }
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> { vec![] }
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> { vec![] }
 }
 
 #[cfg(test)]

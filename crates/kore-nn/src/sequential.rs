@@ -73,18 +73,22 @@ impl Module for Sequential {
         self.layers.iter().flat_map(|m| m.parameters()).collect()
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
-        // Prefix each sub-module's parameters with its index.
-        // Note: we return static-lifetime strings via leak for named_parameters.
-        // This matches the existing pattern where names are &str.
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = Vec::new();
         for (i, module) in self.layers.iter().enumerate() {
             for (name, tensor) in module.named_parameters() {
-                let prefixed = format!("{}.{}", i, name);
-                params.push((prefixed.leak() as &str, tensor));
+                params.push((format!("{}.{}", i, name), tensor));
             }
         }
         params
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        let mut offset = 0;
+        for layer in &mut self.layers {
+            offset += layer.set_parameters(&params[offset..]);
+        }
+        offset
     }
 
     fn train(&mut self, mode: bool) {
@@ -192,7 +196,7 @@ mod tests {
             Box::new(Linear::new(2, 1, false)),
         ]);
         let np = model.named_parameters();
-        let names: Vec<&str> = np.iter().map(|(n, _)| *n).collect();
+        let names: Vec<&str> = np.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"0.weight"));
         assert!(names.contains(&"0.bias"));
         assert!(names.contains(&"1.weight"));

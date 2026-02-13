@@ -184,6 +184,7 @@ impl Trainer {
                     })
                 })
                 .collect();
+            drop(params_refs); // release borrows before mutable set_parameters
 
             // Optional gradient clipping
             if self.config.grad_clip_norm > 0.0 {
@@ -193,6 +194,9 @@ impl Trainer {
             } else {
                 self.optimizer.step(&mut params, &grads);
             }
+
+            // Write updated parameters back into the model
+            self.model.set_parameters(&params);
 
             num_batches += 1;
             num_samples += batch.size;

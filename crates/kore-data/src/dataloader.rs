@@ -141,6 +141,7 @@ pub struct DataLoader {
     shuffle: bool,
     drop_last: bool,
     seed: Option<u64>,
+    epoch_counter: std::cell::Cell<u64>,
 }
 
 impl DataLoader {
@@ -159,7 +160,7 @@ impl DataLoader {
         seed: Option<u64>,
     ) -> Self {
         assert!(batch_size > 0, "batch_size must be > 0");
-        Self { dataset, batch_size, shuffle, drop_last, seed }
+        Self { dataset, batch_size, shuffle, drop_last, seed, epoch_counter: std::cell::Cell::new(0) }
     }
 
     /// Number of batches per epoch.
@@ -189,8 +190,11 @@ impl DataLoader {
 
         if self.shuffle {
             use rand::SeedableRng;
+            let epoch = self.epoch_counter.get();
+            self.epoch_counter.set(epoch + 1);
             if let Some(seed) = self.seed {
-                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                // Vary seed per epoch for different shuffle order while staying deterministic
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(epoch));
                 indices.shuffle(&mut rng);
             } else {
                 let mut rng = rand::thread_rng();
@@ -308,16 +312,32 @@ mod tests {
 
     #[test]
     fn test_dataloader_shuffle_deterministic() {
+        // Two loaders with the same seed produce identical first-epoch order
+        let ds1 = make_dataset(10, 4, 1);
+        let ds2 = make_dataset(10, 4, 1);
+        let loader1 = DataLoader::new(Box::new(ds1), 10, true, false, Some(42));
+        let loader2 = DataLoader::new(Box::new(ds2), 10, true, false, Some(42));
+
+        let b1: Vec<_> = loader1.iter().collect();
+        let b2: Vec<_> = loader2.iter().collect();
+
+        let d1 = b1[0].input.as_f32_slice().unwrap().to_vec();
+        let d2 = b2[0].input.as_f32_slice().unwrap().to_vec();
+        assert_eq!(d1, d2, "same seed should produce same first-epoch order");
+    }
+
+    #[test]
+    fn test_dataloader_shuffle_varies_per_epoch() {
+        // Successive iter() calls on the same loader produce different order
         let ds = make_dataset(10, 4, 1);
         let loader = DataLoader::new(Box::new(ds), 10, true, false, Some(42));
 
         let b1: Vec<_> = loader.iter().collect();
         let b2: Vec<_> = loader.iter().collect();
 
-        // Same seed → same order
         let d1 = b1[0].input.as_f32_slice().unwrap().to_vec();
         let d2 = b2[0].input.as_f32_slice().unwrap().to_vec();
-        assert_eq!(d1, d2);
+        assert_ne!(d1, d2, "different epochs should produce different shuffle order");
     }
 
     #[test]

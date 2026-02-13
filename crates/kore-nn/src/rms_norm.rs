@@ -122,8 +122,13 @@ impl Module for RMSNorm {
         vec![&self.gamma]
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
-        vec![("gamma", &self.gamma)]
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        vec![("gamma".into(), &self.gamma)]
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        self.gamma = params[0].clone();
+        1
     }
 
     fn train(&mut self, mode: bool) {

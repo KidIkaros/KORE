@@ -101,8 +101,13 @@ impl Module for Embedding {
         vec![&self.weight]
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
-        vec![("weight", &self.weight)]
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
+        vec![("weight".into(), &self.weight)]
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        self.weight = params[0].clone();
+        1
     }
 
     fn train(&mut self, mode: bool) {

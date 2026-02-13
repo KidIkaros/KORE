@@ -317,12 +317,16 @@ impl Module for QuatLinear {
         params
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         let mut params = Vec::new();
         if let Some(ref b) = self.bias {
-            params.push(("bias", b));
+            params.push(("bias".into(), b));
         }
         params
+    }
+
+    fn set_parameters(&mut self, params: &[Tensor]) -> usize {
+        if self.bias.is_some() { self.bias = Some(params[0].clone()); 1 } else { 0 }
     }
 
     fn train(&mut self, mode: bool) {

@@ -72,7 +72,7 @@ impl Module for Dropout {
         vec![] // No learnable parameters
     }
 
-    fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
+    fn named_parameters(&self) -> Vec<(String, &Tensor)> {
         vec![]
     }
 
