@@ -20,5 +20,3 @@ anyhow.workspace = true
 parking_lot.workspace = true
 tokio-stream.workspace = true
 async-stream.workspace = true
-safetensors.workspace = true
-sysinfo = "0.31"

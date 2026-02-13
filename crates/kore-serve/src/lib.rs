@@ -20,7 +20,5 @@ pub mod api;
 pub mod server;
 pub mod health;
 pub mod state;
-pub mod layered;
 
 pub use state::InferenceModel;
-pub use layered::LayeredEngine;
