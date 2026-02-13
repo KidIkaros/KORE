@@ -328,7 +328,7 @@ impl MultivectorTensor {
         for b in 0..batch_numel {
             for i in 0..d {
                 let k = self.algebra.grade(i);
-                let sign = if (k * k.wrapping_sub(1) / 2) % 2 == 0 { 1.0 } else { -1.0 };
+                let sign = if (k * k.wrapping_sub(1) / 2).is_multiple_of(2) { 1.0 } else { -1.0 };
                 out[b * d + i] = slice[b * d + i] * sign;
             }
         }
@@ -363,9 +363,7 @@ impl MultivectorTensor {
         let data = self.data.contiguous();
         let mut new_data = data.as_f32_slice().unwrap().to_vec();
         let start = batch_idx * d;
-        for i in 0..d {
-            new_data[start + i] = mv.coeffs[i];
-        }
+        new_data[start..start + d].copy_from_slice(&mv.coeffs[..d]);
         self.data = Tensor::from_f32(&new_data, self.data.shape().dims());
     }
 

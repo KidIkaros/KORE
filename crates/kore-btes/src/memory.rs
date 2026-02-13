@@ -30,8 +30,8 @@ impl TernaryFrame {
     /// Allocate a new frame with all trits set to zero.
     pub fn new(trit_count: usize, mode: PackingMode) -> Self {
         let byte_count = match mode {
-            PackingMode::Ternary => (trit_count + 4) / 5,
-            PackingMode::Quaternary => (trit_count + 3) / 4,
+            PackingMode::Ternary => trit_count.div_ceil(5),
+            PackingMode::Quaternary => trit_count.div_ceil(4),
         };
 
         let fill_byte = match mode {
@@ -138,11 +138,11 @@ impl TernaryFrame {
 
         while words.len() < max_words && current < self.trit_count {
             let mut trits = [0i8; 64];
-            for i in 0..64 {
+            for (i, trit) in trits.iter_mut().enumerate() {
                 if current + i >= self.trit_count {
                     break;
                 }
-                trits[i] = self.get_trit(current + i) as i8;
+                *trit = self.get_trit(current + i) as i8;
             }
             words.push(TernaryWord64::from_trits(&trits));
             current += 64;
@@ -212,8 +212,8 @@ impl TernaryFrame {
     /// Resize the frame, preserving existing data where possible.
     pub fn resize(&mut self, new_trit_count: usize) {
         let new_byte_count = match self.mode {
-            PackingMode::Ternary => (new_trit_count + 4) / 5,
-            PackingMode::Quaternary => (new_trit_count + 3) / 4,
+            PackingMode::Ternary => new_trit_count.div_ceil(5),
+            PackingMode::Quaternary => new_trit_count.div_ceil(4),
         };
 
         let fill_byte = match self.mode {

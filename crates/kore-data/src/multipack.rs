@@ -117,7 +117,7 @@ impl MultipackSampler {
                 if *remaining >= seq_len {
                     // Add to this bin
                     let batch = &mut bins[bin_idx];
-                    let start = batch.tokens.len();
+                    let _start = batch.tokens.len();
                     batch.tokens.extend_from_slice(&seq[..seq_len]);
                     batch.boundaries.push(batch.tokens.len());
                     batch.num_sequences += 1;

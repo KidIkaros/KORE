@@ -49,11 +49,11 @@ impl DType {
         match self {
             DType::Ternary => {
                 // 5 trits per byte (base-243 packing)
-                (n + 4) / 5
+                n.div_ceil(5)
             }
             DType::Quaternary => {
                 // 4 values per byte (2 bits each)
-                (n + 3) / 4
+                n.div_ceil(4)
             }
             other => {
                 other.element_size().unwrap() * n

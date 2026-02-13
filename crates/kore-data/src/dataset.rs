@@ -77,7 +77,7 @@ impl StreamingDataset {
         let mut targets = Vec::new();
 
         let mut offset = 0;
-        while offset + seq_len + 1 <= self.tokens.len() {
+        while offset + seq_len < self.tokens.len() {
             inputs.push(self.tokens[offset..offset + seq_len].to_vec());
             targets.push(self.tokens[offset + 1..offset + seq_len + 1].to_vec());
             offset += seq_len;

@@ -45,8 +45,8 @@ impl EdgeDType {
             EdgeDType::F32 => n * 4,
             EdgeDType::F16 => n * 2,
             EdgeDType::I8 | EdgeDType::U8 => n,
-            EdgeDType::Ternary => (n + 4) / 5,
-            EdgeDType::Quaternary => (n + 3) / 4,
+            EdgeDType::Ternary => n.div_ceil(5),
+            EdgeDType::Quaternary => n.div_ceil(4),
         }
     }
 
@@ -63,6 +63,7 @@ impl EdgeDType {
     }
 
     /// Parse from string tag.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "f32" => Some(EdgeDType::F32),
@@ -212,7 +213,7 @@ impl KorefModel {
         // Header JSON
         buf.extend_from_slice(header_bytes);
         // Padding
-        buf.extend(std::iter::repeat(0u8).take(padding));
+        buf.extend(std::iter::repeat_n(0u8, padding));
         // Weight blob
         buf.extend_from_slice(&self.weights);
 
@@ -285,6 +286,7 @@ pub struct KorefBuilder {
 
 impl KorefBuilder {
     /// Create a new builder with model config.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model_type: &str,
         vocab_size: usize,
@@ -321,7 +323,7 @@ impl KorefBuilder {
     pub fn add_tensor(&mut self, name: &str, dtype: EdgeDType, shape: &[usize], data: &[u8]) {
         // Align to 64 bytes
         let padding = align_up(self.current_offset, 64) - self.current_offset;
-        self.weight_buf.extend(std::iter::repeat(0u8).take(padding));
+        self.weight_buf.extend(std::iter::repeat_n(0u8, padding));
         self.current_offset += padding;
 
         let entry = TensorEntry {

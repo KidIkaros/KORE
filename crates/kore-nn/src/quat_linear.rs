@@ -126,7 +126,7 @@ impl QuatLinear {
 
     /// Dequantize packed weights back to f32 (for inspection/debugging).
     pub fn dequantize_weights(&self) -> Tensor {
-        let k_packed = (self.in_features + 3) / 4;
+        let k_packed = self.in_features.div_ceil(4);
         let mut result = vec![0.0f32; self.out_features * self.in_features];
         const QUAT_VALUES: [f32; 4] = [-3.0, -1.0, 1.0, 3.0];
 

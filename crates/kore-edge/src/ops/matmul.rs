@@ -47,7 +47,7 @@ pub fn matmul_ternary(
     n: usize,
     k: usize,
 ) {
-    let k_packed = (k + 4) / 5;
+    let k_packed = k.div_ceil(5);
 
     for row in 0..m {
         let scale = a_scales[row];
@@ -70,14 +70,14 @@ pub fn matmul_ternary(
             if t == 0 { continue; }
             let t_f32 = t as f32;
             let b_row = &b[ki * n..ki * n + n];
-            for col in 0..n {
-                c_row[col] += t_f32 * b_row[col];
+            for (c_val, &b_val) in c_row.iter_mut().zip(b_row.iter()) {
+                *c_val += t_f32 * b_val;
             }
         }
 
         // Apply scale
-        for col in 0..n {
-            c_row[col] *= scale;
+        for c_val in c_row.iter_mut() {
+            *c_val *= scale;
         }
     }
 }
@@ -98,7 +98,7 @@ pub fn matmul_quaternary(
     k: usize,
 ) {
     const QUAT_VALUES: [f32; 4] = [-3.0, -1.0, 1.0, 3.0];
-    let k_packed = (k + 3) / 4;
+    let k_packed = k.div_ceil(4);
 
     for row in 0..m {
         let scale = a_scales[row];
@@ -119,14 +119,14 @@ pub fn matmul_quaternary(
         for ki in 0..k {
             let w = quats[ki];
             let b_row = &b[ki * n..ki * n + n];
-            for col in 0..n {
-                c_row[col] += w * b_row[col];
+            for (c_val, &b_val) in c_row.iter_mut().zip(b_row.iter()) {
+                *c_val += w * b_val;
             }
         }
 
         // Apply scale
-        for col in 0..n {
-            c_row[col] *= scale;
+        for c_val in c_row.iter_mut() {
+            *c_val *= scale;
         }
     }
 }

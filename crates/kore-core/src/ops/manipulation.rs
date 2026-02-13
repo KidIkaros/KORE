@@ -125,7 +125,7 @@ impl Tensor {
         }
 
         let dim_size = self.shape().dims()[axis];
-        let chunk_size = (dim_size + chunks - 1) / chunks;
+        let chunk_size = dim_size.div_ceil(chunks);
         self.split(chunk_size, axis as isize)
     }
 
@@ -413,8 +413,8 @@ fn tri_op(tensor: &Tensor, k: isize, upper: bool) -> Result<Tensor> {
                 let diag = c as isize - r as isize;
                 if upper {
                     if diag < k { result[idx] = 0.0; }
-                } else {
-                    if diag > k { result[idx] = 0.0; }
+                } else if diag > k {
+                    result[idx] = 0.0;
                 }
             }
         }

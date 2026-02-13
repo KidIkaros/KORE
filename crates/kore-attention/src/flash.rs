@@ -118,8 +118,8 @@ pub fn flash_attention(
 
                 // Add contribution from this block
                 let mut block_sum = 0.0f32;
-                for bj in 0..kv_block_size {
-                    let w = (block_scores[bj] - new_max).exp();
+                for (bj, &score) in block_scores.iter().enumerate() {
+                    let w = (score - new_max).exp();
                     block_sum += w;
 
                     let kj = kv_start + bj;

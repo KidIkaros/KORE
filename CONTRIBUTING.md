@@ -52,12 +52,11 @@ crates/
   kore-kernels/     # CUDA + CPU SIMD kernels
   kore-clifford/    # Geometric algebra
   kore-attention/   # Flash Attention, paged KV-cache
-  kore-transformer/ # Decoder transformer models
-  kore-serve/       # Inference server (axum)
+  kore-serve/       # Model-agnostic inference server (axum)
   kore-edge/        # No-std inference runtime
   kore-data/        # Dataset utilities
   kore-python/      # PyO3 bindings
-  kore-cli/         # CLI: train, serve, bench, info, export
+  kore-cli/         # CLI: info, bench, train, serve, export
 python/kore/        # Python package root
 ```
 

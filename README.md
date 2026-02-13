@@ -8,7 +8,7 @@
 
 # KORE
 
-**A pure-Rust ML framework — from training to edge inference.**
+**A pure-Rust ML engine — from training to edge inference.**
 
 [![CI](https://github.com/KidIkaros/KORE/actions/workflows/ci.yml/badge.svg)](https://github.com/KidIkaros/KORE/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
@@ -20,7 +20,7 @@
 
 - **Autograd engine** — computation graph with automatic backward pass
 - **Native quantization** — 1.58-bit (ternary) and 2-bit (quaternary) layers with 8–16× compression
-- **LLM training** — decoder transformers (LLaMA, GPT, Mistral-style) with LoRA fine-tuning
+- **Model-agnostic** — build any architecture (transformers, SSMs, vision models) on top of KORE primitives
 - **Flash Attention** — paged KV-cache, multi-head & grouped-query attention
 - **Edge inference** — BitNet, SqueezeNet, `.koref` export, `no_std` runtime (WASM, iOS, Android)
 - **Python bindings** — `import kore` with full NumPy interop, autograd, and safetensors I/O
@@ -123,7 +123,7 @@ println!("output shape: {:?}", out.shape().dims());
 
 ```bash
 cargo build --workspace
-cargo test  --workspace          # 588+ tests
+cargo test  --workspace
 cargo clippy --workspace -- -D warnings
 ```
 
@@ -138,8 +138,7 @@ The `kore` CLI provides built-in tools for benchmarking, training, serving, and 
 | `kore info` | System info — SIMD capabilities, supported dtypes, available crates |
 | `kore bench --sizes 128,256,512` | Matrix multiply & Flash Attention benchmarks |
 | `kore train --steps 100 --lr 0.001 --scheduler warmup_cosine` | Demo training loop with LR schedulers |
-| `kore serve --addr 0.0.0.0:8080 --model ./my_model` | OpenAI-compatible inference server |
-| `kore generate --prompt "Hello" --max-tokens 32` | Text generation demo |
+| `kore serve --addr 0.0.0.0:8080` | OpenAI-compatible inference server (model-agnostic) |
 | `kore export --model ./my_model --quantize ternary` | Export to `.koref` for edge inference |
 
 ---
@@ -155,6 +154,7 @@ The `kore` CLI provides built-in tools for benchmarking, training, serving, and 
 │ Module   │ Adam/SGD  │ Ternary/  │ clifford  │ attention    │
 │ Linear   │ Schedulers│ Quaternary│ Geometric │ Flash/Paged  │
 │ Conv/Norm│ Clipping  │ VT-ALU    │ Algebra   │ KV-Cache     │
+│ Sampler  │           │           │           │              │
 ├──────────┴───────────┴───────────┴───────────┴──────────────┤
 │                     kore-autograd                            │
 │              Computation graph, backward, tape               │
@@ -173,18 +173,31 @@ The `kore` CLI provides built-in tools for benchmarking, training, serving, and 
 |-------|-------------|
 | `kore-core` | Tensor, DType, Device, Storage, shape ops, SIMD |
 | `kore-autograd` | Computation graph, backward pass, gradient tape |
-| `kore-nn` | Module trait, Linear, Conv, LayerNorm, RMSNorm, BitLinear, QuatLinear, LoRA, SqueezeNet |
+| `kore-nn` | Module trait, Linear, Conv, LayerNorm, RMSNorm, BitLinear, QuatLinear, LoRA, SqueezeNet, Sampler |
 | `kore-optim` | SGD, Adam, LR schedulers (cosine, warmup, one-cycle, step), gradient clipping |
 | `kore-btes` | Binary/Ternary/Quaternary encoding, VT-ALU, matmul |
 | `kore-kernels` | CUDA kernels (cudarc + PTX), CPU SIMD (AVX2, NEON) |
 | `kore-clifford` | Geometric algebra engine |
 | `kore-attention` | Flash Attention, paged KV-cache |
-| `kore-transformer` | Decoder transformer, BitNetTransformer, QuatNetTransformer |
 | `kore-edge` | No-std inference runtime: WASM, iOS, Android |
 | `kore-data` | StreamingDataset, MultipackSampler, TokenBatcher |
-| `kore-serve` | Inference server (axum, OpenAI-compatible) |
+| `kore-serve` | Model-agnostic inference server (axum, OpenAI-compatible) |
 | `kore-python` | PyO3 bindings — `import kore` (maturin) |
-| `kore-cli` | CLI: info, bench, train, serve, generate, export |
+| `kore-cli` | CLI: info, bench, train, serve, export |
+
+---
+
+## Model Implementations
+
+KORE is the engine. Model architectures live in **[Xura](https://github.com/KidIkaros/Xura)**:
+
+| Xura Crate | Architecture |
+|------------|-------------|
+| `xura-mamba` | Mamba / Mamba-2 / Mamba-3 SSM |
+| `xura-vljepa` | Vision-Language JEPA (Mamba3-JEPA) |
+| `xura-transformer` | Decoder transformers (LLaMA, GPT, Mistral-style) |
+
+Implement `kore_serve::InferenceModel` in your model crate to serve it via the built-in OpenAI-compatible API.
 
 ---
 
@@ -204,4 +217,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, code style, and P
 
 Apache License 2.0 — see [LICENSE](LICENSE) for details.
 
-Copyright 2025 Ikaros Digital LLC
+Copyright 2025–2026 Ikaros Digital LLC

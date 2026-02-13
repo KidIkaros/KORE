@@ -2,6 +2,27 @@
 
 All notable changes to KORE will be documented in this file.
 
+## [0.2.0] — 2025-07-11
+
+### Architecture Refactor — Pure ML Engine
+
+KORE is now a **model-agnostic ML engine**. Model implementations (Transformer, Mamba, VL-JEPA)
+have been extracted to the [Xura](https://github.com/KidIkaros/Xura) project.
+
+#### Removed Crates
+- `kore-transformer` — extracted to `xura-transformer`
+- `kore-mamba` — extracted to `xura-mamba`
+- `kore-vljepa` — extracted to `xura-vljepa`
+- `kore-glial`, `kore-glial-vljepa` — removed (empty)
+
+#### Changed
+- **kore-serve**: now model-agnostic via `InferenceModel` trait — any model implementing
+  `generate_with_config()` can be served through the OpenAI-compatible API
+- **kore-cli**: removed `generate` command (model-specific); `serve` starts in placeholder mode;
+  `export` parses config.json directly without model-specific loaders
+- **kore-nn**: added `sampler` module (SamplerConfig, Rng, top-k/top-p/repetition penalty sampling)
+  — previously in kore-transformer, now a framework-level utility
+
 ## [0.1.0] — 2026-02-10
 
 First hardened release of the KORE ML Training Framework.
