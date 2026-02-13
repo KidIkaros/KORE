@@ -15,10 +15,124 @@ use parking_lot::Mutex;
 /// the cache, prefetcher, and engine without duplicating multi-GB buffers.
 pub type LayerWeights = Arc<Vec<(String, Vec<u8>)>>;
 
+// ── O(1) doubly-linked list arena used for LRU ordering ──────────────
+
+/// Sentinel value indicating no link.
+const NONE: usize = usize::MAX;
+
+/// A node in the LRU doubly-linked list.
+struct LruNode {
+    key: String,
+    prev: usize,
+    next: usize,
+}
+
+/// Arena-allocated doubly-linked list for LRU ordering.
+///
+/// Supports O(1) insert-at-tail, remove-by-handle, and pop-from-head.
+struct LruList {
+    nodes: Vec<LruNode>,
+    head: usize,
+    tail: usize,
+    free: Vec<usize>,
+}
+
+impl LruList {
+    fn new() -> Self {
+        Self { nodes: Vec::new(), head: NONE, tail: NONE, free: Vec::new() }
+    }
+
+    /// Insert a key at the tail (MRU position). Returns the node handle.
+    fn push_back(&mut self, key: String) -> usize {
+        let idx = if let Some(free_idx) = self.free.pop() {
+            self.nodes[free_idx] = LruNode { key, prev: self.tail, next: NONE };
+            free_idx
+        } else {
+            let idx = self.nodes.len();
+            self.nodes.push(LruNode { key, prev: self.tail, next: NONE });
+            idx
+        };
+
+        if self.tail != NONE {
+            self.nodes[self.tail].next = idx;
+        } else {
+            self.head = idx;
+        }
+        self.tail = idx;
+        idx
+    }
+
+    /// Remove a node by handle. O(1).
+    fn remove(&mut self, idx: usize) {
+        let prev = self.nodes[idx].prev;
+        let next = self.nodes[idx].next;
+
+        if prev != NONE {
+            self.nodes[prev].next = next;
+        } else {
+            self.head = next;
+        }
+        if next != NONE {
+            self.nodes[next].prev = prev;
+        } else {
+            self.tail = prev;
+        }
+
+        self.nodes[idx].prev = NONE;
+        self.nodes[idx].next = NONE;
+        self.free.push(idx);
+    }
+
+    /// Move an existing node to the tail (MRU). O(1).
+    fn move_to_back(&mut self, idx: usize) {
+        if idx == self.tail {
+            return; // already MRU
+        }
+        self.remove(idx);
+        // Re-insert at tail (reuse the slot directly)
+        self.nodes[idx].prev = self.tail;
+        self.nodes[idx].next = NONE;
+        // Reclaim from free list since we're reusing it
+        if let Some(pos) = self.free.iter().position(|&f| f == idx) {
+            self.free.swap_remove(pos);
+        }
+        if self.tail != NONE {
+            self.nodes[self.tail].next = idx;
+        } else {
+            self.head = idx;
+        }
+        self.tail = idx;
+    }
+
+    /// Pop the head (LRU) node. Returns the key. O(1).
+    fn pop_front(&mut self) -> Option<String> {
+        if self.head == NONE {
+            return None;
+        }
+        let idx = self.head;
+        let key = self.nodes[idx].key.clone();
+        self.remove(idx);
+        Some(key)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.nodes.len() - self.free.len()
+    }
+
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.head = NONE;
+        self.tail = NONE;
+        self.free.clear();
+    }
+}
+
+// ── LayerCache ───────────────────────────────────────────────────────
+
 /// LRU cache for layer state dicts in RAM.
 ///
-/// Keeps up to `max_layers` layers in memory. When full, evicts the
-/// least-recently-used layer to make room for new ones.
+/// Uses an arena-backed doubly-linked list for O(1) get, put, and evict.
 pub struct LayerCache {
     inner: Mutex<CacheInner>,
 }
@@ -27,7 +141,7 @@ impl std::fmt::Debug for LayerCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.lock();
         f.debug_struct("LayerCache")
-            .field("entries", &inner.entries.len())
+            .field("entries", &inner.map.len())
             .field("max_layers", &inner.max_layers)
             .field("max_bytes", &inner.max_bytes)
             .field("current_bytes", &inner.current_bytes)
@@ -36,26 +150,21 @@ impl std::fmt::Debug for LayerCache {
 }
 
 struct CacheInner {
-    /// Layers stored in access order (most recent at the end).
-    entries: Vec<CacheEntry>,
-    /// Map from layer name to index in `entries`.
-    index: HashMap<String, usize>,
-    /// Maximum number of layers to cache.
+    /// Map from layer name → (weights, size, LRU node handle).
+    map: HashMap<String, CacheValue>,
+    /// LRU ordering list.
+    lru: LruList,
     max_layers: usize,
-    /// Maximum bytes to use for cache (0 = use max_layers only).
     max_bytes: usize,
-    /// Current total size in bytes.
     current_bytes: usize,
-    /// Cache hit count.
     hits: u64,
-    /// Cache miss count.
     misses: u64,
 }
 
-struct CacheEntry {
-    name: String,
+struct CacheValue {
     weights: LayerWeights,
     size_bytes: usize,
+    lru_handle: usize,
 }
 
 impl LayerCache {
@@ -63,8 +172,8 @@ impl LayerCache {
     pub fn new(max_layers: usize) -> Self {
         Self {
             inner: Mutex::new(CacheInner {
-                entries: Vec::new(),
-                index: HashMap::new(),
+                map: HashMap::new(),
+                lru: LruList::new(),
                 max_layers,
                 max_bytes: 0,
                 current_bytes: 0,
@@ -90,9 +199,9 @@ impl LayerCache {
 
         Self {
             inner: Mutex::new(CacheInner {
-                entries: Vec::new(),
-                index: HashMap::new(),
-                max_layers: 256, // generous upper bound
+                map: HashMap::new(),
+                lru: LruList::new(),
+                max_layers: 256,
                 max_bytes: budget,
                 current_bytes: 0,
                 hits: 0,
@@ -103,31 +212,21 @@ impl LayerCache {
 
     /// Check if a layer is in the cache.
     pub fn has(&self, layer_name: &str) -> bool {
-        let inner = self.inner.lock();
-        inner.index.contains_key(layer_name)
+        self.inner.lock().map.contains_key(layer_name)
     }
 
     /// Get a layer from the cache, moving it to the most-recently-used position.
     ///
-    /// Returns `None` on cache miss.
+    /// O(1) — linked-list node is moved to tail without shifting other entries.
     pub fn get(&self, layer_name: &str) -> Option<LayerWeights> {
         let mut inner = self.inner.lock();
 
-        if let Some(&idx) = inner.index.get(layer_name) {
+        // Extract handle + weights first to release the immutable borrow on `map`.
+        let found = inner.map.get(layer_name).map(|val| (val.lru_handle, val.weights.clone()));
+
+        if let Some((handle, weights)) = found {
             inner.hits += 1;
-            // Move to end (most recently used)
-            let entry = inner.entries.remove(idx);
-            let weights = entry.weights.clone();
-            let new_idx = inner.entries.len();
-            inner.entries.push(entry);
-            // Incremental index update: only entries that shifted down
-            let shifted: Vec<(String, usize)> = (idx..new_idx)
-                .map(|i| (inner.entries[i].name.clone(), i))
-                .collect();
-            for (name, i) in shifted {
-                inner.index.insert(name, i);
-            }
-            inner.index.insert(layer_name.to_string(), new_idx);
+            inner.lru.move_to_back(handle);
             Some(weights)
         } else {
             inner.misses += 1;
@@ -136,50 +235,37 @@ impl LayerCache {
     }
 
     /// Insert a layer into the cache, evicting LRU entries if necessary.
+    ///
+    /// O(1) amortized — eviction pops the linked-list head and removes from the map.
     pub fn put(&self, layer_name: String, weights: LayerWeights) {
         let size = estimate_weights_size(&weights);
         let mut inner = self.inner.lock();
 
-        // Already cached? Move to end.
-        if inner.index.contains_key(&layer_name) {
+        if inner.map.contains_key(&layer_name) {
             return;
         }
 
-        // Evict until we have room
+        // Evict LRU entries until we have room
         while needs_eviction(&inner, size) {
-            if inner.entries.is_empty() {
+            if let Some(evict_key) = inner.lru.pop_front() {
+                if let Some(evicted) = inner.map.remove(&evict_key) {
+                    inner.current_bytes = inner.current_bytes.saturating_sub(evicted.size_bytes);
+                }
+            } else {
                 break;
-            }
-            let evicted = inner.entries.remove(0);
-            inner.current_bytes = inner.current_bytes.saturating_sub(evicted.size_bytes);
-            inner.index.remove(&evicted.name);
-            // Incremental index update: all entries shifted down by 1
-            let shifted: Vec<(String, usize)> = inner.entries.iter()
-                .enumerate()
-                .map(|(i, e)| (e.name.clone(), i))
-                .collect();
-            for (name, i) in shifted {
-                inner.index.insert(name, i);
             }
         }
 
-        // Insert
-        let entry = CacheEntry {
-            name: layer_name.clone(),
-            weights,
-            size_bytes: size,
-        };
-        inner.entries.push(entry);
-        let len = inner.entries.len();
-        inner.index.insert(layer_name, len - 1);
+        let handle = inner.lru.push_back(layer_name.clone());
+        inner.map.insert(layer_name, CacheValue { weights, size_bytes: size, lru_handle: handle });
         inner.current_bytes += size;
     }
 
     /// Clear the entire cache.
     pub fn clear(&self) {
         let mut inner = self.inner.lock();
-        inner.entries.clear();
-        inner.index.clear();
+        inner.map.clear();
+        inner.lru.clear();
         inner.current_bytes = 0;
     }
 
@@ -188,7 +274,7 @@ impl LayerCache {
         let inner = self.inner.lock();
         let total = inner.hits + inner.misses;
         CacheStats {
-            cached_layers: inner.entries.len(),
+            cached_layers: inner.map.len(),
             max_layers: inner.max_layers,
             current_bytes: inner.current_bytes,
             max_bytes: inner.max_bytes,
@@ -227,7 +313,7 @@ impl std::fmt::Display for CacheStats {
 }
 
 fn needs_eviction(inner: &CacheInner, new_size: usize) -> bool {
-    if inner.entries.len() >= inner.max_layers {
+    if inner.map.len() >= inner.max_layers {
         return true;
     }
     if inner.max_bytes > 0 && (inner.current_bytes + new_size) > inner.max_bytes {
@@ -305,5 +391,31 @@ mod tests {
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
         assert!((stats.hit_rate - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_lru_list_ops() {
+        let mut lru = LruList::new();
+        assert_eq!(lru.len(), 0);
+
+        let a = lru.push_back("a".into());
+        let b = lru.push_back("b".into());
+        let _c = lru.push_back("c".into());
+        assert_eq!(lru.len(), 3);
+
+        // Pop front should give LRU ("a")
+        assert_eq!(lru.pop_front().unwrap(), "a");
+        assert_eq!(lru.len(), 2);
+
+        // Move b to back, then pop front should give "c"
+        lru.move_to_back(b);
+        assert_eq!(lru.pop_front().unwrap(), "c");
+        assert_eq!(lru.pop_front().unwrap(), "b");
+        assert_eq!(lru.len(), 0);
+
+        // Reuse freed slots
+        let _d = lru.push_back("d".into());
+        assert_eq!(lru.len(), 1);
+        assert!(a < lru.nodes.len()); // slot was reused
     }
 }

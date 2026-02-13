@@ -180,11 +180,21 @@ impl LayerPrefetcher {
         let (tx, rx) = oneshot::channel();
         pending_map.insert(idx, PendingLayer::Loading(rx));
 
+        // Verify a Tokio runtime is available before spawning.
+        // If not, send an error immediately so callers never hang.
+        let handle = match tokio::runtime::Handle::try_current() {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = tx.send(Err("no async runtime available for prefetch".into()));
+                return;
+            }
+        };
+
         let shard_dir = self.shard_dir.clone();
         let profiling = self.profiling;
         let profile = self.profile.clone();
 
-        tokio::spawn(async move {
+        handle.spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let t_start = std::time::Instant::now();
                 let weights = load_layer_from_disk(&shard_dir, &layer_name);

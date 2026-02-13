@@ -139,11 +139,10 @@ fn write_shard_file(
         .iter()
         .map(|(name, data, dtype, shape)| {
             let view = safetensors::tensor::TensorView::new(*dtype, shape.clone(), data)
-                .map_err(|e| format!("invalid tensor {name}: {e}"))
-                .expect("valid tensor view");
-            (name.clone(), view)
+                .map_err(|e| format!("invalid tensor {name}: {e}"))?;
+            Ok((name.clone(), view))
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
     let bytes = safetensors::tensor::serialize(tensor_views, &None)
         .map_err(|e| format!("failed to serialize shard: {e}"))?;

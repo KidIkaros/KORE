@@ -22,55 +22,119 @@ use super::prefetcher::LayerPrefetcher;
 
 /// KV cache for autoregressive generation.
 ///
-/// Stores the key and value tensors for each transformer layer so that
-/// previously computed positions do not need to be recomputed. Each entry
-/// holds a tensor of shape `[cached_seq_len, n_kv_heads * head_dim]`.
+/// Uses pre-allocated buffers sized to `max_seq_len` so that appending new
+/// key/value data on each decode step is a `memcpy` into the existing buffer
+/// rather than a fresh allocation + copy via `Tensor::cat`.
 #[derive(Debug, Clone)]
 pub struct KvCache {
-    /// Per-layer key cache.
-    k: Vec<Option<Tensor>>,
-    /// Per-layer value cache.
-    v: Vec<Option<Tensor>>,
+    layers: Vec<KvCacheLayer>,
+    max_seq_len: usize,
 }
 
-impl KvCache {
-    /// Create an empty KV cache for `num_layers` transformer layers.
-    pub fn new(num_layers: usize) -> Self {
-        Self {
-            k: vec![None; num_layers],
-            v: vec![None; num_layers],
+/// Per-layer pre-allocated key/value buffers.
+#[derive(Debug, Clone)]
+struct KvCacheLayer {
+    k_buf: Vec<f32>,
+    v_buf: Vec<f32>,
+    /// Number of sequence positions currently filled.
+    len: usize,
+    /// Dimension per position (`n_kv_heads * head_dim`). Set on first update.
+    dim: usize,
+}
+
+impl KvCacheLayer {
+    fn new() -> Self {
+        Self { k_buf: Vec::new(), v_buf: Vec::new(), len: 0, dim: 0 }
+    }
+
+    /// Ensure the buffer is allocated for the given max_seq_len and dim.
+    /// Only allocates on the first call; subsequent calls are no-ops.
+    fn ensure_capacity(&mut self, max_seq_len: usize, dim: usize) {
+        if self.dim == 0 {
+            self.dim = dim;
+            let capacity = max_seq_len * dim;
+            self.k_buf.resize(capacity, 0.0);
+            self.v_buf.resize(capacity, 0.0);
         }
     }
 
-    /// Append new key/value tensors for a given layer, concatenating with
-    /// any previously cached values along the sequence dimension (axis 0).
-    pub fn update(&mut self, layer: usize, new_k: Tensor, new_v: Tensor) -> Result<(Tensor, Tensor), String> {
-        let full_k = match self.k[layer].take() {
-            Some(prev) => Tensor::cat(&[&prev, &new_k], 0)
-                .map_err(|e| format!("kv cache cat k: {e}"))?,
-            None => new_k,
-        };
-        let full_v = match self.v[layer].take() {
-            Some(prev) => Tensor::cat(&[&prev, &new_v], 0)
-                .map_err(|e| format!("kv cache cat v: {e}"))?,
-            None => new_v,
-        };
-        self.k[layer] = Some(full_k.clone());
-        self.v[layer] = Some(full_v.clone());
-        Ok((full_k, full_v))
+    /// Append new_tokens positions of key/value data into the pre-allocated buffer.
+    fn append(&mut self, k_data: &[f32], v_data: &[f32], new_tokens: usize) -> Result<(), String> {
+        let n = new_tokens * self.dim;
+        let offset = self.len * self.dim;
+        let end = offset + n;
+        if end > self.k_buf.len() {
+            return Err(format!(
+                "KV cache overflow: need {} but capacity is {} (max_seq_len exceeded)",
+                end, self.k_buf.len()
+            ));
+        }
+        self.k_buf[offset..end].copy_from_slice(&k_data[..n]);
+        self.v_buf[offset..end].copy_from_slice(&v_data[..n]);
+        self.len += new_tokens;
+        Ok(())
     }
 
-    /// Clear the cache (e.g. between different prompts).
+    /// Return the full cached K tensor `[len, dim]`.
+    fn k_tensor(&self) -> Tensor {
+        Tensor::from_f32(&self.k_buf[..self.len * self.dim], &[self.len, self.dim])
+    }
+
+    /// Return the full cached V tensor `[len, dim]`.
+    fn v_tensor(&self) -> Tensor {
+        Tensor::from_f32(&self.v_buf[..self.len * self.dim], &[self.len, self.dim])
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        // Keep the buffer allocated for reuse — just reset the length.
+    }
+}
+
+impl KvCache {
+    /// Create a KV cache for `num_layers` layers with room for `max_seq_len` positions.
+    ///
+    /// Actual buffer allocation is deferred until the first `update` call
+    /// (when the KV dimension is known).
+    pub fn new(num_layers: usize, max_seq_len: usize) -> Self {
+        Self {
+            layers: (0..num_layers).map(|_| KvCacheLayer::new()).collect(),
+            max_seq_len,
+        }
+    }
+
+    /// Append new key/value tensors for a given layer.
+    ///
+    /// On the first call for a layer the buffer is pre-allocated to hold
+    /// `max_seq_len` positions. Subsequent calls copy into the existing
+    /// buffer without allocating.
+    ///
+    /// Returns tensors covering all cached positions for this layer.
+    pub fn update(&mut self, layer: usize, new_k: Tensor, new_v: Tensor) -> Result<(Tensor, Tensor), String> {
+        let new_tokens = new_k.shape().dims()[0];
+        let dim = new_k.shape().dims().get(1).copied().unwrap_or(new_k.numel() / new_tokens.max(1));
+
+        let entry = &mut self.layers[layer];
+        entry.ensure_capacity(self.max_seq_len, dim);
+
+        let k_data = new_k.as_f32_slice().ok_or("KV cache: K must be F32")?;
+        let v_data = new_v.as_f32_slice().ok_or("KV cache: V must be F32")?;
+        entry.append(k_data, v_data, new_tokens)?;
+
+        Ok((entry.k_tensor(), entry.v_tensor()))
+    }
+
+    /// Clear all layers (call between independent prompts).
+    /// Buffers remain allocated for reuse.
     pub fn clear(&mut self) {
-        for slot in &mut self.k { *slot = None; }
-        for slot in &mut self.v { *slot = None; }
+        for layer in &mut self.layers {
+            layer.clear();
+        }
     }
 
     /// Number of cached positions (from the first populated layer).
     pub fn seq_len(&self) -> usize {
-        self.k.iter()
-            .find_map(|opt| opt.as_ref().map(|t| t.shape().dims()[0]))
-            .unwrap_or(0)
+        self.layers.iter().map(|l| l.len).max().unwrap_or(0)
     }
 }
 
@@ -126,7 +190,7 @@ impl LayeredEngine {
             config.shard_dir.display(),
         );
 
-        let kv_cache = KvCache::new(config.num_layers);
+        let kv_cache = KvCache::new(config.num_layers, config.max_seq_len);
 
         Ok(Self {
             config,
@@ -167,6 +231,10 @@ impl LayeredEngine {
     }
 
     fn forward_inner(&mut self, input_ids: &[usize], start_pos: usize) -> Result<Vec<f32>, String> {
+        if input_ids.is_empty() {
+            return Err("input_ids must not be empty".to_string());
+        }
+
         let layer_names = self.config.layer_names();
 
         let prefetcher = LayerPrefetcher::new(
@@ -668,6 +736,18 @@ mod tests {
     }
 
     #[test]
+    fn test_forward_rejects_empty_input() {
+        let dir = std::env::temp_dir().join("kore_empty_input_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let config = LayeredConfig::llama(dir.clone(), 1, 64, 100, 2, 2, 128);
+        let mut engine = LayeredEngine::new(config).unwrap();
+        let result = engine.forward(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("must not be empty"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_silu() {
         let x = Tensor::from_f32(&[0.0, 1.0, -1.0], &[3]);
         let y = silu(&x);
@@ -786,7 +866,7 @@ mod tests {
 
     #[test]
     fn test_kv_cache_update_and_concat() {
-        let mut kv = KvCache::new(2);
+        let mut kv = KvCache::new(2, 128);
         assert_eq!(kv.seq_len(), 0);
 
         // First update: 3 positions
