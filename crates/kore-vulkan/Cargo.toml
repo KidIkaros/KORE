@@ -16,6 +16,13 @@ thiserror.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
 [features]
 default = ["ash"]
 ash = ["dep:ash", "vulkan-kernels/ash"]
+
+[[bench]]
+name = "matmul_benchmark"
+harness = false
