@@ -7,10 +7,10 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::autograd::{self, GradNode, GradFn};
+use crate::autograd::{self, GradFn, GradNode};
+use crate::dtype::DType;
 use crate::error::KoreError;
 use crate::tensor::Tensor;
-use crate::dtype::DType;
 use crate::Result;
 
 /// Minimum number of elements before we use rayon parallelism.
@@ -23,7 +23,10 @@ fn any_tracks_grad(tensors: &[&Tensor]) -> bool {
 
 /// Collect GradNode inputs from tensors that track gradients.
 fn grad_inputs(tensors: &[&Tensor]) -> Vec<Arc<GradNode>> {
-    tensors.iter().filter_map(|t| t.grad_node().cloned()).collect()
+    tensors
+        .iter()
+        .filter_map(|t| t.grad_node().cloned())
+        .collect()
 }
 
 /// Attach a GradNode to a result tensor if gradient tracking is active.
@@ -41,7 +44,11 @@ impl Tensor {
         }
         let result = binary_op(self, other, |a, b| a + b)?;
         if any_tracks_grad(&[self, other]) {
-            Ok(with_grad(result, Box::new(autograd::AddBackward), grad_inputs(&[self, other])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::AddBackward),
+                grad_inputs(&[self, other]),
+            ))
         } else {
             Ok(result)
         }
@@ -55,7 +62,11 @@ impl Tensor {
         }
         let result = binary_op(self, other, |a, b| a - b)?;
         if any_tracks_grad(&[self, other]) {
-            Ok(with_grad(result, Box::new(autograd::SubBackward), grad_inputs(&[self, other])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::SubBackward),
+                grad_inputs(&[self, other]),
+            ))
         } else {
             Ok(result)
         }
@@ -69,9 +80,14 @@ impl Tensor {
         }
         let result = binary_op(self, other, |a, b| a * b)?;
         if any_tracks_grad(&[self, other]) {
-            Ok(with_grad(result, Box::new(autograd::MulBackward {
-                lhs: self.clone(), rhs: other.clone(),
-            }), grad_inputs(&[self, other])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::MulBackward {
+                    lhs: self.clone(),
+                    rhs: other.clone(),
+                }),
+                grad_inputs(&[self, other]),
+            ))
         } else {
             Ok(result)
         }
@@ -85,9 +101,14 @@ impl Tensor {
         }
         let result = binary_op(self, other, |a, b| a / b)?;
         if any_tracks_grad(&[self, other]) {
-            Ok(with_grad(result, Box::new(autograd::DivBackward {
-                lhs: self.clone(), rhs: other.clone(),
-            }), grad_inputs(&[self, other])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::DivBackward {
+                    lhs: self.clone(),
+                    rhs: other.clone(),
+                }),
+                grad_inputs(&[self, other]),
+            ))
         } else {
             Ok(result)
         }
@@ -101,7 +122,11 @@ impl Tensor {
         }
         let result = unary_op(self, |a| -a)?;
         if any_tracks_grad(&[self]) {
-            Ok(with_grad(result, Box::new(autograd::NegBackward), grad_inputs(&[self])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::NegBackward),
+                grad_inputs(&[self]),
+            ))
         } else {
             Ok(result)
         }
@@ -115,9 +140,13 @@ impl Tensor {
         }
         let result = unary_op(self, |a| a.abs())?;
         if any_tracks_grad(&[self]) {
-            Ok(with_grad(result, Box::new(autograd::AbsBackward {
-                input: self.clone(),
-            }), grad_inputs(&[self])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::AbsBackward {
+                    input: self.clone(),
+                }),
+                grad_inputs(&[self]),
+            ))
         } else {
             Ok(result)
         }
@@ -131,7 +160,9 @@ impl Tensor {
         }
         let result = unary_op(self, |a| a.sqrt())?;
         if any_tracks_grad(&[self]) {
-            let bw = Box::new(autograd::SqrtBackward { output: result.clone() });
+            let bw = Box::new(autograd::SqrtBackward {
+                output: result.clone(),
+            });
             Ok(with_grad(result, bw, grad_inputs(&[self])))
         } else {
             Ok(result)
@@ -151,7 +182,9 @@ impl Tensor {
         }
         let result = unary_op(self, |a| a.exp())?;
         if any_tracks_grad(&[self]) {
-            let bw = Box::new(autograd::ExpBackward { output: result.clone() });
+            let bw = Box::new(autograd::ExpBackward {
+                output: result.clone(),
+            });
             Ok(with_grad(result, bw, grad_inputs(&[self])))
         } else {
             Ok(result)
@@ -166,9 +199,13 @@ impl Tensor {
         }
         let result = unary_op(self, |a| a.ln())?;
         if any_tracks_grad(&[self]) {
-            Ok(with_grad(result, Box::new(autograd::LogBackward {
-                input: self.clone(),
-            }), grad_inputs(&[self])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::LogBackward {
+                    input: self.clone(),
+                }),
+                grad_inputs(&[self]),
+            ))
         } else {
             Ok(result)
         }
@@ -182,9 +219,14 @@ impl Tensor {
         }
         let result = unary_op(self, |a| a.powf(exponent))?;
         if any_tracks_grad(&[self]) {
-            Ok(with_grad(result, Box::new(autograd::PowScalarBackward {
-                input: self.clone(), exponent,
-            }), grad_inputs(&[self])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::PowScalarBackward {
+                    input: self.clone(),
+                    exponent,
+                }),
+                grad_inputs(&[self]),
+            ))
         } else {
             Ok(result)
         }
@@ -198,7 +240,11 @@ impl Tensor {
         }
         let result = unary_op(self, |a| a + scalar)?;
         if any_tracks_grad(&[self]) {
-            Ok(with_grad(result, Box::new(autograd::AddScalarBackward), grad_inputs(&[self])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::AddScalarBackward),
+                grad_inputs(&[self]),
+            ))
         } else {
             Ok(result)
         }
@@ -212,7 +258,11 @@ impl Tensor {
         }
         let result = unary_op(self, |a| a * scalar)?;
         if any_tracks_grad(&[self]) {
-            Ok(with_grad(result, Box::new(autograd::MulScalarBackward { scalar }), grad_inputs(&[self])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::MulScalarBackward { scalar }),
+                grad_inputs(&[self]),
+            ))
         } else {
             Ok(result)
         }
@@ -244,16 +294,23 @@ impl Tensor {
             }
             (3, 3) => matmul_batched(&a, &b)?,
             (2, 1) => matvec(&a, &b)?,
-            _ => return Err(KoreError::ShapeMismatch {
-                expected: a_dims.to_vec(),
-                got: b_dims.to_vec(),
-            }),
+            _ => {
+                return Err(KoreError::ShapeMismatch {
+                    expected: a_dims.to_vec(),
+                    got: b_dims.to_vec(),
+                })
+            }
         };
 
         if any_tracks_grad(&[self, other]) {
-            Ok(with_grad(result, Box::new(autograd::MatmulBackward {
-                lhs: self.clone(), rhs: other.clone(),
-            }), grad_inputs(&[self, other])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::MatmulBackward {
+                    lhs: self.clone(),
+                    rhs: other.clone(),
+                }),
+                grad_inputs(&[self, other]),
+            ))
         } else {
             Ok(result)
         }
@@ -267,9 +324,15 @@ impl Tensor {
         }
         let result = unary_op(self, |a| a.clamp(min, max))?;
         if any_tracks_grad(&[self]) {
-            Ok(with_grad(result, Box::new(autograd::ClampBackward {
-                input: self.clone(), min, max,
-            }), grad_inputs(&[self])))
+            Ok(with_grad(
+                result,
+                Box::new(autograd::ClampBackward {
+                    input: self.clone(),
+                    min,
+                    max,
+                }),
+                grad_inputs(&[self]),
+            ))
         } else {
             Ok(result)
         }
@@ -348,9 +411,9 @@ fn inplace_unary(a: &mut Tensor, op: impl Fn(f32) -> f32 + Sync) -> Result<()> {
             "In-place op requires contiguous tensor".into(),
         ));
     }
-    let data = a.as_f32_slice_mut().ok_or_else(|| {
-        KoreError::StorageError("Failed to get mutable f32 slice".into())
-    })?;
+    let data = a
+        .as_f32_slice_mut()
+        .ok_or_else(|| KoreError::StorageError("Failed to get mutable f32 slice".into()))?;
     if data.len() >= PAR_THRESHOLD {
         data.par_iter_mut().for_each(|v| *v = op(*v));
     } else {
@@ -382,13 +445,16 @@ fn inplace_binary(a: &mut Tensor, b: &Tensor, op: impl Fn(f32, f32) -> f32 + Syn
     }
     let b = b.contiguous();
     let b_data = b.as_f32_slice().unwrap();
-    let a_data = a.as_f32_slice_mut().ok_or_else(|| {
-        KoreError::StorageError("Failed to get mutable f32 slice".into())
-    })?;
+    let a_data = a
+        .as_f32_slice_mut()
+        .ok_or_else(|| KoreError::StorageError("Failed to get mutable f32 slice".into()))?;
     if a_data.len() >= PAR_THRESHOLD {
-        a_data.par_iter_mut().zip(b_data.par_iter()).for_each(|(av, &bv)| {
-            *av = op(*av, bv);
-        });
+        a_data
+            .par_iter_mut()
+            .zip(b_data.par_iter())
+            .for_each(|(av, &bv)| {
+                *av = op(*av, bv);
+            });
     } else {
         for (av, &bv) in a_data.iter_mut().zip(b_data.iter()) {
             *av = op(*av, bv);
@@ -421,12 +487,13 @@ fn binary_op(a: &Tensor, b: &Tensor, op: impl Fn(f32, f32) -> f32 + Sync) -> Res
         });
     }
 
-    let out_shape = a.shape().broadcast_with(b.shape()).ok_or_else(|| {
-        KoreError::BroadcastError {
-            a: a.shape().dims().to_vec(),
-            b: b.shape().dims().to_vec(),
-        }
-    })?;
+    let out_shape =
+        a.shape()
+            .broadcast_with(b.shape())
+            .ok_or_else(|| KoreError::BroadcastError {
+                a: a.shape().dims().to_vec(),
+                b: b.shape().dims().to_vec(),
+            })?;
 
     let numel = out_shape.numel();
     let mut result = vec![0.0f32; numel];
@@ -640,12 +707,7 @@ fn matvec(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let k2 = b_dims[0];
 
     if k1 != k2 {
-        return Err(KoreError::MatmulDimMismatch {
-            m,
-            k1,
-            k2,
-            n: 1,
-        });
+        return Err(KoreError::MatmulDimMismatch { m, k1, k2, n: 1 });
     }
 
     let a_data = a.as_f32_slice().unwrap();
@@ -820,7 +882,14 @@ mod tests {
     fn assert_close(a: &[f32], b: &[f32], tol: f32) {
         assert_eq!(a.len(), b.len(), "length mismatch");
         for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-            assert!((x - y).abs() < tol, "elem {} differs: {} vs {} (tol={})", i, x, y, tol);
+            assert!(
+                (x - y).abs() < tol,
+                "elem {} differs: {} vs {} (tol={})",
+                i,
+                x,
+                y,
+                tol
+            );
         }
     }
 
@@ -836,8 +905,16 @@ mod tests {
         let loss = c.sum().unwrap();
         loss.backward().unwrap();
 
-        assert_close(a.grad().unwrap().as_f32_slice().unwrap(), &[1.0, 1.0, 1.0], 1e-6);
-        assert_close(b.grad().unwrap().as_f32_slice().unwrap(), &[1.0, 1.0, 1.0], 1e-6);
+        assert_close(
+            a.grad().unwrap().as_f32_slice().unwrap(),
+            &[1.0, 1.0, 1.0],
+            1e-6,
+        );
+        assert_close(
+            b.grad().unwrap().as_f32_slice().unwrap(),
+            &[1.0, 1.0, 1.0],
+            1e-6,
+        );
     }
 
     #[test]
@@ -939,7 +1016,11 @@ mod tests {
         let loss = n.sum().unwrap();
         loss.backward().unwrap();
 
-        assert_close(a.grad().unwrap().as_f32_slice().unwrap(), &[-1.0, -1.0, -1.0], 1e-6);
+        assert_close(
+            a.grad().unwrap().as_f32_slice().unwrap(),
+            &[-1.0, -1.0, -1.0],
+            1e-6,
+        );
     }
 
     #[test]
@@ -955,7 +1036,11 @@ mod tests {
         loss.backward().unwrap();
 
         assert_close(a.grad().unwrap().as_f32_slice().unwrap(), &[1.0, 1.0], 1e-6);
-        assert_close(b.grad().unwrap().as_f32_slice().unwrap(), &[-1.0, -1.0], 1e-6);
+        assert_close(
+            b.grad().unwrap().as_f32_slice().unwrap(),
+            &[-1.0, -1.0],
+            1e-6,
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Error types for kore-vulkan.
 
-use thiserror::Error;
 use kore_core::DType;
+use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, VulkanError>;
 

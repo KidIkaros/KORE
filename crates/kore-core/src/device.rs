@@ -66,7 +66,7 @@ mod tests {
         assert!(Device::Cuda(0).is_cuda());
         assert_eq!(Device::Cuda(1).cuda_index(), Some(1));
         assert_eq!(Device::Cpu.cuda_index(), None);
-        
+
         assert!(Device::Vulkan(0).is_vulkan());
         assert!(!Device::Cpu.is_vulkan());
         assert_eq!(Device::Vulkan(2).vulkan_index(), Some(2));

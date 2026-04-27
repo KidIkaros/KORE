@@ -26,7 +26,9 @@ impl Tensor {
         let result = Tensor::scalar(total);
         if self.tracks_grad() && autograd::is_grad_enabled() {
             let node = autograd::GradNode::with_grad_fn(
-                Box::new(autograd::SumBackward { input_shape: self.shape().dims().to_vec() }),
+                Box::new(autograd::SumBackward {
+                    input_shape: self.shape().dims().to_vec(),
+                }),
                 self.grad_node().into_iter().cloned().collect(),
             );
             Ok(result.with_grad_node(node))
@@ -104,7 +106,10 @@ impl Tensor {
         let data = self.contiguous();
         let slice = data.as_f32_slice().unwrap();
         let val = if slice.len() >= PAR_THRESHOLD {
-            slice.par_iter().cloned().reduce(|| f32::NEG_INFINITY, f32::max)
+            slice
+                .par_iter()
+                .cloned()
+                .reduce(|| f32::NEG_INFINITY, f32::max)
         } else {
             slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
         };

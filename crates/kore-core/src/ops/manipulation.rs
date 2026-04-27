@@ -17,12 +17,21 @@ impl Tensor {
         let first = tensors[0];
         let ndim = first.ndim();
         if ndim == 0 {
-            return Err(KoreError::StorageError("cat: cannot concatenate scalars".into()));
+            return Err(KoreError::StorageError(
+                "cat: cannot concatenate scalars".into(),
+            ));
         }
 
-        let axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+        let axis = if axis < 0 {
+            (ndim as isize + axis) as usize
+        } else {
+            axis as usize
+        };
         if axis >= ndim {
-            return Err(KoreError::StorageError(format!("cat: axis {} out of range for {}D tensor", axis, ndim)));
+            return Err(KoreError::StorageError(format!(
+                "cat: axis {} out of range for {}D tensor",
+                axis, ndim
+            )));
         }
 
         // Validate shapes match on all non-cat axes
@@ -58,7 +67,9 @@ impl Tensor {
         let mut cat_offset = 0;
         for t in tensors {
             let t_cont = t.contiguous();
-            let t_data = t_cont.as_f32_slice().ok_or(KoreError::UnsupportedDType(t.dtype()))?;
+            let t_data = t_cont
+                .as_f32_slice()
+                .ok_or(KoreError::UnsupportedDType(t.dtype()))?;
             let t_axis_size = t.shape().dims()[axis];
 
             for o in 0..outer {
@@ -84,9 +95,16 @@ impl Tensor {
         }
         let first = tensors[0];
         let ndim = first.ndim();
-        let axis = if axis < 0 { (ndim as isize + 1 + axis) as usize } else { axis as usize };
+        let axis = if axis < 0 {
+            (ndim as isize + 1 + axis) as usize
+        } else {
+            axis as usize
+        };
         if axis > ndim {
-            return Err(KoreError::StorageError(format!("stack: axis {} out of range", axis)));
+            return Err(KoreError::StorageError(format!(
+                "stack: axis {} out of range",
+                axis
+            )));
         }
 
         // Validate all shapes match
@@ -119,9 +137,16 @@ impl Tensor {
             return Err(KoreError::StorageError("chunk: chunks must be > 0".into()));
         }
         let ndim = self.ndim();
-        let axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+        let axis = if axis < 0 {
+            (ndim as isize + axis) as usize
+        } else {
+            axis as usize
+        };
         if axis >= ndim {
-            return Err(KoreError::StorageError(format!("chunk: axis {} out of range", axis)));
+            return Err(KoreError::StorageError(format!(
+                "chunk: axis {} out of range",
+                axis
+            )));
         }
 
         let dim_size = self.shape().dims()[axis];
@@ -134,17 +159,28 @@ impl Tensor {
     /// Last piece may be smaller.
     pub fn split(&self, split_size: usize, axis: isize) -> Result<Vec<Tensor>> {
         if split_size == 0 {
-            return Err(KoreError::StorageError("split: split_size must be > 0".into()));
+            return Err(KoreError::StorageError(
+                "split: split_size must be > 0".into(),
+            ));
         }
         let ndim = self.ndim();
-        let axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+        let axis = if axis < 0 {
+            (ndim as isize + axis) as usize
+        } else {
+            axis as usize
+        };
         if axis >= ndim {
-            return Err(KoreError::StorageError(format!("split: axis {} out of range", axis)));
+            return Err(KoreError::StorageError(format!(
+                "split: axis {} out of range",
+                axis
+            )));
         }
 
         let dim_size = self.shape().dims()[axis];
         let data = self.contiguous();
-        let src = data.as_f32_slice().ok_or(KoreError::UnsupportedDType(self.dtype()))?;
+        let src = data
+            .as_f32_slice()
+            .ok_or(KoreError::UnsupportedDType(self.dtype()))?;
 
         let outer: usize = self.shape().dims()[..axis].iter().product();
         let inner: usize = self.shape().dims()[axis + 1..].iter().product();
@@ -179,7 +215,10 @@ impl Tensor {
     /// Returns `self` where `condition > 0`, else `other`.
     /// All three tensors must have the same shape.
     pub fn where_cond(&self, condition: &Tensor, other: &Tensor) -> Result<Tensor> {
-        if self.dtype() != DType::F32 || other.dtype() != DType::F32 || condition.dtype() != DType::F32 {
+        if self.dtype() != DType::F32
+            || other.dtype() != DType::F32
+            || condition.dtype() != DType::F32
+        {
             return Err(KoreError::UnsupportedDType(self.dtype()));
         }
         if self.shape() != other.shape() || self.shape() != condition.shape() {
@@ -196,7 +235,10 @@ impl Tensor {
         let b_data = b.as_f32_slice().unwrap();
         let c_data = c.as_f32_slice().unwrap();
 
-        let result: Vec<f32> = a_data.iter().zip(b_data.iter()).zip(c_data.iter())
+        let result: Vec<f32> = a_data
+            .iter()
+            .zip(b_data.iter())
+            .zip(c_data.iter())
             .map(|((&a, &b), &c)| if c > 0.0 { a } else { b })
             .collect();
 
@@ -220,7 +262,9 @@ impl Tensor {
         let d = data.as_f32_slice().unwrap();
         let m_data = m.as_f32_slice().unwrap();
 
-        let result: Vec<f32> = d.iter().zip(m_data.iter())
+        let result: Vec<f32> = d
+            .iter()
+            .zip(m_data.iter())
             .map(|(&v, &m)| if m > 0.0 { value } else { v })
             .collect();
 
@@ -243,9 +287,16 @@ impl Tensor {
             return Err(KoreError::UnsupportedDType(self.dtype()));
         }
         let ndim = self.ndim();
-        let axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+        let axis = if axis < 0 {
+            (ndim as isize + axis) as usize
+        } else {
+            axis as usize
+        };
         if axis >= ndim {
-            return Err(KoreError::StorageError(format!("softmax: axis {} out of range", axis)));
+            return Err(KoreError::StorageError(format!(
+                "softmax: axis {} out of range",
+                axis
+            )));
         }
 
         let data = self.contiguous();
@@ -294,9 +345,16 @@ impl Tensor {
             return Err(KoreError::UnsupportedDType(self.dtype()));
         }
         let ndim = self.ndim();
-        let axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+        let axis = if axis < 0 {
+            (ndim as isize + axis) as usize
+        } else {
+            axis as usize
+        };
         if axis >= ndim {
-            return Err(KoreError::StorageError(format!("log_softmax: axis {} out of range", axis)));
+            return Err(KoreError::StorageError(format!(
+                "log_softmax: axis {} out of range",
+                axis
+            )));
         }
 
         let data = self.contiguous();
@@ -343,15 +401,24 @@ impl Tensor {
             return Err(KoreError::UnsupportedDType(self.dtype()));
         }
         let ndim = self.ndim();
-        let axis = if axis < 0 { (ndim as isize + axis) as usize } else { axis as usize };
+        let axis = if axis < 0 {
+            (ndim as isize + axis) as usize
+        } else {
+            axis as usize
+        };
         if axis >= ndim {
-            return Err(KoreError::StorageError(format!("gather: axis {} out of range", axis)));
+            return Err(KoreError::StorageError(format!(
+                "gather: axis {} out of range",
+                axis
+            )));
         }
 
         let data = self.contiguous();
         let src = data.as_f32_slice().unwrap();
         let idx_data = index.contiguous();
-        let indices = idx_data.as_f32_slice().ok_or(KoreError::UnsupportedDType(index.dtype()))?;
+        let indices = idx_data
+            .as_f32_slice()
+            .ok_or(KoreError::UnsupportedDType(index.dtype()))?;
 
         let out_shape = index.shape().dims();
         let numel: usize = out_shape.iter().product();
@@ -381,7 +448,11 @@ impl Tensor {
             multi_idx[axis] = gathered_idx;
 
             // Convert back to flat index in source
-            let src_flat: usize = multi_idx.iter().zip(src_strides.iter()).map(|(&i, &s)| i * s).sum();
+            let src_flat: usize = multi_idx
+                .iter()
+                .zip(src_strides.iter())
+                .map(|(&i, &s)| i * s)
+                .sum();
             result[flat_idx] = src[src_flat];
         }
 
@@ -395,7 +466,9 @@ fn tri_op(tensor: &Tensor, k: isize, upper: bool) -> Result<Tensor> {
     }
     let dims = tensor.shape().dims();
     if dims.len() < 2 {
-        return Err(KoreError::StorageError("triu/tril requires at least 2D tensor".into()));
+        return Err(KoreError::StorageError(
+            "triu/tril requires at least 2D tensor".into(),
+        ));
     }
 
     let data = tensor.contiguous();
@@ -412,7 +485,9 @@ fn tri_op(tensor: &Tensor, k: isize, upper: bool) -> Result<Tensor> {
                 let idx = b * rows * cols + r * cols + c;
                 let diag = c as isize - r as isize;
                 if upper {
-                    if diag < k { result[idx] = 0.0; }
+                    if diag < k {
+                        result[idx] = 0.0;
+                    }
                 } else if diag > k {
                     result[idx] = 0.0;
                 }
@@ -450,7 +525,10 @@ mod tests {
         let b = Tensor::from_f32(&[5.0, 6.0, 7.0, 8.0, 9.0, 10.0], &[2, 3]);
         let c = Tensor::cat(&[&a, &b], 1).unwrap();
         assert_eq!(c.shape().dims(), &[2, 5]);
-        assert_eq!(c.as_f32_slice().unwrap(), &[1.0, 2.0, 5.0, 6.0, 7.0, 3.0, 4.0, 8.0, 9.0, 10.0]);
+        assert_eq!(
+            c.as_f32_slice().unwrap(),
+            &[1.0, 2.0, 5.0, 6.0, 7.0, 3.0, 4.0, 8.0, 9.0, 10.0]
+        );
     }
 
     #[test]
@@ -515,14 +593,20 @@ mod tests {
     fn test_triu() {
         let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[3, 3]);
         let u = a.triu(0).unwrap();
-        assert_eq!(u.as_f32_slice().unwrap(), &[1.0, 2.0, 3.0, 0.0, 5.0, 6.0, 0.0, 0.0, 9.0]);
+        assert_eq!(
+            u.as_f32_slice().unwrap(),
+            &[1.0, 2.0, 3.0, 0.0, 5.0, 6.0, 0.0, 0.0, 9.0]
+        );
     }
 
     #[test]
     fn test_tril() {
         let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[3, 3]);
         let l = a.tril(0).unwrap();
-        assert_eq!(l.as_f32_slice().unwrap(), &[1.0, 0.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0, 9.0]);
+        assert_eq!(
+            l.as_f32_slice().unwrap(),
+            &[1.0, 0.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0, 9.0]
+        );
     }
 
     #[test]
@@ -531,7 +615,11 @@ mod tests {
         let s = a.softmax(-1).unwrap();
         let data = s.as_f32_slice().unwrap();
         let sum: f32 = data.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "softmax should sum to 1, got {}", sum);
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "softmax should sum to 1, got {}",
+            sum
+        );
         assert!(data[2] > data[1] && data[1] > data[0]);
     }
 
@@ -584,6 +672,9 @@ mod tests {
     fn test_triu_with_offset() {
         let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[3, 3]);
         let u = a.triu(1).unwrap();
-        assert_eq!(u.as_f32_slice().unwrap(), &[0.0, 2.0, 3.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            u.as_f32_slice().unwrap(),
+            &[0.0, 2.0, 3.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0]
+        );
     }
 }

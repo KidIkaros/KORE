@@ -55,9 +55,7 @@ impl DType {
                 // 4 values per byte (2 bits each)
                 n.div_ceil(4)
             }
-            other => {
-                other.element_size().unwrap() * n
-            }
+            other => other.element_size().unwrap() * n,
         }
     }
 

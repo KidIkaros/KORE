@@ -36,7 +36,7 @@ pub mod ops;
 
 pub use backend::VulkanBackend;
 pub use buffer::{KoreVulkanBuffer, ToVulkanBuffer};
-pub use error::{VulkanError, Result};
+pub use error::{Result, VulkanError};
 
 #[cfg(test)]
 mod tests {

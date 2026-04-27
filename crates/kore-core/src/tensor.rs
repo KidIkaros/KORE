@@ -4,8 +4,8 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::autograd::GradNode;
-use crate::dtype::DType;
 use crate::device::Device;
+use crate::dtype::DType;
 use crate::error::KoreError;
 use crate::shape::Shape;
 use crate::storage::Storage;
@@ -140,8 +140,13 @@ impl Tensor {
     /// Panics if `step` is zero or if `step` direction doesn't match `start`→`end`.
     pub fn arange(start: f32, end: f32, step: f32) -> Self {
         assert!(step != 0.0, "arange: step must be non-zero");
-        assert!((end - start) * step > 0.0 || (end - start).abs() < f32::EPSILON,
-            "arange: step direction ({}) does not match start ({}) → end ({})", step, start, end);
+        assert!(
+            (end - start) * step > 0.0 || (end - start).abs() < f32::EPSILON,
+            "arange: step direction ({}) does not match start ({}) → end ({})",
+            step,
+            start,
+            end
+        );
         let mut data = Vec::new();
         let mut v = start;
         if step > 0.0 {
@@ -356,12 +361,13 @@ impl Tensor {
 
     /// Reshape the tensor (zero-copy if contiguous).
     pub fn reshape(&self, new_shape: &[isize]) -> Result<Tensor> {
-        let resolved = self.shape.resolve_reshape(new_shape).ok_or_else(|| {
-            KoreError::InvalidReshape {
-                numel: self.numel(),
-                shape: new_shape.iter().map(|&d| d as usize).collect(),
-            }
-        })?;
+        let resolved =
+            self.shape
+                .resolve_reshape(new_shape)
+                .ok_or_else(|| KoreError::InvalidReshape {
+                    numel: self.numel(),
+                    shape: new_shape.iter().map(|&d| d as usize).collect(),
+                })?;
 
         if !self.is_contiguous() {
             return Err(KoreError::StorageError(
@@ -382,12 +388,13 @@ impl Tensor {
 
     /// Transpose the last two dimensions (zero-copy view).
     pub fn transpose(&self) -> Result<Tensor> {
-        let new_shape = self.shape.transpose().ok_or_else(|| {
-            KoreError::InvalidAxis {
+        let new_shape = self
+            .shape
+            .transpose()
+            .ok_or_else(|| KoreError::InvalidAxis {
                 axis: 0,
                 ndim: self.ndim(),
-            }
-        })?;
+            })?;
 
         let ndim = self.ndim();
         let mut new_strides = self.strides.clone();
@@ -475,7 +482,7 @@ impl Tensor {
     }
 
     /// Move tensor to Vulkan device (convenience for `.to(Device::Vulkan(idx))`).
-    /// 
+    ///
     /// Note: This requires the kore-vulkan crate for actual transfer.
     /// The tensor will be marked as Vulkan device but operations require VulkanBackend.
     pub fn vulkan(&self, _device_idx: usize) -> Result<Tensor> {
@@ -503,7 +510,8 @@ impl Tensor {
             let numel = self.numel();
             let mut data = vec![0.0f32; numel];
             for (i, slot) in data.iter_mut().enumerate() {
-                *slot = self.get_f32(i)
+                *slot = self
+                    .get_f32(i)
                     .expect("contiguous: index out of bounds during copy");
             }
             let mut t = Tensor::from_f32(&data, self.shape.dims());

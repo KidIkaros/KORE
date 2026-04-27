@@ -6,12 +6,21 @@
 use kore_core::{Device, Tensor};
 
 fn assert_close(a: &[f32], b: &[f32], tol: f32) {
-    assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "length mismatch: {} vs {}",
+        a.len(),
+        b.len()
+    );
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         assert!(
             (x - y).abs() < tol,
             "element {} differs: {} vs {} (tol={})",
-            i, x, y, tol
+            i,
+            x,
+            y,
+            tol
         );
     }
 }
@@ -50,8 +59,12 @@ fn test_cuda_noop_transfer() {
 
 #[test]
 fn test_cuda_add() {
-    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4]).cuda(0).unwrap();
-    let b = Tensor::from_f32(&[5.0, 6.0, 7.0, 8.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4])
+        .cuda(0)
+        .unwrap();
+    let b = Tensor::from_f32(&[5.0, 6.0, 7.0, 8.0], &[4])
+        .cuda(0)
+        .unwrap();
     let c = a.add(&b).unwrap();
     assert!(c.is_cuda());
     let result = c.cpu().unwrap();
@@ -60,8 +73,12 @@ fn test_cuda_add() {
 
 #[test]
 fn test_cuda_sub() {
-    let a = Tensor::from_f32(&[5.0, 6.0, 7.0, 8.0], &[4]).cuda(0).unwrap();
-    let b = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[5.0, 6.0, 7.0, 8.0], &[4])
+        .cuda(0)
+        .unwrap();
+    let b = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4])
+        .cuda(0)
+        .unwrap();
     let c = a.sub(&b).unwrap();
     let result = c.cpu().unwrap();
     assert_eq!(result.as_f32_slice().unwrap(), &[4.0, 4.0, 4.0, 4.0]);
@@ -69,8 +86,12 @@ fn test_cuda_sub() {
 
 #[test]
 fn test_cuda_mul() {
-    let a = Tensor::from_f32(&[2.0, 3.0, 4.0, 5.0], &[4]).cuda(0).unwrap();
-    let b = Tensor::from_f32(&[3.0, 4.0, 5.0, 6.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[2.0, 3.0, 4.0, 5.0], &[4])
+        .cuda(0)
+        .unwrap();
+    let b = Tensor::from_f32(&[3.0, 4.0, 5.0, 6.0], &[4])
+        .cuda(0)
+        .unwrap();
     let c = a.mul(&b).unwrap();
     let result = c.cpu().unwrap();
     assert_eq!(result.as_f32_slice().unwrap(), &[6.0, 12.0, 20.0, 30.0]);
@@ -78,8 +99,12 @@ fn test_cuda_mul() {
 
 #[test]
 fn test_cuda_div() {
-    let a = Tensor::from_f32(&[10.0, 20.0, 30.0, 40.0], &[4]).cuda(0).unwrap();
-    let b = Tensor::from_f32(&[2.0, 4.0, 5.0, 8.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[10.0, 20.0, 30.0, 40.0], &[4])
+        .cuda(0)
+        .unwrap();
+    let b = Tensor::from_f32(&[2.0, 4.0, 5.0, 8.0], &[4])
+        .cuda(0)
+        .unwrap();
     let c = a.div(&b).unwrap();
     let result = c.cpu().unwrap();
     assert_eq!(result.as_f32_slice().unwrap(), &[5.0, 5.0, 6.0, 5.0]);
@@ -91,7 +116,9 @@ fn test_cuda_div() {
 
 #[test]
 fn test_cuda_neg() {
-    let a = Tensor::from_f32(&[1.0, -2.0, 3.0, -4.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[1.0, -2.0, 3.0, -4.0], &[4])
+        .cuda(0)
+        .unwrap();
     let c = a.neg().unwrap();
     let result = c.cpu().unwrap();
     assert_eq!(result.as_f32_slice().unwrap(), &[-1.0, 2.0, -3.0, 4.0]);
@@ -99,7 +126,9 @@ fn test_cuda_neg() {
 
 #[test]
 fn test_cuda_abs() {
-    let a = Tensor::from_f32(&[-1.0, 2.0, -3.0, 4.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[-1.0, 2.0, -3.0, 4.0], &[4])
+        .cuda(0)
+        .unwrap();
     let c = a.abs().unwrap();
     let result = c.cpu().unwrap();
     assert_eq!(result.as_f32_slice().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
@@ -107,7 +136,9 @@ fn test_cuda_abs() {
 
 #[test]
 fn test_cuda_exp_log() {
-    let a = Tensor::from_f32(&[0.0, 1.0, 2.0, 3.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[0.0, 1.0, 2.0, 3.0], &[4])
+        .cuda(0)
+        .unwrap();
     let b = a.exp().unwrap();
     let c = b.log().unwrap();
     let result = c.cpu().unwrap();
@@ -117,7 +148,9 @@ fn test_cuda_exp_log() {
 
 #[test]
 fn test_cuda_sqrt() {
-    let a = Tensor::from_f32(&[1.0, 4.0, 9.0, 16.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[1.0, 4.0, 9.0, 16.0], &[4])
+        .cuda(0)
+        .unwrap();
     let c = a.sqrt().unwrap();
     let result = c.cpu().unwrap();
     assert_close(result.as_f32_slice().unwrap(), &[1.0, 2.0, 3.0, 4.0], 1e-6);
@@ -129,7 +162,9 @@ fn test_cuda_sqrt() {
 
 #[test]
 fn test_cuda_add_scalar() {
-    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4])
+        .cuda(0)
+        .unwrap();
     let c = a.add_scalar(10.0).unwrap();
     let result = c.cpu().unwrap();
     assert_eq!(result.as_f32_slice().unwrap(), &[11.0, 12.0, 13.0, 14.0]);
@@ -137,7 +172,9 @@ fn test_cuda_add_scalar() {
 
 #[test]
 fn test_cuda_mul_scalar() {
-    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4])
+        .cuda(0)
+        .unwrap();
     let c = a.mul_scalar(3.0).unwrap();
     let result = c.cpu().unwrap();
     assert_eq!(result.as_f32_slice().unwrap(), &[3.0, 6.0, 9.0, 12.0]);
@@ -150,8 +187,12 @@ fn test_cuda_mul_scalar() {
 #[test]
 fn test_cuda_matmul_small() {
     // [2,3] @ [3,2] → [2,2]
-    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]).cuda(0).unwrap();
-    let b = Tensor::from_f32(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &[3, 2]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])
+        .cuda(0)
+        .unwrap();
+    let b = Tensor::from_f32(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &[3, 2])
+        .cuda(0)
+        .unwrap();
     let c = a.matmul(&b).unwrap();
     assert!(c.is_cuda());
     assert_eq!(c.shape().dims(), &[2, 2]);
@@ -162,8 +203,12 @@ fn test_cuda_matmul_small() {
 #[test]
 fn test_cuda_matmul_identity() {
     // A @ I = A
-    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]).cuda(0).unwrap();
-    let eye = Tensor::from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2])
+        .cuda(0)
+        .unwrap();
+    let eye = Tensor::from_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2])
+        .cuda(0)
+        .unwrap();
     let c = a.matmul(&eye).unwrap();
     let result = c.cpu().unwrap();
     assert_eq!(result.as_f32_slice().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
@@ -221,8 +266,12 @@ fn test_cuda_matmul_large() {
 
 #[test]
 fn test_cuda_chained_ops() {
-    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4]).cuda(0).unwrap();
-    let b = Tensor::from_f32(&[2.0, 2.0, 2.0, 2.0], &[4]).cuda(0).unwrap();
+    let a = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[4])
+        .cuda(0)
+        .unwrap();
+    let b = Tensor::from_f32(&[2.0, 2.0, 2.0, 2.0], &[4])
+        .cuda(0)
+        .unwrap();
 
     // (a + b) * a - b = (3*6*5*8) - (2*2*2*2) = (3,8,15,24) - ... wait
     // (a + b) = [3, 4, 5, 6]

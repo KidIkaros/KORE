@@ -18,20 +18,33 @@ use crate::{DType, Device, KoreError, Result};
 
 /// Function names exported by each CUDA module.
 const ELEMENTWISE_FUNCS: &[&str] = &[
-    "add_f32", "sub_f32", "mul_f32", "div_f32",
-    "add_scalar_f32", "mul_scalar_f32",
-    "neg_f32", "abs_f32", "sqrt_f32", "exp_f32", "log_f32",
-    "relu_f32", "gelu_f32", "silu_f32", "sigmoid_f32", "tanh_f32",
-    "clamp_f32", "pow_scalar_f32",
+    "add_f32",
+    "sub_f32",
+    "mul_f32",
+    "div_f32",
+    "add_scalar_f32",
+    "mul_scalar_f32",
+    "neg_f32",
+    "abs_f32",
+    "sqrt_f32",
+    "exp_f32",
+    "log_f32",
+    "relu_f32",
+    "gelu_f32",
+    "silu_f32",
+    "sigmoid_f32",
+    "tanh_f32",
+    "clamp_f32",
+    "pow_scalar_f32",
 ];
 
-const MATMUL_FUNCS: &[&str] = &[
-    "matmul_f32", "matmul_f32_tiled2x2", "matmul_bias_relu_f32",
-];
+const MATMUL_FUNCS: &[&str] = &["matmul_f32", "matmul_f32_tiled2x2", "matmul_bias_relu_f32"];
 
 const REDUCE_FUNCS: &[&str] = &[
-    "reduce_sum_f32", "reduce_max_f32",
-    "reduce_sum_rows_f32", "reduce_max_rows_f32",
+    "reduce_sum_f32",
+    "reduce_max_f32",
+    "reduce_sum_rows_f32",
+    "reduce_max_rows_f32",
 ];
 
 /// Get a CUDA kernel function, compiling and loading the module if needed.
@@ -53,8 +66,12 @@ fn get_func(
         .map_err(|e| KoreError::CudaError(format!("PTX compile '{}': {}", module_name, e)))?;
     dev.load_ptx(ptx, module_name, func_names)
         .map_err(|e| KoreError::CudaError(format!("load module '{}': {}", module_name, e)))?;
-    dev.get_func(module_name, func_name)
-        .ok_or_else(|| KoreError::CudaError(format!("func '{}' not found in '{}'", func_name, module_name)))
+    dev.get_func(module_name, func_name).ok_or_else(|| {
+        KoreError::CudaError(format!(
+            "func '{}' not found in '{}'",
+            func_name, module_name
+        ))
+    })
 }
 
 // ============================================================================
@@ -74,13 +91,17 @@ const BLOCK_SIZE: usize = 256;
 
 /// Extract (CudaDevice, device_idx, CudaSlice<u8>) from a GPU tensor's storage.
 fn gpu_parts(t: &Tensor) -> Result<(Arc<CudaDevice>, usize, &CudaSlice<u8>)> {
-    let dev = t.storage_ref().cuda_device()
+    let dev = t
+        .storage_ref()
+        .cuda_device()
         .ok_or_else(|| KoreError::CudaError("tensor not on GPU".into()))?;
     let idx = match t.device() {
         Device::Cuda(i) => i,
         _ => return Err(KoreError::CudaError("tensor not on GPU".into())),
     };
-    let slice = t.storage_ref().as_cuda_slice()
+    let slice = t
+        .storage_ref()
+        .as_cuda_slice()
         .ok_or_else(|| KoreError::CudaError("tensor not on GPU".into()))?;
     Ok((dev, idx, slice))
 }
@@ -94,7 +115,9 @@ unsafe fn as_f32_view(slice: &CudaSlice<u8>, numel: usize) -> CudaView<'_, f32> 
 /// Reinterpret a CudaSlice<u8> as a CudaViewMut<f32> (mutable) for kernel output.
 /// Safety: caller must ensure numel*4 <= slice.len().
 unsafe fn as_f32_view_mut(slice: &mut CudaSlice<u8>, numel: usize) -> CudaViewMut<'_, f32> {
-    slice.transmute_mut(numel).expect("f32 transmute_mut failed")
+    slice
+        .transmute_mut(numel)
+        .expect("f32 transmute_mut failed")
 }
 
 /// Allocate a zeroed u8 buffer sized for `numel` f32 elements, returning the buffer.
@@ -127,16 +150,18 @@ fn grid_1d(n: usize, block: usize) -> LaunchConfig {
 // Binary element-wise ops
 // ============================================================================
 
-pub(crate) fn cuda_binary_op(
-    a: &Tensor,
-    b: &Tensor,
-    func_name: &str,
-) -> Result<Tensor> {
+pub(crate) fn cuda_binary_op(a: &Tensor, b: &Tensor, func_name: &str) -> Result<Tensor> {
     let (dev, idx, a_slice) = gpu_parts(a)?;
     let (_, _, b_slice) = gpu_parts(b)?;
     let n = a.numel();
 
-    let f = get_func(&dev, "elementwise", func_name, ELEMENTWISE_CU, ELEMENTWISE_FUNCS)?;
+    let f = get_func(
+        &dev,
+        "elementwise",
+        func_name,
+        ELEMENTWISE_CU,
+        ELEMENTWISE_FUNCS,
+    )?;
     let mut out = alloc_f32_as_u8(&dev, n)?;
     let cfg = grid_1d(n, BLOCK_SIZE);
     unsafe {
@@ -153,14 +178,17 @@ pub(crate) fn cuda_binary_op(
 // Unary element-wise ops
 // ============================================================================
 
-pub(crate) fn cuda_unary_op(
-    a: &Tensor,
-    func_name: &str,
-) -> Result<Tensor> {
+pub(crate) fn cuda_unary_op(a: &Tensor, func_name: &str) -> Result<Tensor> {
     let (dev, idx, a_slice) = gpu_parts(a)?;
     let n = a.numel();
 
-    let f = get_func(&dev, "elementwise", func_name, ELEMENTWISE_CU, ELEMENTWISE_FUNCS)?;
+    let f = get_func(
+        &dev,
+        "elementwise",
+        func_name,
+        ELEMENTWISE_CU,
+        ELEMENTWISE_FUNCS,
+    )?;
     let mut out = alloc_f32_as_u8(&dev, n)?;
     let cfg = grid_1d(n, BLOCK_SIZE);
     unsafe {
@@ -176,15 +204,17 @@ pub(crate) fn cuda_unary_op(
 // Scalar ops
 // ============================================================================
 
-pub(crate) fn cuda_scalar_op(
-    a: &Tensor,
-    scalar: f32,
-    func_name: &str,
-) -> Result<Tensor> {
+pub(crate) fn cuda_scalar_op(a: &Tensor, scalar: f32, func_name: &str) -> Result<Tensor> {
     let (dev, idx, a_slice) = gpu_parts(a)?;
     let n = a.numel();
 
-    let f = get_func(&dev, "elementwise", func_name, ELEMENTWISE_CU, ELEMENTWISE_FUNCS)?;
+    let f = get_func(
+        &dev,
+        "elementwise",
+        func_name,
+        ELEMENTWISE_CU,
+        ELEMENTWISE_FUNCS,
+    )?;
     let mut out = alloc_f32_as_u8(&dev, n)?;
     let cfg = grid_1d(n, BLOCK_SIZE);
     unsafe {
@@ -196,15 +226,17 @@ pub(crate) fn cuda_scalar_op(
     Ok(tensor_from_gpu(dev, idx, out, a.shape().dims()))
 }
 
-pub(crate) fn cuda_clamp(
-    a: &Tensor,
-    lo: f32,
-    hi: f32,
-) -> Result<Tensor> {
+pub(crate) fn cuda_clamp(a: &Tensor, lo: f32, hi: f32) -> Result<Tensor> {
     let (dev, idx, a_slice) = gpu_parts(a)?;
     let n = a.numel();
 
-    let f = get_func(&dev, "elementwise", "clamp_f32", ELEMENTWISE_CU, ELEMENTWISE_FUNCS)?;
+    let f = get_func(
+        &dev,
+        "elementwise",
+        "clamp_f32",
+        ELEMENTWISE_CU,
+        ELEMENTWISE_FUNCS,
+    )?;
     let mut out = alloc_f32_as_u8(&dev, n)?;
     let cfg = grid_1d(n, BLOCK_SIZE);
     unsafe {
@@ -236,20 +268,26 @@ pub(crate) fn cuda_matmul_2d(a: &Tensor, b: &Tensor) -> Result<Tensor> {
     let (func_name, cfg) = if m >= 64 && n >= 64 {
         let grid_x = ((n + 63) / 64) as u32;
         let grid_y = ((m + 63) / 64) as u32;
-        ("matmul_f32_tiled2x2", LaunchConfig {
-            grid_dim: (grid_x, grid_y, 1),
-            block_dim: (32, 32, 1),
-            shared_mem_bytes: 0,
-        })
+        (
+            "matmul_f32_tiled2x2",
+            LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (32, 32, 1),
+                shared_mem_bytes: 0,
+            },
+        )
     } else {
         let tile = 32;
         let grid_x = ((n + tile - 1) / tile) as u32;
         let grid_y = ((m + tile - 1) / tile) as u32;
-        ("matmul_f32", LaunchConfig {
-            grid_dim: (grid_x, grid_y, 1),
-            block_dim: (tile as u32, tile as u32, 1),
-            shared_mem_bytes: 0,
-        })
+        (
+            "matmul_f32",
+            LaunchConfig {
+                grid_dim: (grid_x, grid_y, 1),
+                block_dim: (tile as u32, tile as u32, 1),
+                shared_mem_bytes: 0,
+            },
+        )
     };
 
     let f = get_func(&dev, "matmul", func_name, MATMUL_CU, MATMUL_FUNCS)?;
@@ -257,8 +295,11 @@ pub(crate) fn cuda_matmul_2d(a: &Tensor, b: &Tensor) -> Result<Tensor> {
         let a_f32 = as_f32_view(a_slice, m * k);
         let b_f32 = as_f32_view(b_slice, k * n);
         let mut out_f32 = as_f32_view_mut(&mut out, m * n);
-        f.launch(cfg, (&a_f32, &b_f32, &mut out_f32, m as u32, n as u32, k as u32))
-            .map_err(|e| KoreError::CudaError(format!("launch {}: {}", func_name, e)))?;
+        f.launch(
+            cfg,
+            (&a_f32, &b_f32, &mut out_f32, m as u32, n as u32, k as u32),
+        )
+        .map_err(|e| KoreError::CudaError(format!("launch {}: {}", func_name, e)))?;
     }
     Ok(tensor_from_gpu(dev, idx, out, &[m, n]))
 }

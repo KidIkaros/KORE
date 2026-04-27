@@ -67,10 +67,7 @@ impl Storage {
 
     /// Create storage from a slice of f32 values.
     pub fn from_f32(data: &[f32]) -> Self {
-        let bytes: Vec<u8> = data
-            .iter()
-            .flat_map(|v| v.to_ne_bytes())
-            .collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_ne_bytes()).collect();
         Self {
             data: Arc::new(StorageData::Cpu(bytes)),
             dtype: DType::F32,
@@ -81,10 +78,7 @@ impl Storage {
 
     /// Create storage from a slice of f64 values.
     pub fn from_f64(data: &[f64]) -> Self {
-        let bytes: Vec<u8> = data
-            .iter()
-            .flat_map(|v| v.to_ne_bytes())
-            .collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_ne_bytes()).collect();
         Self {
             data: Arc::new(StorageData::Cpu(bytes)),
             dtype: DType::F64,
@@ -95,10 +89,7 @@ impl Storage {
 
     /// Create storage from a slice of i32 values.
     pub fn from_i32(data: &[i32]) -> Self {
-        let bytes: Vec<u8> = data
-            .iter()
-            .flat_map(|v| v.to_ne_bytes())
-            .collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_ne_bytes()).collect();
         Self {
             data: Arc::new(StorageData::Cpu(bytes)),
             dtype: DType::I32,
@@ -137,7 +128,9 @@ impl Storage {
         match self.data.as_ref() {
             StorageData::Cpu(v) => v,
             #[cfg(feature = "cuda")]
-            StorageData::Cuda { .. } => panic!("Cannot access GPU storage as bytes — transfer to CPU first with .to(Device::Cpu)"),
+            StorageData::Cuda { .. } => panic!(
+                "Cannot access GPU storage as bytes — transfer to CPU first with .to(Device::Cpu)"
+            ),
         }
     }
 
@@ -149,7 +142,9 @@ impl Storage {
         match data {
             StorageData::Cpu(v) => v,
             #[cfg(feature = "cuda")]
-            StorageData::Cuda { .. } => panic!("Cannot mutate GPU storage as bytes — transfer to CPU first"),
+            StorageData::Cuda { .. } => {
+                panic!("Cannot mutate GPU storage as bytes — transfer to CPU first")
+            }
         }
     }
 

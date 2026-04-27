@@ -8,7 +8,11 @@ use crate::Result;
 impl Tensor {
     /// Element-wise equality check. Returns a tensor of 1.0 (true) or 0.0 (false).
     pub fn eq_tensor(&self, other: &Tensor) -> Result<Tensor> {
-        cmp_op(self, other, |a, b| if (a - b).abs() < 1e-7 { 1.0 } else { 0.0 })
+        cmp_op(
+            self,
+            other,
+            |a, b| if (a - b).abs() < 1e-7 { 1.0 } else { 0.0 },
+        )
     }
 
     /// Element-wise greater-than. Returns 1.0 where self > other.
