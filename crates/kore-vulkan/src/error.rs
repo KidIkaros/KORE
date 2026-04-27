@@ -1,6 +1,7 @@
 //! Error types for kore-vulkan.
 
 use thiserror::Error;
+use kore_core::DType;
 
 pub type Result<T> = std::result::Result<T, VulkanError>;
 
@@ -14,6 +15,9 @@ pub enum VulkanError {
 
     #[error("Operation not supported: {0}")]
     UnsupportedOperation(String),
+
+    #[error("DType not supported: {0:?}")]
+    UnsupportedDType(DType),
 
     #[error("Tensor device mismatch: expected {expected}, got {actual}")]
     DeviceMismatch { expected: String, actual: String },
