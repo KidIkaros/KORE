@@ -417,6 +417,11 @@ impl Tensor {
         self.storage.is_cuda()
     }
 
+    /// Whether this tensor is on a Vulkan device.
+    pub fn is_vulkan(&self) -> bool {
+        self.storage.is_vulkan()
+    }
+
     /// Move tensor to the specified device. No-op if already there.
     #[cfg(feature = "cuda")]
     pub fn to(&self, device: Device) -> Result<Tensor> {
@@ -453,6 +458,13 @@ impl Tensor {
                     grad_node: cont.grad_node.clone(),
                 })
             }
+            Device::Vulkan(_) => {
+                // Vulkan device transfer requires kore-vulkan crate
+                // Use kore_vulkan::VulkanBackend for explicit transfer
+                Err(KoreError::StorageError(
+                    "Vulkan device transfer requires kore-vulkan crate. Use VulkanBackend::transfer() instead.".to_string()
+                ))
+            }
         }
     }
 
@@ -460,6 +472,18 @@ impl Tensor {
     #[cfg(feature = "cuda")]
     pub fn cuda(&self, device_idx: usize) -> Result<Tensor> {
         self.to(Device::Cuda(device_idx))
+    }
+
+    /// Move tensor to Vulkan device (convenience for `.to(Device::Vulkan(idx))`).
+    /// 
+    /// Note: This requires the kore-vulkan crate for actual transfer.
+    /// The tensor will be marked as Vulkan device but operations require VulkanBackend.
+    pub fn vulkan(&self, _device_idx: usize) -> Result<Tensor> {
+        // Vulkan device transfer requires kore-vulkan crate
+        // Use kore_vulkan::VulkanBackend::transfer() for actual GPU transfer
+        Err(KoreError::StorageError(
+            "Vulkan device transfer requires kore-vulkan crate. Use VulkanBackend::transfer() instead.".to_string()
+        ))
     }
 
     /// Move tensor to CPU (convenience for `.to(Device::Cpu)`).

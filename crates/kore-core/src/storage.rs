@@ -206,6 +206,11 @@ impl Storage {
         self.device.is_cuda()
     }
 
+    /// Whether this storage is on a Vulkan device.
+    pub fn is_vulkan(&self) -> bool {
+        self.device.is_vulkan()
+    }
+
     /// Create GPU storage from host bytes (H2D copy).
     #[cfg(feature = "cuda")]
     pub fn to_cuda(&self, device_idx: usize) -> Result<Self> {
