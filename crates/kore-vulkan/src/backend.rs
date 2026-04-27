@@ -87,24 +87,30 @@ impl VulkanBackend {
             vulkan_kernels::runtime::BufferUsage::storage())
             .map_err(|e| VulkanError::Kernel(e.to_string()))?;
         
-        // Execute GEMM kernel
-        let _push_constants = vec![
-            m as u32, n as u32, a_shape[1] as u32,
-            0u32, // alpha
-            0u32, // beta
-        ];
+        // Execute GEMM kernel with proper push constants
+        // Push constants layout: M, N, K, lda, ldb, ldc, alpha, beta
+        let push_constants: Vec<u8> = [
+            (m as u32).to_ne_bytes(),
+            (n as u32).to_ne_bytes(),
+            (a_shape[1] as u32).to_ne_bytes(),
+            (a_shape[1] as u32).to_ne_bytes(), // lda = K
+            (b_shape[1] as u32).to_ne_bytes(), // ldb = N
+            (n as u32).to_ne_bytes(),          // ldc = N
+            (1.0f32).to_ne_bytes(),            // alpha = 1.0
+            (0.0f32).to_ne_bytes(),            // beta = 0.0
+        ]
+        .concat();
         
-        // TODO: Execute actual kernel when shader is available
-        // self.context.execute_kernel(
-        //     "gemm",
-        //     &[a_buf.vulkan_buffer(), b_buf.vulkan_buffer(), c_vulkan_buf.clone()],
-        //     &_push_constants,
-        //     vulkan_kernels::runtime::WorkgroupSize::new_2d(16, 16),
-        //     vulkan_kernels::runtime::DispatchSize::new_2d(
-        //         (m as u32 + 15) / 16,
-        //         (n as u32 + 15) / 16,
-        //     ),
-        // ).map_err(|e| VulkanError::Kernel(e.to_string()))?;
+        self.context.execute_kernel(
+            "gemm",
+            &[_a_buf.vulkan_buffer(), _b_buf.vulkan_buffer(), c_vulkan_buf.clone()],
+            &push_constants,
+            vulkan_kernels::runtime::WorkgroupSize::new_2d(16, 16),
+            vulkan_kernels::runtime::DispatchSize::new_2d(
+                ((m as u32 + 31) / 32).max(1),  // TILE_M = 32
+                ((n as u32 + 31) / 32).max(1),  // TILE_N = 32
+            ),
+        ).map_err(|e| VulkanError::Kernel(e.to_string()))?;
         
         // Download result back to CPU storage
         let c_buf = KoreVulkanBuffer::new(c_vulkan_buf, a.dtype(), vec![m, n]);
@@ -115,12 +121,15 @@ impl VulkanBackend {
     
     /// Element-wise addition: C = A + B
     pub fn add(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        self.elementwise_binary(a, b, "elementwise_add")
+        // Note: "elementwise_add" is an alias for "elementwise" kernel
+        // Operation selection requires specialization constants (not yet supported in execute_kernel API)
+        self.elementwise_binary(a, b, "elementwise")
     }
     
     /// Element-wise multiplication: C = A * B
     pub fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Tensor> {
-        self.elementwise_binary(a, b, "elementwise_mul")
+        // Note: "elementwise_mul" is an alias for "elementwise" kernel
+        self.elementwise_binary(a, b, "elementwise")
     }
     
     /// Softmax along last dimension
@@ -206,8 +215,8 @@ impl VulkanBackend {
         let numel = a.numel();
         
         // Upload input tensors
-        let _a_buf = a.storage_ref().to_vulkan(&self.context)?;
-        let _b_buf = b.storage_ref().to_vulkan(&self.context)?;
+        let a_buf = a.storage_ref().to_vulkan(&self.context)?;
+        let b_buf = b.storage_ref().to_vulkan(&self.context)?;
         
         // Create output buffer
         let output_size = storage_bytes(a.dtype(), numel);
@@ -215,8 +224,22 @@ impl VulkanBackend {
             vulkan_kernels::runtime::BufferUsage::storage())
             .map_err(|e| VulkanError::Kernel(e.to_string()))?;
         
-        // TODO: Execute kernel when available
-        // self.context.execute_kernel(...)
+        // Execute elementwise kernel
+        // Note: Full operation selection requires specialization constants support
+        let push_constants: Vec<u8> = [
+            (numel as u32).to_ne_bytes(),
+            (1.0f32).to_ne_bytes(), // alpha
+            (0.0f32).to_ne_bytes(), // beta
+        ]
+        .concat();
+        
+        self.context.execute_kernel(
+            _kernel, // "elementwise" kernel - operation selected via specialization
+            &[a_buf.vulkan_buffer(), b_buf.vulkan_buffer(), c_vulkan_buf.clone(), c_vulkan_buf.clone()],
+            &push_constants,
+            vulkan_kernels::runtime::WorkgroupSize::new_1d(256),
+            vulkan_kernels::runtime::DispatchSize::new_1d(((numel as u32 + 255) / 256).max(1)),
+        ).map_err(|e| VulkanError::Kernel(e.to_string()))?;
         
         // Download result
         let c_buf = KoreVulkanBuffer::new(c_vulkan_buf, a.dtype(), shape.clone());

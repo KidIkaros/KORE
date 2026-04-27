@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use kore_core::{Storage, DType, Device};
+use kore_core::{Storage, DType};
 use vulkan_kernels::runtime::{Buffer as VulkanBuffer, BufferUsage};
 
 use crate::error::{Result, VulkanError};
