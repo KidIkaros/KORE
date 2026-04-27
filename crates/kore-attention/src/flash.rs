@@ -57,7 +57,10 @@ pub fn flash_attention(
 
     if d_k != k_dims[1] {
         return Err(KoreError::MatmulDimMismatch {
-            m: seq_q, k1: d_k, k2: k_dims[1], n: seq_k,
+            m: seq_q,
+            k1: d_k,
+            k2: k_dims[1],
+            n: seq_k,
         });
     }
 
@@ -70,8 +73,8 @@ pub fn flash_attention(
     // Output accumulator
     let mut output = vec![0.0f32; seq_q * d_v];
     // Running softmax statistics per query row
-    let mut row_max = vec![f32::NEG_INFINITY; seq_q];   // m_i
-    let mut row_sum = vec![0.0f32; seq_q];               // l_i
+    let mut row_max = vec![f32::NEG_INFINITY; seq_q]; // m_i
+    let mut row_sum = vec![0.0f32; seq_q]; // l_i
 
     // Process K/V in blocks
     for kv_start in (0..seq_k).step_by(BLOCK_SIZE) {
@@ -136,7 +139,11 @@ pub fn flash_attention(
 
     // Final normalization
     for qi in 0..seq_q {
-        let inv_sum = if row_sum[qi] > 0.0 { 1.0 / row_sum[qi] } else { 0.0 };
+        let inv_sum = if row_sum[qi] > 0.0 {
+            1.0 / row_sum[qi]
+        } else {
+            0.0
+        };
         for j in 0..d_v {
             output[qi * d_v + j] *= inv_sum;
         }
@@ -148,15 +155,17 @@ pub fn flash_attention(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scaled_dot::scaled_dot_product_attention;
     use crate::mask::causal_mask;
+    use crate::scaled_dot::scaled_dot_product_attention;
 
     #[test]
     fn test_flash_matches_standard() {
         // Flash attention should produce the same results as standard attention
         let seq = 16;
         let d = 8;
-        let data: Vec<f32> = (0..seq * d).map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6).collect();
+        let data: Vec<f32> = (0..seq * d)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6)
+            .collect();
 
         let q = Tensor::from_f32(&data, &[seq, d]);
         let k = Tensor::from_f32(&data, &[seq, d]);
@@ -172,7 +181,9 @@ mod tests {
             assert!(
                 (std_data[i] - flash_data[i]).abs() < 1e-4,
                 "Mismatch at {}: std={}, flash={}",
-                i, std_data[i], flash_data[i]
+                i,
+                std_data[i],
+                flash_data[i]
             );
         }
     }
@@ -181,7 +192,9 @@ mod tests {
     fn test_flash_causal_matches_standard() {
         let seq = 16;
         let d = 8;
-        let data: Vec<f32> = (0..seq * d).map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6).collect();
+        let data: Vec<f32> = (0..seq * d)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6)
+            .collect();
 
         let q = Tensor::from_f32(&data, &[seq, d]);
         let k = Tensor::from_f32(&data, &[seq, d]);
@@ -198,7 +211,9 @@ mod tests {
             assert!(
                 (std_data[i] - flash_data[i]).abs() < 1e-4,
                 "Mismatch at {}: std={}, flash={}",
-                i, std_data[i], flash_data[i]
+                i,
+                std_data[i],
+                flash_data[i]
             );
         }
     }

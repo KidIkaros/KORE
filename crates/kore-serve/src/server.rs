@@ -1,6 +1,9 @@
 //! Server setup and configuration.
 
-use axum::{routing::{get, post}, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use tower_http::cors::CorsLayer;
 
 use crate::api;

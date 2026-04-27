@@ -5,7 +5,13 @@
 /// `weight`: [vocab_size, dim] embedding table
 /// `ids`: token IDs to look up
 /// `output`: [ids.len(), dim] output buffer
-pub fn embedding_lookup(weight: &[f32], ids: &[u32], output: &mut [f32], vocab_size: usize, dim: usize) {
+pub fn embedding_lookup(
+    weight: &[f32],
+    ids: &[u32],
+    output: &mut [f32],
+    vocab_size: usize,
+    dim: usize,
+) {
     for (i, &id) in ids.iter().enumerate() {
         let id = id as usize;
         let dst = &mut output[i * dim..(i + 1) * dim];

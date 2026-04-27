@@ -42,27 +42,24 @@ type FnHipGetDeviceCount = unsafe extern "C" fn(*mut c_int) -> HipErrorT;
 type FnHipSetDevice = unsafe extern "C" fn(c_int) -> HipErrorT;
 type FnHipMalloc = unsafe extern "C" fn(*mut HipDeviceptr, usize) -> HipErrorT;
 type FnHipFree = unsafe extern "C" fn(HipDeviceptr) -> HipErrorT;
-type FnHipMemcpy = unsafe extern "C" fn(
-    *mut c_void, *const c_void, usize, c_int,
-) -> HipErrorT;
-type FnHipMemset = unsafe extern "C" fn(
-    HipDeviceptr, c_int, usize,
-) -> HipErrorT;
+type FnHipMemcpy = unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> HipErrorT;
+type FnHipMemset = unsafe extern "C" fn(HipDeviceptr, c_int, usize) -> HipErrorT;
 type FnHipDeviceSynchronize = unsafe extern "C" fn() -> HipErrorT;
-type FnHipModuleLoadData = unsafe extern "C" fn(
-    *mut HipModule, *const c_void,
-) -> HipErrorT;
-type FnHipModuleGetFunction = unsafe extern "C" fn(
-    *mut HipFunction, HipModule, *const c_char,
-) -> HipErrorT;
+type FnHipModuleLoadData = unsafe extern "C" fn(*mut HipModule, *const c_void) -> HipErrorT;
+type FnHipModuleGetFunction =
+    unsafe extern "C" fn(*mut HipFunction, HipModule, *const c_char) -> HipErrorT;
 type FnHipModuleLaunchKernel = unsafe extern "C" fn(
     HipFunction,
-    c_uint, c_uint, c_uint,   // grid x, y, z
-    c_uint, c_uint, c_uint,   // block x, y, z
-    c_uint,                    // shared mem bytes
-    HipStream,                 // stream (null = default)
-    *mut *mut c_void,          // kernel params
-    *mut *mut c_void,          // extra (null)
+    c_uint,
+    c_uint,
+    c_uint, // grid x, y, z
+    c_uint,
+    c_uint,
+    c_uint,           // block x, y, z
+    c_uint,           // shared mem bytes
+    HipStream,        // stream (null = default)
+    *mut *mut c_void, // kernel params
+    *mut *mut c_void, // extra (null)
 ) -> HipErrorT;
 type FnHipModuleUnload = unsafe extern "C" fn(HipModule) -> HipErrorT;
 
@@ -72,30 +69,19 @@ type FnHipModuleUnload = unsafe extern "C" fn(HipModule) -> HipErrorT;
 
 type FnHiprtcCreateProgram = unsafe extern "C" fn(
     *mut HiprtcProgram,
-    *const c_char,     // source
-    *const c_char,     // name
-    c_int,             // numHeaders
-    *const *const c_char,  // headers
-    *const *const c_char,  // includeNames
+    *const c_char,        // source
+    *const c_char,        // name
+    c_int,                // numHeaders
+    *const *const c_char, // headers
+    *const *const c_char, // includeNames
 ) -> HiprtcResult;
-type FnHiprtcCompileProgram = unsafe extern "C" fn(
-    HiprtcProgram, c_int, *const *const c_char,
-) -> HiprtcResult;
-type FnHiprtcGetCodeSize = unsafe extern "C" fn(
-    HiprtcProgram, *mut usize,
-) -> HiprtcResult;
-type FnHiprtcGetCode = unsafe extern "C" fn(
-    HiprtcProgram, *mut c_char,
-) -> HiprtcResult;
-type FnHiprtcGetProgramLogSize = unsafe extern "C" fn(
-    HiprtcProgram, *mut usize,
-) -> HiprtcResult;
-type FnHiprtcGetProgramLog = unsafe extern "C" fn(
-    HiprtcProgram, *mut c_char,
-) -> HiprtcResult;
-type FnHiprtcDestroyProgram = unsafe extern "C" fn(
-    *mut HiprtcProgram,
-) -> HiprtcResult;
+type FnHiprtcCompileProgram =
+    unsafe extern "C" fn(HiprtcProgram, c_int, *const *const c_char) -> HiprtcResult;
+type FnHiprtcGetCodeSize = unsafe extern "C" fn(HiprtcProgram, *mut usize) -> HiprtcResult;
+type FnHiprtcGetCode = unsafe extern "C" fn(HiprtcProgram, *mut c_char) -> HiprtcResult;
+type FnHiprtcGetProgramLogSize = unsafe extern "C" fn(HiprtcProgram, *mut usize) -> HiprtcResult;
+type FnHiprtcGetProgramLog = unsafe extern "C" fn(HiprtcProgram, *mut c_char) -> HiprtcResult;
+type FnHiprtcDestroyProgram = unsafe extern "C" fn(*mut HiprtcProgram) -> HiprtcResult;
 
 // ---------------------------------------------------------------------------
 // Loaded API structs
@@ -148,16 +134,26 @@ impl HipApi {
         unsafe {
             let api = HipApi {
                 hip_init: *lib.get::<FnHipInit>(b"hipInit\0").ok()?,
-                hip_get_device_count: *lib.get::<FnHipGetDeviceCount>(b"hipGetDeviceCount\0").ok()?,
+                hip_get_device_count: *lib
+                    .get::<FnHipGetDeviceCount>(b"hipGetDeviceCount\0")
+                    .ok()?,
                 hip_set_device: *lib.get::<FnHipSetDevice>(b"hipSetDevice\0").ok()?,
                 hip_malloc: *lib.get::<FnHipMalloc>(b"hipMalloc\0").ok()?,
                 hip_free: *lib.get::<FnHipFree>(b"hipFree\0").ok()?,
                 hip_memcpy: *lib.get::<FnHipMemcpy>(b"hipMemcpy\0").ok()?,
                 hip_memset: *lib.get::<FnHipMemset>(b"hipMemset\0").ok()?,
-                hip_device_synchronize: *lib.get::<FnHipDeviceSynchronize>(b"hipDeviceSynchronize\0").ok()?,
-                hip_module_load_data: *lib.get::<FnHipModuleLoadData>(b"hipModuleLoadData\0").ok()?,
-                hip_module_get_function: *lib.get::<FnHipModuleGetFunction>(b"hipModuleGetFunction\0").ok()?,
-                hip_module_launch_kernel: *lib.get::<FnHipModuleLaunchKernel>(b"hipModuleLaunchKernel\0").ok()?,
+                hip_device_synchronize: *lib
+                    .get::<FnHipDeviceSynchronize>(b"hipDeviceSynchronize\0")
+                    .ok()?,
+                hip_module_load_data: *lib
+                    .get::<FnHipModuleLoadData>(b"hipModuleLoadData\0")
+                    .ok()?,
+                hip_module_get_function: *lib
+                    .get::<FnHipModuleGetFunction>(b"hipModuleGetFunction\0")
+                    .ok()?,
+                hip_module_launch_kernel: *lib
+                    .get::<FnHipModuleLaunchKernel>(b"hipModuleLaunchKernel\0")
+                    .ok()?,
                 hip_module_unload: *lib.get::<FnHipModuleUnload>(b"hipModuleUnload\0").ok()?,
                 _lib: lib,
             };
@@ -171,13 +167,25 @@ impl HiprtcApi {
         let lib = unsafe { Library::new("libhiprtc.so") }.ok()?;
         unsafe {
             let api = HiprtcApi {
-                hiprtc_create_program: *lib.get::<FnHiprtcCreateProgram>(b"hiprtcCreateProgram\0").ok()?,
-                hiprtc_compile_program: *lib.get::<FnHiprtcCompileProgram>(b"hiprtcCompileProgram\0").ok()?,
-                hiprtc_get_code_size: *lib.get::<FnHiprtcGetCodeSize>(b"hiprtcGetCodeSize\0").ok()?,
+                hiprtc_create_program: *lib
+                    .get::<FnHiprtcCreateProgram>(b"hiprtcCreateProgram\0")
+                    .ok()?,
+                hiprtc_compile_program: *lib
+                    .get::<FnHiprtcCompileProgram>(b"hiprtcCompileProgram\0")
+                    .ok()?,
+                hiprtc_get_code_size: *lib
+                    .get::<FnHiprtcGetCodeSize>(b"hiprtcGetCodeSize\0")
+                    .ok()?,
                 hiprtc_get_code: *lib.get::<FnHiprtcGetCode>(b"hiprtcGetCode\0").ok()?,
-                hiprtc_get_program_log_size: *lib.get::<FnHiprtcGetProgramLogSize>(b"hiprtcGetProgramLogSize\0").ok()?,
-                hiprtc_get_program_log: *lib.get::<FnHiprtcGetProgramLog>(b"hiprtcGetProgramLog\0").ok()?,
-                hiprtc_destroy_program: *lib.get::<FnHiprtcDestroyProgram>(b"hiprtcDestroyProgram\0").ok()?,
+                hiprtc_get_program_log_size: *lib
+                    .get::<FnHiprtcGetProgramLogSize>(b"hiprtcGetProgramLogSize\0")
+                    .ok()?,
+                hiprtc_get_program_log: *lib
+                    .get::<FnHiprtcGetProgramLog>(b"hiprtcGetProgramLog\0")
+                    .ok()?,
+                hiprtc_destroy_program: *lib
+                    .get::<FnHiprtcDestroyProgram>(b"hiprtcDestroyProgram\0")
+                    .ok()?,
                 _lib: lib,
             };
             Some(api)
@@ -204,7 +212,10 @@ pub fn check_hip(code: HipErrorT, context: &str) -> Result<(), RocmError> {
     if code == HIP_SUCCESS {
         Ok(())
     } else {
-        Err(RocmError::HipError { code, context: context.to_string() })
+        Err(RocmError::HipError {
+            code,
+            context: context.to_string(),
+        })
     }
 }
 
@@ -213,6 +224,9 @@ pub fn check_hiprtc(code: HiprtcResult, context: &str) -> Result<(), RocmError> 
     if code == HIPRTC_SUCCESS {
         Ok(())
     } else {
-        Err(RocmError::HiprtcError { code, context: context.to_string() })
+        Err(RocmError::HiprtcError {
+            code,
+            context: context.to_string(),
+        })
     }
 }

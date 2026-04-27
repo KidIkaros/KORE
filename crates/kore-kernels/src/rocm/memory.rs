@@ -4,8 +4,10 @@
 
 use std::ffi::c_void;
 
-use super::context::{init_device, set_device, device_synchronize, RocmError};
-use super::ffi::{self, check_hip, HipDeviceptr, HIP_MEMCPY_HOST_TO_DEVICE, HIP_MEMCPY_DEVICE_TO_HOST};
+use super::context::{device_synchronize, init_device, set_device, RocmError};
+use super::ffi::{
+    self, check_hip, HipDeviceptr, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE,
+};
 
 /// A GPU memory buffer holding raw bytes on a specific HIP device.
 ///
@@ -24,7 +26,11 @@ impl HipBuffer {
     /// Allocate zeroed GPU memory.
     pub fn zeros(device_idx: usize, nbytes: usize) -> Result<Self, RocmError> {
         if nbytes == 0 {
-            return Ok(Self { ptr: std::ptr::null_mut(), device_idx, nbytes: 0 });
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                device_idx,
+                nbytes: 0,
+            });
         }
         let api = ffi::hip_api().ok_or(RocmError::NotAvailable)?;
         init_device(device_idx)?;
@@ -39,13 +45,21 @@ impl HipBuffer {
             unsafe { (api.hip_memset)(ptr, 0, nbytes) },
             &format!("hipMemset({} bytes)", nbytes),
         )?;
-        Ok(Self { ptr, device_idx, nbytes })
+        Ok(Self {
+            ptr,
+            device_idx,
+            nbytes,
+        })
     }
 
     /// Copy host bytes to a new GPU buffer (H2D).
     pub fn from_host(device_idx: usize, data: &[u8]) -> Result<Self, RocmError> {
         if data.is_empty() {
-            return Ok(Self { ptr: std::ptr::null_mut(), device_idx, nbytes: 0 });
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                device_idx,
+                nbytes: 0,
+            });
         }
         let api = ffi::hip_api().ok_or(RocmError::NotAvailable)?;
         init_device(device_idx)?;
@@ -68,7 +82,11 @@ impl HipBuffer {
             },
             "hipMemcpy H2D",
         )?;
-        Ok(Self { ptr, device_idx, nbytes })
+        Ok(Self {
+            ptr,
+            device_idx,
+            nbytes,
+        })
     }
 
     /// Copy GPU buffer back to host (D2H).

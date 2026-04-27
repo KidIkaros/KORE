@@ -9,9 +9,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kore_core::{DType, KoreError, Tensor};
-use kore_core::autograd::{self, GradFn, GradNode};
 use crate::module::Module;
+use kore_core::autograd::{self, GradFn, GradNode};
+use kore_core::{DType, KoreError, Tensor};
 
 /// Root Mean Square Layer Normalization.
 ///
@@ -99,13 +99,17 @@ impl Module for RMSNorm {
         let result = kore_kernels::cpu_fused::fused_rms_norm(input, &self.gamma, self.eps)?;
 
         // Wire into autograd graph if tracking gradients
-        let tracks = autograd::is_grad_enabled()
-            && (input.tracks_grad() || self.gamma.tracks_grad());
+        let tracks =
+            autograd::is_grad_enabled() && (input.tracks_grad() || self.gamma.tracks_grad());
         if tracks {
             // Order must match fused_rms_norm_backward return: (dx, dgamma)
             let mut inputs = Vec::new();
-            if let Some(n) = input.grad_node() { inputs.push(Arc::clone(n)); }  // idx 0 → dx
-            if let Some(n) = self.gamma.grad_node() { inputs.push(Arc::clone(n)); }  // idx 1 → dgamma
+            if let Some(n) = input.grad_node() {
+                inputs.push(Arc::clone(n));
+            } // idx 0 → dx
+            if let Some(n) = self.gamma.grad_node() {
+                inputs.push(Arc::clone(n));
+            } // idx 1 → dgamma
             let grad_fn = Box::new(FusedRMSNormBackward {
                 input: input.clone(),
                 gamma: self.gamma.clone(),
@@ -155,7 +159,10 @@ struct FusedRMSNormBackward {
 impl GradFn for FusedRMSNormBackward {
     fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         match kore_kernels::cpu_fused_backward::fused_rms_norm_backward(
-            grad_output, &self.input, &self.gamma, self.eps,
+            grad_output,
+            &self.input,
+            &self.gamma,
+            self.eps,
         ) {
             Ok((dx, dgamma)) => vec![Some(dx), Some(dgamma)],
             Err(e) => {
@@ -165,7 +172,9 @@ impl GradFn for FusedRMSNormBackward {
         }
     }
 
-    fn name(&self) -> &str { "FusedRMSNormBackward" }
+    fn name(&self) -> &str {
+        "FusedRMSNormBackward"
+    }
 }
 
 #[cfg(test)]

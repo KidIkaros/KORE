@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use kore_core::{DType, Tensor};
-use kore_kernels::cpu_quat_matmul::{quat_matmul, pack_weights_quaternary};
+use kore_kernels::cpu_quat_matmul::{pack_weights_quaternary, quat_matmul};
 
 use crate::module::Module;
 
@@ -45,12 +45,18 @@ impl QuatLinear {
     /// * `bias` - optional f32 bias tensor of shape [out_features]
     pub fn new(weight: &Tensor, bias: Option<&Tensor>) -> Self {
         let dims = weight.shape().dims();
-        assert!(dims.len() == 2, "QuatLinear weight must be 2D, got {:?}", dims);
+        assert!(
+            dims.len() == 2,
+            "QuatLinear weight must be 2D, got {:?}",
+            dims
+        );
         let out_features = dims[0];
         let in_features = dims[1];
 
         let w_data = weight.contiguous();
-        let w_slice = w_data.as_f32_slice().expect("QuatLinear requires f32 weights");
+        let w_slice = w_data
+            .as_f32_slice()
+            .expect("QuatLinear requires f32 weights");
 
         let (packed_weights, scales) = pack_weights_quaternary(w_slice, out_features, in_features);
 
@@ -162,7 +168,9 @@ impl QuatLinear {
         use kore_kernels::cuda::memory::CudaBuffer;
         use kore_kernels::cuda::ops::cuda_dequant_quat_matmul_f32;
 
-        if !is_cuda_available() { return None; }
+        if !is_cuda_available() {
+            return None;
+        }
 
         let dev_idx = 0;
         let dev = get_device(dev_idx).ok()?;
@@ -176,10 +184,7 @@ impl QuatLinear {
 
         // Upload scales as raw bytes
         let scales_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                self.scales.as_ptr() as *const u8,
-                self.scales.len() * 4,
-            )
+            std::slice::from_raw_parts(self.scales.as_ptr() as *const u8, self.scales.len() * 4)
         };
         let scales_gpu = CudaBuffer::from_host(dev_idx, scales_bytes).ok()?;
 
@@ -187,20 +192,21 @@ impl QuatLinear {
         let input_data = input_t.contiguous();
         let input_slice = input_data.as_f32_slice().ok()?;
         let input_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                input_slice.as_ptr() as *const u8,
-                input_slice.len() * 4,
-            )
+            std::slice::from_raw_parts(input_slice.as_ptr() as *const u8, input_slice.len() * 4)
         };
         let b_gpu = CudaBuffer::from_host(dev_idx, input_bytes).ok()?;
 
         let out_gpu = cuda_dequant_quat_matmul_f32(
-            &dev, dev_idx,
+            &dev,
+            dev_idx,
             a_gpu.as_cuda_slice(),
             scales_gpu.as_cuda_slice(),
             b_gpu.as_cuda_slice(),
-            m, n, k,
-        ).ok()?;
+            m,
+            n,
+            k,
+        )
+        .ok()?;
 
         // Download result
         let out_bytes = dev.dtoh_sync_copy(&out_gpu).ok()?;
@@ -267,7 +273,8 @@ impl Module for QuatLinear {
         let input_t = input_2d.transpose()?.contiguous();
 
         #[cfg(feature = "cuda")]
-        let mut output = self.try_cuda_forward(&input_t, batch_size)
+        let mut output = self
+            .try_cuda_forward(&input_t, batch_size)
             .unwrap_or_else(|| {
                 quat_matmul(
                     &self.packed_weights,
@@ -276,7 +283,8 @@ impl Module for QuatLinear {
                     self.out_features,
                     batch_size,
                     self.in_features,
-                ).expect("CPU quat_matmul failed")
+                )
+                .expect("CPU quat_matmul failed")
             });
 
         #[cfg(not(feature = "cuda"))]
@@ -301,7 +309,8 @@ impl Module for QuatLinear {
         if ndim == 1 {
             output = output.reshape(&[self.out_features as isize])?;
         } else if ndim > 2 {
-            let mut out_shape: Vec<isize> = input_dims[..ndim - 1].iter().map(|&d| d as isize).collect();
+            let mut out_shape: Vec<isize> =
+                input_dims[..ndim - 1].iter().map(|&d| d as isize).collect();
             out_shape.push(self.out_features as isize);
             output = output.reshape(&out_shape)?;
         }

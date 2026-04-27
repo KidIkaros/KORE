@@ -98,9 +98,7 @@ impl StreamingDataset {
 
     /// Save to a binary file.
     pub fn save(&self, path: &Path) -> Result<(), KoreError> {
-        let bytes: Vec<u8> = self.tokens.iter()
-            .flat_map(|&t| t.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = self.tokens.iter().flat_map(|&t| t.to_le_bytes()).collect();
         std::fs::write(path, &bytes)
             .map_err(|e| KoreError::StorageError(format!("Failed to write dataset: {}", e)))?;
         Ok(())

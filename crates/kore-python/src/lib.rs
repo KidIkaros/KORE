@@ -11,9 +11,9 @@
 //! - `kore.optim.Adam` / `kore.optim.SGD` — optimizer bindings
 //! - `kore.functional` — activation functions
 
-use pyo3::prelude::*;
+use numpy::{PyArray1, PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use pyo3::exceptions::PyValueError;
-use numpy::{PyArrayDyn, PyArray1, PyReadonlyArrayDyn, PyUntypedArrayMethods, PyArrayMethods};
+use pyo3::prelude::*;
 
 // ============================================================================
 // Tensor wrapper
@@ -30,7 +30,9 @@ impl PyTensor {
     /// Create a tensor from a NumPy array.
     #[new]
     fn new(data: PyReadonlyArrayDyn<'_, f32>) -> PyResult<Self> {
-        let slice = data.as_slice().map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let slice = data
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let shape: Vec<usize> = data.shape().to_vec();
         Ok(Self {
             inner: kore_core::Tensor::from_f32(slice, &shape),
@@ -80,7 +82,8 @@ impl PyTensor {
     /// Convert to NumPy array (copies data).
     fn numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         let data = self.inner.contiguous();
-        let slice = data.as_f32_slice()
+        let slice = data
+            .as_f32_slice()
             .ok_or_else(|| PyValueError::new_err("Cannot convert non-f32 tensor to numpy"))?;
         let shape: Vec<usize> = data.shape().dims().to_vec();
         let flat = PyArray1::from_vec_bound(py, slice.to_vec());
@@ -90,56 +93,72 @@ impl PyTensor {
 
     /// Element-wise addition.
     fn add(&self, other: &PyTensor) -> PyResult<PyTensor> {
-        let result = self.inner.add(&other.inner)
+        let result = self
+            .inner
+            .add(&other.inner)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
 
     /// Element-wise subtraction.
     fn sub(&self, other: &PyTensor) -> PyResult<PyTensor> {
-        let result = self.inner.sub(&other.inner)
+        let result = self
+            .inner
+            .sub(&other.inner)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
 
     /// Element-wise multiplication.
     fn mul(&self, other: &PyTensor) -> PyResult<PyTensor> {
-        let result = self.inner.mul(&other.inner)
+        let result = self
+            .inner
+            .mul(&other.inner)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
 
     /// Matrix multiplication.
     fn matmul(&self, other: &PyTensor) -> PyResult<PyTensor> {
-        let result = self.inner.matmul(&other.inner)
+        let result = self
+            .inner
+            .matmul(&other.inner)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
 
     /// Reshape.
     fn reshape(&self, shape: Vec<isize>) -> PyResult<PyTensor> {
-        let result = self.inner.reshape(&shape)
+        let result = self
+            .inner
+            .reshape(&shape)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
 
     /// Transpose last two dimensions.
     fn transpose(&self) -> PyResult<PyTensor> {
-        let result = self.inner.transpose()
+        let result = self
+            .inner
+            .transpose()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
 
     /// Sum all elements.
     fn sum(&self) -> PyResult<PyTensor> {
-        let result = self.inner.sum()
+        let result = self
+            .inner
+            .sum()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
 
     /// Mean of all elements.
     fn mean(&self) -> PyResult<PyTensor> {
-        let result = self.inner.mean()
+        let result = self
+            .inner
+            .mean()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
@@ -171,7 +190,9 @@ impl PyTensor {
     /// Softmax over given axis.
     #[pyo3(signature = (axis=-1))]
     fn softmax(&self, axis: isize) -> PyResult<PyTensor> {
-        let result = self.inner.softmax(axis)
+        let result = self
+            .inner
+            .softmax(axis)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
@@ -179,14 +200,18 @@ impl PyTensor {
     /// Log-softmax over given axis.
     #[pyo3(signature = (axis=-1))]
     fn log_softmax(&self, axis: isize) -> PyResult<PyTensor> {
-        let result = self.inner.log_softmax(axis)
+        let result = self
+            .inner
+            .log_softmax(axis)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
 
     /// Masked fill: replace elements where mask > 0 with value.
     fn masked_fill(&self, mask: &PyTensor, value: f32) -> PyResult<PyTensor> {
-        let result = self.inner.masked_fill(&mask.inner, value)
+        let result = self
+            .inner
+            .masked_fill(&mask.inner, value)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
@@ -194,7 +219,9 @@ impl PyTensor {
     /// Upper triangular.
     #[pyo3(signature = (k=0))]
     fn triu(&self, k: isize) -> PyResult<PyTensor> {
-        let result = self.inner.triu(k)
+        let result = self
+            .inner
+            .triu(k)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
@@ -202,14 +229,18 @@ impl PyTensor {
     /// Lower triangular.
     #[pyo3(signature = (k=0))]
     fn tril(&self, k: isize) -> PyResult<PyTensor> {
-        let result = self.inner.tril(k)
+        let result = self
+            .inner
+            .tril(k)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
 
     /// Gather elements along axis.
     fn gather(&self, axis: isize, index: &PyTensor) -> PyResult<PyTensor> {
-        let result = self.inner.gather(axis, &index.inner)
+        let result = self
+            .inner
+            .gather(axis, &index.inner)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
@@ -234,7 +265,9 @@ impl PyTensor {
 
     /// Absolute value.
     fn abs(&self) -> PyResult<PyTensor> {
-        let result = self.inner.abs()
+        let result = self
+            .inner
+            .abs()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(PyTensor { inner: result })
     }
@@ -280,7 +313,8 @@ impl PyTensor {
 
     /// Run backward pass (tensor must be scalar).
     fn backward(&self) -> PyResult<()> {
-        self.inner.backward()
+        self.inner
+            .backward()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
     }
 }
@@ -322,8 +356,12 @@ impl PyLinear {
     }
 
     fn __repr__(&self) -> String {
-        format!("Linear(in_features={}, out_features={}, bias={})",
-            self.inner.in_features(), self.inner.out_features(), self.inner.has_bias())
+        format!(
+            "Linear(in_features={}, out_features={}, bias={})",
+            self.inner.in_features(),
+            self.inner.out_features(),
+            self.inner.has_bias()
+        )
     }
 }
 
@@ -360,8 +398,11 @@ impl PyLayerNorm {
     }
 
     fn __repr__(&self) -> String {
-        format!("LayerNorm(normalized_shape={}, eps={})",
-            self.inner.normalized_shape(), self.inner.eps())
+        format!(
+            "LayerNorm(normalized_shape={}, eps={})",
+            self.inner.normalized_shape(),
+            self.inner.eps()
+        )
     }
 }
 
@@ -390,7 +431,9 @@ impl PyEmbedding {
     }
 
     fn lookup(&self, ids: Vec<usize>) -> PyTensor {
-        PyTensor { inner: self.inner.lookup(&ids) }
+        PyTensor {
+            inner: self.inner.lookup(&ids),
+        }
     }
 
     fn parameters(&self) -> Vec<PyTensor> {
@@ -401,8 +444,11 @@ impl PyEmbedding {
     }
 
     fn __repr__(&self) -> String {
-        format!("Embedding(num_embeddings={}, embedding_dim={})",
-            self.inner.num_embeddings(), self.inner.embedding_dim())
+        format!(
+            "Embedding(num_embeddings={}, embedding_dim={})",
+            self.inner.num_embeddings(),
+            self.inner.embedding_dim()
+        )
     }
 }
 
@@ -568,9 +614,23 @@ struct PyConv2d {
 impl PyConv2d {
     #[new]
     #[pyo3(signature = (in_channels, out_channels, kernel_size, stride=1, padding=0, bias=true))]
-    fn new(in_channels: usize, out_channels: usize, kernel_size: usize, stride: usize, padding: usize, bias: bool) -> Self {
+    fn new(
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        bias: bool,
+    ) -> Self {
         Self {
-            inner: kore_nn::Conv2d::new(in_channels, out_channels, kernel_size, stride, padding, bias),
+            inner: kore_nn::Conv2d::new(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+                bias,
+            ),
         }
     }
 
@@ -592,9 +652,14 @@ impl PyConv2d {
     }
 
     fn __repr__(&self) -> String {
-        format!("Conv2d(in_channels={}, out_channels={}, kernel_size={}, stride={}, padding={})",
-            self.inner.in_channels(), self.inner.out_channels(),
-            self.inner.kernel_size(), self.inner.stride(), self.inner.padding())
+        format!(
+            "Conv2d(in_channels={}, out_channels={}, kernel_size={}, stride={}, padding={})",
+            self.inner.in_channels(),
+            self.inner.out_channels(),
+            self.inner.kernel_size(),
+            self.inner.stride(),
+            self.inner.padding()
+        )
     }
 }
 
@@ -624,8 +689,12 @@ impl PyMaxPool2d {
     }
 
     fn __repr__(&self) -> String {
-        format!("MaxPool2d(kernel_size={}, stride={}, padding={})",
-            self.inner.kernel_size(), self.inner.stride(), self.inner.padding())
+        format!(
+            "MaxPool2d(kernel_size={}, stride={}, padding={})",
+            self.inner.kernel_size(),
+            self.inner.stride(),
+            self.inner.padding()
+        )
     }
 }
 
@@ -655,8 +724,12 @@ impl PyAvgPool2d {
     }
 
     fn __repr__(&self) -> String {
-        format!("AvgPool2d(kernel_size={}, stride={}, padding={})",
-            self.inner.kernel_size(), self.inner.stride(), self.inner.padding())
+        format!(
+            "AvgPool2d(kernel_size={}, stride={}, padding={})",
+            self.inner.kernel_size(),
+            self.inner.stride(),
+            self.inner.padding()
+        )
     }
 }
 
@@ -686,8 +759,11 @@ impl PyAdaptiveAvgPool2d {
     }
 
     fn __repr__(&self) -> String {
-        format!("AdaptiveAvgPool2d(output_size=({}, {}))",
-            self.inner.output_h(), self.inner.output_w())
+        format!(
+            "AdaptiveAvgPool2d(output_size=({}, {}))",
+            self.inner.output_h(),
+            self.inner.output_w()
+        )
     }
 }
 
@@ -715,7 +791,11 @@ impl PyAdam {
     /// Usage::
     ///
     ///     optimizer.step(params, grads)  # params are updated in-place
-    fn step(&mut self, params: Bound<'_, pyo3::types::PyList>, grads: Vec<PyTensor>) -> PyResult<()> {
+    fn step(
+        &mut self,
+        params: Bound<'_, pyo3::types::PyList>,
+        grads: Vec<PyTensor>,
+    ) -> PyResult<()> {
         let g: Vec<kore_core::Tensor> = grads.into_iter().map(|t| t.inner).collect();
         let len = params.len();
         // Extract inner tensors (takes ownership temporarily)
@@ -736,9 +816,14 @@ impl PyAdam {
     }
 
     fn __repr__(&self) -> String {
-        format!("Adam(lr={}, betas=({}, {}), eps={}, weight_decay={})",
-            self.inner.lr(), self.inner.beta1(), self.inner.beta2(),
-            self.inner.eps(), self.inner.weight_decay())
+        format!(
+            "Adam(lr={}, betas=({}, {}), eps={}, weight_decay={})",
+            self.inner.lr(),
+            self.inner.beta1(),
+            self.inner.beta2(),
+            self.inner.eps(),
+            self.inner.weight_decay()
+        )
     }
 }
 
@@ -758,7 +843,11 @@ impl PySGD {
     }
 
     /// Update parameters in-place. Params list is mutated directly.
-    fn step(&mut self, params: Bound<'_, pyo3::types::PyList>, grads: Vec<PyTensor>) -> PyResult<()> {
+    fn step(
+        &mut self,
+        params: Bound<'_, pyo3::types::PyList>,
+        grads: Vec<PyTensor>,
+    ) -> PyResult<()> {
         let g: Vec<kore_core::Tensor> = grads.into_iter().map(|t| t.inner).collect();
         let len = params.len();
         let mut p: Vec<kore_core::Tensor> = Vec::with_capacity(len);
@@ -777,8 +866,12 @@ impl PySGD {
     }
 
     fn __repr__(&self) -> String {
-        format!("SGD(lr={}, momentum={}, weight_decay={})",
-            self.inner.lr(), self.inner.momentum(), self.inner.weight_decay())
+        format!(
+            "SGD(lr={}, momentum={}, weight_decay={})",
+            self.inner.lr(),
+            self.inner.momentum(),
+            self.inner.weight_decay()
+        )
     }
 }
 
@@ -868,11 +961,12 @@ fn silu(input: &PyTensor) -> PyResult<PyTensor> {
 
 /// Save a state dict to a safetensors file.
 #[pyfunction]
-fn save_state_dict(state_dict: std::collections::HashMap<String, PyTensor>, path: String) -> PyResult<()> {
-    let sd: std::collections::HashMap<String, kore_core::Tensor> = state_dict
-        .into_iter()
-        .map(|(k, v)| (k, v.inner))
-        .collect();
+fn save_state_dict(
+    state_dict: std::collections::HashMap<String, PyTensor>,
+    path: String,
+) -> PyResult<()> {
+    let sd: std::collections::HashMap<String, kore_core::Tensor> =
+        state_dict.into_iter().map(|(k, v)| (k, v.inner)).collect();
     kore_nn::save_state_dict(&sd, std::path::Path::new(&path))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
 }
@@ -882,7 +976,10 @@ fn save_state_dict(state_dict: std::collections::HashMap<String, PyTensor>, path
 fn load_state_dict(path: String) -> PyResult<std::collections::HashMap<String, PyTensor>> {
     let sd = kore_nn::load_state_dict(std::path::Path::new(&path))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    Ok(sd.into_iter().map(|(k, v)| (k, PyTensor { inner: v })).collect())
+    Ok(sd
+        .into_iter()
+        .map(|(k, v)| (k, PyTensor { inner: v }))
+        .collect())
 }
 
 // ============================================================================

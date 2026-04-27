@@ -5,9 +5,9 @@
 //! for every token. This module caches layer weights in RAM to avoid redundant
 //! disk I/O.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 /// A single cached layer: mapping from parameter name to raw weight bytes.
 ///
@@ -39,17 +39,30 @@ struct LruList {
 
 impl LruList {
     fn new() -> Self {
-        Self { nodes: Vec::new(), head: NONE, tail: NONE, free: Vec::new() }
+        Self {
+            nodes: Vec::new(),
+            head: NONE,
+            tail: NONE,
+            free: Vec::new(),
+        }
     }
 
     /// Insert a key at the tail (MRU position). Returns the node handle.
     fn push_back(&mut self, key: String) -> usize {
         let idx = if let Some(free_idx) = self.free.pop() {
-            self.nodes[free_idx] = LruNode { key, prev: self.tail, next: NONE };
+            self.nodes[free_idx] = LruNode {
+                key,
+                prev: self.tail,
+                next: NONE,
+            };
             free_idx
         } else {
             let idx = self.nodes.len();
-            self.nodes.push(LruNode { key, prev: self.tail, next: NONE });
+            self.nodes.push(LruNode {
+                key,
+                prev: self.tail,
+                next: NONE,
+            });
             idx
         };
 
@@ -233,7 +246,10 @@ impl LayerCache {
         let mut inner = self.inner.lock();
 
         // Extract handle + weights first to release the immutable borrow on `map`.
-        let found = inner.map.get(layer_name).map(|val| (val.lru_handle, val.weights.clone()));
+        let found = inner
+            .map
+            .get(layer_name)
+            .map(|val| (val.lru_handle, val.weights.clone()));
 
         if let Some((handle, weights)) = found {
             inner.hits += 1;
@@ -268,7 +284,14 @@ impl LayerCache {
         }
 
         let handle = inner.lru.push_back(layer_name.clone());
-        inner.map.insert(layer_name, CacheValue { weights, size_bytes: size, lru_handle: handle });
+        inner.map.insert(
+            layer_name,
+            CacheValue {
+                weights,
+                size_bytes: size,
+                lru_handle: handle,
+            },
+        );
         inner.current_bytes += size;
     }
 
@@ -291,7 +314,11 @@ impl LayerCache {
             max_bytes: inner.max_bytes,
             hits: inner.hits,
             misses: inner.misses,
-            hit_rate: if total > 0 { inner.hits as f64 / total as f64 } else { 0.0 },
+            hit_rate: if total > 0 {
+                inner.hits as f64 / total as f64
+            } else {
+                0.0
+            },
         }
     }
 }
@@ -334,7 +361,11 @@ fn needs_eviction(inner: &CacheInner, new_size: usize) -> bool {
 }
 
 fn estimate_weights_size(weights: &LayerWeights) -> usize {
-    weights.as_ref().iter().map(|(name, data)| name.len() + data.len()).sum()
+    weights
+        .as_ref()
+        .iter()
+        .map(|(name, data)| name.len() + data.len())
+        .sum()
 }
 
 fn available_ram_bytes() -> usize {

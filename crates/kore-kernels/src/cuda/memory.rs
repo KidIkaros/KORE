@@ -39,9 +39,9 @@ impl CudaBuffer {
     /// Copy host bytes to a new GPU buffer (H2D).
     pub fn from_host(device_idx: usize, data: &[u8]) -> Result<Self, CudaError> {
         let dev = get_device(device_idx)?;
-        let slice = dev
-            .htod_copy(data.to_vec())
-            .map_err(|e| CudaError::MemoryError(format!("htod_copy({} bytes): {}", data.len(), e)))?;
+        let slice = dev.htod_copy(data.to_vec()).map_err(|e| {
+            CudaError::MemoryError(format!("htod_copy({} bytes): {}", data.len(), e))
+        })?;
         Ok(Self {
             inner: Arc::new(slice),
             device_idx,

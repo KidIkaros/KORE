@@ -2,8 +2,8 @@
 //!
 //! Normalizes across the last dimension: y = (x - mean) / sqrt(var + eps) * gamma + beta
 
-use kore_core::{DType, KoreError, Tensor};
 use crate::module::Module;
+use kore_core::{DType, KoreError, Tensor};
 
 /// Layer Normalization over the last dimension.
 pub struct LayerNorm {
@@ -61,13 +61,13 @@ impl Module for LayerNorm {
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let data = input.contiguous();
         let dims = data.shape().dims().to_vec();
-        let slice = data.as_f32_slice().ok_or_else(|| {
-            KoreError::UnsupportedDType(input.dtype())
-        })?;
+        let slice = data
+            .as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
 
-        let last_dim = *dims.last().ok_or_else(|| {
-            KoreError::StorageError("LayerNorm: empty shape".into())
-        })?;
+        let last_dim = *dims
+            .last()
+            .ok_or_else(|| KoreError::StorageError("LayerNorm: empty shape".into()))?;
         if last_dim != self.normalized_shape {
             return Err(KoreError::ShapeMismatch {
                 expected: vec![self.normalized_shape],
@@ -90,7 +90,8 @@ impl Module for LayerNorm {
             let mean: f32 = row.iter().sum::<f32>() / last_dim as f32;
 
             // Variance
-            let var: f32 = row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / last_dim as f32;
+            let var: f32 =
+                row.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / last_dim as f32;
 
             let inv_std = 1.0 / (var + self.eps).sqrt();
 
@@ -152,7 +153,11 @@ mod tests {
 
         let mean: f32 = data.iter().sum::<f32>() / 4.0;
         let var: f32 = data.iter().map(|&x| (x - mean) * (x - mean)).sum::<f32>() / 4.0;
-        assert!((var - 1.0).abs() < 0.1, "variance should be ~1, got {}", var);
+        assert!(
+            (var - 1.0).abs() < 0.1,
+            "variance should be ~1, got {}",
+            var
+        );
     }
 
     #[test]

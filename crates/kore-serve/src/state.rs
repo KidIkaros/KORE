@@ -1,8 +1,8 @@
 //! Shared application state holding the loaded model.
 
-use std::sync::Arc;
+use kore_nn::sampler::{Rng, SamplerConfig};
 use parking_lot::Mutex;
-use kore_nn::sampler::{SamplerConfig, Rng};
+use std::sync::Arc;
 
 /// Trait for any model that can perform autoregressive generation.
 ///

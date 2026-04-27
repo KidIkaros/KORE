@@ -1,6 +1,6 @@
 //! Activation functions.
 
-use kore_core::{DType, Tensor, KoreError};
+use kore_core::{DType, KoreError, Tensor};
 
 /// ReLU activation: max(0, x)
 pub fn relu(input: &Tensor) -> kore_core::Result<Tensor> {
@@ -16,12 +16,14 @@ pub fn gelu(input: &Tensor) -> kore_core::Result<Tensor> {
         return Err(KoreError::UnsupportedDType(input.dtype()));
     }
     let data = input.contiguous();
-    let slice = data.as_f32_slice()
+    let slice = data
+        .as_f32_slice()
         .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
     let result: Vec<f32> = slice
         .iter()
         .map(|&x| {
-            let inner = std::f32::consts::FRAC_2_SQRT_PI * std::f32::consts::FRAC_1_SQRT_2
+            let inner = std::f32::consts::FRAC_2_SQRT_PI
+                * std::f32::consts::FRAC_1_SQRT_2
                 * (x + 0.044715 * x * x * x);
             0.5 * x * (1.0 + inner.tanh())
         })
@@ -35,12 +37,10 @@ pub fn silu(input: &Tensor) -> kore_core::Result<Tensor> {
         return Err(KoreError::UnsupportedDType(input.dtype()));
     }
     let data = input.contiguous();
-    let slice = data.as_f32_slice()
+    let slice = data
+        .as_f32_slice()
         .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
-    let result: Vec<f32> = slice
-        .iter()
-        .map(|&x| x / (1.0 + (-x).exp()))
-        .collect();
+    let result: Vec<f32> = slice.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
     Ok(Tensor::from_f32(&result, input.shape().dims()))
 }
 
@@ -50,12 +50,10 @@ pub fn sigmoid(input: &Tensor) -> kore_core::Result<Tensor> {
         return Err(KoreError::UnsupportedDType(input.dtype()));
     }
     let data = input.contiguous();
-    let slice = data.as_f32_slice()
+    let slice = data
+        .as_f32_slice()
         .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
-    let result: Vec<f32> = slice
-        .iter()
-        .map(|&x| 1.0 / (1.0 + (-x).exp()))
-        .collect();
+    let result: Vec<f32> = slice.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
     Ok(Tensor::from_f32(&result, input.shape().dims()))
 }
 
@@ -66,14 +64,17 @@ pub fn softmax(input: &Tensor) -> kore_core::Result<Tensor> {
     }
     let data = input.contiguous();
     let dims = data.shape().dims();
-    let slice = data.as_f32_slice()
+    let slice = data
+        .as_f32_slice()
         .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
 
     if dims.is_empty() {
         return Ok(Tensor::scalar(1.0));
     }
 
-    let last_dim = *dims.last().ok_or_else(|| KoreError::StorageError("empty dims".into()))?;
+    let last_dim = *dims
+        .last()
+        .ok_or_else(|| KoreError::StorageError("empty dims".into()))?;
     let batch_size = data.numel() / last_dim;
     let mut result = vec![0.0f32; data.numel()];
 
@@ -100,7 +101,8 @@ pub fn tanh(input: &Tensor) -> kore_core::Result<Tensor> {
         return Err(KoreError::UnsupportedDType(input.dtype()));
     }
     let data = input.contiguous();
-    let slice = data.as_f32_slice()
+    let slice = data
+        .as_f32_slice()
         .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
     let result: Vec<f32> = slice.iter().map(|&x| x.tanh()).collect();
     Ok(Tensor::from_f32(&result, input.shape().dims()))

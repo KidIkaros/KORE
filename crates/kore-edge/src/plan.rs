@@ -19,13 +19,32 @@ pub enum FusedOp {
     /// Embedding lookup
     Embedding { weight_name: String, dim: usize },
     /// Linear projection (matmul + optional bias)
-    Linear { weight_name: String, bias_name: Option<String>, m: usize, n: usize, k: usize },
+    Linear {
+        weight_name: String,
+        bias_name: Option<String>,
+        m: usize,
+        n: usize,
+        k: usize,
+    },
     /// RMS normalization
-    RMSNorm { gamma_name: String, dim: usize, eps: f32 },
+    RMSNorm {
+        gamma_name: String,
+        dim: usize,
+        eps: f32,
+    },
     /// RoPE application
-    RoPE { n_heads: usize, head_dim: usize, base: f32 },
+    RoPE {
+        n_heads: usize,
+        head_dim: usize,
+        base: f32,
+    },
     /// Multi-head attention (fused QKV → scores → output)
-    Attention { n_heads: usize, n_kv_heads: usize, head_dim: usize, causal: bool },
+    Attention {
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        causal: bool,
+    },
     /// SwiGLU feed-forward: silu(x @ w1) * (x @ w3) @ w2
     FeedForward {
         w1_name: String,
@@ -37,7 +56,11 @@ pub enum FusedOp {
     /// Residual add (in-place)
     ResidualAdd,
     /// Final linear projection to vocab logits
-    FinalProj { weight_name: String, vocab_size: usize, d_model: usize },
+    FinalProj {
+        weight_name: String,
+        vocab_size: usize,
+        d_model: usize,
+    },
 }
 
 /// Complete execution plan for a transformer model.
@@ -103,7 +126,11 @@ impl ExecutionPlan {
             });
 
             // RoPE
-            ops.push(FusedOp::RoPE { n_heads, head_dim, base: rope_base });
+            ops.push(FusedOp::RoPE {
+                n_heads,
+                head_dim,
+                base: rope_base,
+            });
 
             // Attention
             ops.push(FusedOp::Attention {
@@ -232,6 +259,10 @@ mod tests {
         let header = tiny_header();
         let plan = ExecutionPlan::from_header(&header);
         // Should be reasonable for a tiny model
-        assert!(plan.peak_memory_mb() < 10.0, "peak={}MB", plan.peak_memory_mb());
+        assert!(
+            plan.peak_memory_mb() < 10.0,
+            "peak={}MB",
+            plan.peak_memory_mb()
+        );
     }
 }

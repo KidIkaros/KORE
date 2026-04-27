@@ -1,6 +1,6 @@
 use clap::Parser;
-use std::time::Instant;
 use serde::Deserialize;
+use std::time::Instant;
 
 use kore_core::Tensor;
 
@@ -16,7 +16,7 @@ const BANNER: &str = r#"
     name = "kore",
     about = "Kore ML Engine CLI",
     long_about = "A pure-Rust ML engine — from training to edge inference.\n\nBuild any architecture on top of KORE primitives: tensors, autograd,\nquantization, attention, and more. Model implementations live in Xura.",
-    version,
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -75,14 +75,26 @@ fn main() {
         Commands::Info => cmd_info(),
         Commands::Bench { sizes } => cmd_bench(&sizes),
         Commands::Serve { addr } => cmd_serve(&addr),
-        Commands::Train { steps, lr, scheduler, warmup_pct } => cmd_train(steps, lr, &scheduler, warmup_pct),
-        Commands::Export { model, output, quantize } => cmd_export(&model, &output, &quantize),
+        Commands::Train {
+            steps,
+            lr,
+            scheduler,
+            warmup_pct,
+        } => cmd_train(steps, lr, &scheduler, warmup_pct),
+        Commands::Export {
+            model,
+            output,
+            quantize,
+        } => cmd_export(&model, &output, &quantize),
     }
 }
 
 fn cmd_info() {
     println!("{}", BANNER);
-    println!("  v{}  —  A pure-Rust ML engine\n", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  v{}  —  A pure-Rust ML engine\n",
+        env!("CARGO_PKG_VERSION")
+    );
 
     println!("Platform");
     println!("  OS:   {}", std::env::consts::OS);
@@ -102,19 +114,19 @@ fn cmd_info() {
 
     println!("\nCrates (13)");
     let crates = [
-        ("core",      "Tensor, DType, Device, Storage"),
-        ("autograd",  "Computation graph, backward pass"),
-        ("nn",        "Layers, modules, sampler"),
-        ("optim",     "Adam, SGD, LR schedulers"),
-        ("btes",      "Ternary/quaternary encoding"),
-        ("kernels",   "CUDA + CPU SIMD kernels"),
-        ("clifford",  "Geometric algebra"),
+        ("core", "Tensor, DType, Device, Storage"),
+        ("autograd", "Computation graph, backward pass"),
+        ("nn", "Layers, modules, sampler"),
+        ("optim", "Adam, SGD, LR schedulers"),
+        ("btes", "Ternary/quaternary encoding"),
+        ("kernels", "CUDA + CPU SIMD kernels"),
+        ("clifford", "Geometric algebra"),
         ("attention", "Flash attention, KV-cache"),
-        ("edge",      "No-std inference runtime"),
-        ("data",      "Dataset utilities"),
-        ("serve",     "Inference server (OpenAI API)"),
-        ("python",    "PyO3 bindings"),
-        ("cli",       "This CLI"),
+        ("edge", "No-std inference runtime"),
+        ("data", "Dataset utilities"),
+        ("serve", "Inference server (OpenAI API)"),
+        ("python", "PyO3 bindings"),
+        ("cli", "This CLI"),
     ];
     for (name, desc) in crates {
         println!("  kore-{:<10} {}", name, desc);
@@ -129,31 +141,55 @@ fn cmd_bench(sizes_str: &str) {
 
     let simd = kore_kernels::SimdCapability::detect();
     println!("=== Kore Matmul Benchmark ===");
-    println!("SIMD: {} (avx2={}, avx512={}, fma={})\n",
-        simd.best_tier(), simd.avx2, simd.avx512f, simd.fma);
+    println!(
+        "SIMD: {} (avx2={}, avx512={}, fma={})\n",
+        simd.best_tier(),
+        simd.avx2,
+        simd.avx512f,
+        simd.fma
+    );
 
-    println!("{:<14} {:>12} {:>12} {:>9} {:>12} {:>10}",
-        "Size", "Naive (ms)", "Tiled (ms)", "Speedup", "Quat (ms)", "Quat GF/s");
+    println!(
+        "{:<14} {:>12} {:>12} {:>9} {:>12} {:>10}",
+        "Size", "Naive (ms)", "Tiled (ms)", "Speedup", "Quat (ms)", "Quat GF/s"
+    );
     println!("{}", "-".repeat(73));
 
     for &sz in &sizes {
         let (m, n, k) = (sz, sz, sz);
-        let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6).collect();
-        let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 11 + 5) % 17) as f32 * 0.1 - 0.8).collect();
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 11 + 5) % 17) as f32 * 0.1 - 0.8)
+            .collect();
 
         let a = Tensor::from_f32(&a_data, &[m, k]);
         let b = Tensor::from_f32(&b_data, &[k, n]);
 
-        let iters = if sz <= 128 { 500 } else if sz <= 256 { 50 } else if sz <= 512 { 10 } else { 3 };
+        let iters = if sz <= 128 {
+            500
+        } else if sz <= 256 {
+            50
+        } else if sz <= 512 {
+            10
+        } else {
+            3
+        };
 
         // Warmup
         let _ = a.matmul(&b);
         let _ = kore_kernels::cpu_matmul::matmul_f32(&a, &b);
 
-        let naive_s = time_it(iters, || { let _ = a.matmul(&b); });
-        let tiled_s = time_it(iters, || { let _ = kore_kernels::cpu_matmul::matmul_f32(&a, &b); });
+        let naive_s = time_it(iters, || {
+            let _ = a.matmul(&b);
+        });
+        let tiled_s = time_it(iters, || {
+            let _ = kore_kernels::cpu_matmul::matmul_f32(&a, &b);
+        });
 
-        let (packed, scales) = kore_kernels::cpu_quat_matmul::pack_weights_quaternary(&a_data, m, k);
+        let (packed, scales) =
+            kore_kernels::cpu_quat_matmul::pack_weights_quaternary(&a_data, m, k);
         let quat_s = time_it(iters, || {
             let _ = kore_kernels::cpu_quat_matmul::quat_matmul(&packed, &scales, &b, m, n, k);
         });
@@ -161,7 +197,8 @@ fn cmd_bench(sizes_str: &str) {
         let speedup = naive_s / tiled_s;
         let quat_gflops = (2.0 * m as f64 * n as f64 * k as f64) / quat_s / 1e9;
 
-        println!("{:<14} {:>10.3}ms {:>10.3}ms {:>8.1}x {:>10.3}ms {:>9.2}",
+        println!(
+            "{:<14} {:>10.3}ms {:>10.3}ms {:>8.1}x {:>10.3}ms {:>9.2}",
             format!("{}x{}", sz, sz),
             naive_s * 1000.0,
             tiled_s * 1000.0,
@@ -173,21 +210,35 @@ fn cmd_bench(sizes_str: &str) {
 
     // Flash Attention benchmark
     println!("\n=== Flash Attention Benchmark ===\n");
-    println!("{:<14} {:>14} {:>14} {:>10}",
-        "SeqLen", "Standard (ms)", "Flash (ms)", "Speedup");
+    println!(
+        "{:<14} {:>14} {:>14} {:>10}",
+        "SeqLen", "Standard (ms)", "Flash (ms)", "Speedup"
+    );
     println!("{}", "-".repeat(56));
 
     for &seq_len in &[64, 128, 256, 512] {
         let d = 64;
-        let data: Vec<f32> = (0..seq_len * d).map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6).collect();
+        let data: Vec<f32> = (0..seq_len * d)
+            .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6)
+            .collect();
         let q = Tensor::from_f32(&data, &[seq_len, d]);
         let mask = kore_attention::mask::causal_mask(seq_len);
 
-        let iters = if seq_len <= 128 { 50 } else if seq_len <= 256 { 10 } else { 3 };
+        let iters = if seq_len <= 128 {
+            50
+        } else if seq_len <= 256 {
+            10
+        } else {
+            3
+        };
 
         let std_s = time_it(iters, || {
             let _ = kore_attention::scaled_dot::scaled_dot_product_attention(
-                &q, &q, &q, Some(&mask), None,
+                &q,
+                &q,
+                &q,
+                Some(&mask),
+                None,
             );
         });
 
@@ -195,7 +246,8 @@ fn cmd_bench(sizes_str: &str) {
             let _ = kore_attention::flash::flash_attention(&q, &q, &q, true);
         });
 
-        println!("{:<14} {:>12.3}ms {:>12.3}ms {:>9.1}x",
+        println!(
+            "{:<14} {:>12.3}ms {:>12.3}ms {:>9.1}x",
             format!("seq={}", seq_len),
             std_s * 1000.0,
             flash_s * 1000.0,
@@ -240,10 +292,13 @@ fn cmd_serve(addr: &str) {
 }
 
 fn cmd_train(steps: usize, lr: f32, scheduler_name: &str, warmup_pct: f32) {
-    use kore_optim::{LrScheduler, CosineAnnealing, WarmupCosine, OneCycle, StepDecay};
+    use kore_optim::{CosineAnnealing, LrScheduler, OneCycle, StepDecay, WarmupCosine};
 
     println!("=== Kore Training Demo ===");
-    println!("Steps: {}, LR: {}, Scheduler: {}", steps, lr, scheduler_name);
+    println!(
+        "Steps: {}, LR: {}, Scheduler: {}",
+        steps, lr, scheduler_name
+    );
 
     // Build scheduler
     let sched: Box<dyn LrScheduler> = match scheduler_name {
@@ -315,7 +370,7 @@ struct HfExportConfig {
 }
 
 fn cmd_export(model_path: &str, output_path: &str, quantize: &str) {
-    use kore_edge::format::{KorefBuilder, EdgeDType};
+    use kore_edge::format::{EdgeDType, KorefBuilder};
     use std::path::Path;
 
     println!("=== Kore Export → .koref ===");
@@ -352,8 +407,10 @@ fn cmd_export(model_path: &str, output_path: &str, quantize: &str) {
     let norm_eps = config.rms_norm_eps.unwrap_or(1e-5) as f32;
     let rope_base = config.rope_theta.unwrap_or(10000.0) as f32;
 
-    println!("Config: vocab={} d={} heads={} kv_heads={} layers={} ff={} max_seq={}",
-        vocab_size, d_model, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len);
+    println!(
+        "Config: vocab={} d={} heads={} kv_heads={} layers={} ff={} max_seq={}",
+        vocab_size, d_model, n_heads, n_kv_heads, n_layers, d_ff, max_seq_len
+    );
 
     let _target_dtype = match quantize {
         "f32" => EdgeDType::F32,
@@ -361,14 +418,25 @@ fn cmd_export(model_path: &str, output_path: &str, quantize: &str) {
         "ternary" => EdgeDType::Ternary,
         "quaternary" => EdgeDType::Quaternary,
         other => {
-            eprintln!("Unknown quantization: {}. Use f32, f16, ternary, or quaternary.", other);
+            eprintln!(
+                "Unknown quantization: {}. Use f32, f16, ternary, or quaternary.",
+                other
+            );
             return;
         }
     };
 
     let mut builder = KorefBuilder::new(
-        "llama", vocab_size, d_model, n_heads, n_kv_heads,
-        n_layers, d_ff, max_seq_len, norm_eps, rope_base,
+        "llama",
+        vocab_size,
+        d_model,
+        n_heads,
+        n_kv_heads,
+        n_layers,
+        d_ff,
+        max_seq_len,
+        norm_eps,
+        rope_base,
     );
 
     // Find safetensors files
@@ -384,13 +452,15 @@ fn cmd_export(model_path: &str, output_path: &str, quantize: &str) {
         eprintln!("Creating demo .koref with random weights instead...");
 
         // Demo: create a tiny model
-        let demo_builder = KorefBuilder::new(
-            "demo", 256, 64, 4, 4, 2, 128, 128, 1e-5, 10000.0,
-        );
+        let demo_builder = KorefBuilder::new("demo", 256, 64, 4, 4, 2, 128, 128, 1e-5, 10000.0);
         let model = demo_builder.build();
         let bytes = model.to_bytes();
         std::fs::write(output_path, &bytes).expect("Failed to write .koref");
-        println!("Wrote demo .koref ({} bytes) to {}", bytes.len(), output_path);
+        println!(
+            "Wrote demo .koref ({} bytes) to {}",
+            bytes.len(),
+            output_path
+        );
         return;
     }
 
@@ -401,7 +471,8 @@ fn cmd_export(model_path: &str, output_path: &str, quantize: &str) {
 
     for st_path in &st_files {
         let data = std::fs::read(st_path).expect("Failed to read safetensors");
-        let tensors = safetensors::SafeTensors::deserialize(&data).expect("Failed to parse safetensors");
+        let tensors =
+            safetensors::SafeTensors::deserialize(&data).expect("Failed to parse safetensors");
 
         for (name, view) in tensors.tensors() {
             let shape: Vec<usize> = view.shape().to_vec();
@@ -421,12 +492,17 @@ fn cmd_export(model_path: &str, output_path: &str, quantize: &str) {
     println!();
     println!("Export complete:");
     println!("  Tensors:    {}", tensor_count);
-    println!("  Weight data: {:.1} MB", total_bytes as f64 / (1024.0 * 1024.0));
-    println!("  .koref size: {:.1} MB", bytes.len() as f64 / (1024.0 * 1024.0));
+    println!(
+        "  Weight data: {:.1} MB",
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
+    println!(
+        "  .koref size: {:.1} MB",
+        bytes.len() as f64 / (1024.0 * 1024.0)
+    );
     println!("  Output:     {}", output_path);
 
     // Print estimated edge memory
     let plan = kore_edge::plan::ExecutionPlan::from_header(&model.header);
     println!("  Est. runtime memory: {:.1} MB", plan.peak_memory_mb());
 }
-

@@ -1,7 +1,7 @@
 //! Dropout layer — randomly zeroes elements during training.
 
-use kore_core::{KoreError, Tensor};
 use crate::module::Module;
+use kore_core::{KoreError, Tensor};
 
 /// Dropout layer: randomly zeroes elements with probability `p` during training.
 /// During evaluation, acts as identity.
@@ -14,7 +14,10 @@ pub struct Dropout {
 impl Dropout {
     /// Create a new Dropout layer with the given drop probability.
     pub fn new(p: f32) -> Self {
-        assert!((0.0..1.0).contains(&p), "Dropout probability must be in [0, 1)");
+        assert!(
+            (0.0..1.0).contains(&p),
+            "Dropout probability must be in [0, 1)"
+        );
         Self {
             p,
             training: true,
@@ -40,9 +43,9 @@ impl Module for Dropout {
         }
 
         let data = input.contiguous();
-        let slice = data.as_f32_slice().ok_or_else(|| {
-            KoreError::UnsupportedDType(input.dtype())
-        })?;
+        let slice = data
+            .as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
         let scale = 1.0 / (1.0 - self.p);
 
         // Use a local copy of seed for deterministic but varying masks
@@ -56,13 +59,7 @@ impl Module for Dropout {
 
         let result: Vec<f32> = slice
             .iter()
-            .map(|&x| {
-                if next() < self.p {
-                    0.0
-                } else {
-                    x * scale
-                }
-            })
+            .map(|&x| if next() < self.p { 0.0 } else { x * scale })
             .collect();
 
         Ok(Tensor::from_f32(&result, input.shape().dims()))

@@ -7,21 +7,18 @@
 //! without circular dependencies. This crate re-exports them for backward
 //! compatibility and provides the original module structure.
 
-pub mod graph;
 pub mod backward;
-pub mod grad_fn;
-pub mod scope;
 pub mod checkpoint;
+pub mod grad_fn;
+pub mod graph;
+pub mod scope;
 
 // Re-export canonical types from kore-core
 pub use kore_core::autograd::{
-    GradFn, GradNode, NoGradGuard,
-    backward, is_grad_enabled,
-    AddBackward, SubBackward, MulBackward, DivBackward,
-    MatmulBackward, NegBackward, ExpBackward, LogBackward,
-    SqrtBackward, AbsBackward, SumBackward, MeanBackward,
-    AddScalarBackward, MulScalarBackward, PowScalarBackward,
-    ClampBackward,
+    backward, is_grad_enabled, AbsBackward, AddBackward, AddScalarBackward, ClampBackward,
+    DivBackward, ExpBackward, GradFn, GradNode, LogBackward, MatmulBackward, MeanBackward,
+    MulBackward, MulScalarBackward, NegBackward, NoGradGuard, PowScalarBackward, SqrtBackward,
+    SubBackward, SumBackward,
 };
 
 // Legacy re-exports from submodules

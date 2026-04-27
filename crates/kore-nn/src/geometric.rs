@@ -9,8 +9,8 @@
 //! Target applications: robotics perception (SE(3) equivariance),
 //! physics simulation, point cloud processing.
 
-use kore_core::{DType, KoreError, Tensor};
 use kore_clifford::{CliffordAlgebra, MultivectorTensor};
+use kore_core::{DType, KoreError, Tensor};
 
 /// Rotation-equivariant linear layer using Clifford algebra.
 ///
@@ -84,10 +84,12 @@ impl EquivariantLinear {
         let d = self.algebra.dim;
         let batch = input.batch_size();
         let in_data = input.data.contiguous();
-        let in_slice = in_data.as_f32_slice()
+        let in_slice = in_data
+            .as_f32_slice()
             .ok_or_else(|| KoreError::UnsupportedDType(input.data.dtype()))?;
         let w_data = self.weights.contiguous();
-        let w_slice = w_data.as_f32_slice()
+        let w_slice = w_data
+            .as_f32_slice()
             .ok_or_else(|| KoreError::UnsupportedDType(self.weights.dtype()))?;
 
         let mut out = vec![0.0f32; batch * d];
@@ -103,9 +105,13 @@ impl EquivariantLinear {
                 // Compute W_k ⊗ x
                 let mut wx = vec![0.0f32; d];
                 for i in 0..d {
-                    if w[i].abs() < 1e-10 { continue; }
+                    if w[i].abs() < 1e-10 {
+                        continue;
+                    }
                     for j in 0..d {
-                        if x[j].abs() < 1e-10 { continue; }
+                        if x[j].abs() < 1e-10 {
+                            continue;
+                        }
                         let entry = &self.algebra.cayley[i][j];
                         wx[entry.blade] += entry.sign.as_f32() * w[i] * x[j];
                     }
@@ -115,15 +121,23 @@ impl EquivariantLinear {
                 let mut w_rev = vec![0.0f32; d];
                 for i in 0..d {
                     let grade = self.algebra.grade(i);
-                    let sign = if (grade * grade.wrapping_sub(1) / 2).is_multiple_of(2) { 1.0 } else { -1.0 };
+                    let sign = if (grade * grade.wrapping_sub(1) / 2).is_multiple_of(2) {
+                        1.0
+                    } else {
+                        -1.0
+                    };
                     w_rev[i] = w[i] * sign;
                 }
 
                 // Compute (W_k ⊗ x) ⊗ W̃_k
                 for i in 0..d {
-                    if wx[i].abs() < 1e-10 { continue; }
+                    if wx[i].abs() < 1e-10 {
+                        continue;
+                    }
                     for j in 0..d {
-                        if w_rev[j].abs() < 1e-10 { continue; }
+                        if w_rev[j].abs() < 1e-10 {
+                            continue;
+                        }
                         let entry = &self.algebra.cayley[i][j];
                         out[b * d + entry.blade] += entry.sign.as_f32() * wx[i] * w_rev[j];
                     }
@@ -133,7 +147,8 @@ impl EquivariantLinear {
 
         // Add bias (scalar multivector)
         if let Some(ref bias) = self.bias {
-            let b_slice = bias.as_f32_slice()
+            let b_slice = bias
+                .as_f32_slice()
                 .ok_or_else(|| KoreError::UnsupportedDType(bias.dtype()))?;
             for b in 0..batch {
                 for i in 0..d {
@@ -220,7 +235,8 @@ impl GeometricMLP {
         let d = self.algebra.dim;
         let batch = input.batch_size();
         let data = input.data.contiguous();
-        let slice = data.as_f32_slice()
+        let slice = data
+            .as_f32_slice()
             .expect("grade_activation: input must be F32");
 
         let mut out = vec![0.0f32; batch * d];
@@ -236,12 +252,12 @@ impl GeometricMLP {
             let max_grade = self.algebra.n;
             for g in 1..=max_grade {
                 let blades = self.algebra.blades_of_grade(g);
-                if blades.is_empty() { continue; }
+                if blades.is_empty() {
+                    continue;
+                }
 
                 // Compute L2 norm of this grade's components
-                let norm_sq: f32 = blades.iter()
-                    .map(|&idx| mv[idx] * mv[idx])
-                    .sum();
+                let norm_sq: f32 = blades.iter().map(|&idx| mv[idx] * mv[idx]).sum();
                 let norm = norm_sq.sqrt();
 
                 // Sigmoid gate: σ(norm - 1) — activates when norm > 1
@@ -269,16 +285,22 @@ impl GeometricMLP {
 mod tests {
     use super::*;
 
-    fn cl30() -> CliffordAlgebra { CliffordAlgebra::new(3, 0) }
-    fn cl20() -> CliffordAlgebra { CliffordAlgebra::new(2, 0) }
+    fn cl30() -> CliffordAlgebra {
+        CliffordAlgebra::new(3, 0)
+    }
+    fn cl20() -> CliffordAlgebra {
+        CliffordAlgebra::new(2, 0)
+    }
 
     #[test]
     fn test_equivariant_linear_shape() {
         let alg = cl30();
         let layer = EquivariantLinear::new(&alg, 4, true);
         let input = MultivectorTensor::from_vectors(
-            &alg, &Tensor::from_f32(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &[2, 3])
-        ).unwrap();
+            &alg,
+            &Tensor::from_f32(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0], &[2, 3]),
+        )
+        .unwrap();
 
         let output = layer.forward(&input).unwrap();
         assert_eq!(output.data.shape().dims(), &[2, 8]);
@@ -288,9 +310,8 @@ mod tests {
     fn test_equivariant_linear_deterministic() {
         let alg = cl20();
         let layer = EquivariantLinear::new(&alg, 2, false);
-        let input = MultivectorTensor::from_vectors(
-            &alg, &Tensor::from_f32(&[1.0, 0.0], &[1, 2])
-        ).unwrap();
+        let input =
+            MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[1.0, 0.0], &[1, 2])).unwrap();
 
         let out1 = layer.forward(&input).unwrap();
         let out2 = layer.forward(&input).unwrap();
@@ -335,8 +356,10 @@ mod tests {
         let alg = cl30();
         let mlp = GeometricMLP::new(&alg, 3, 2);
         let input = MultivectorTensor::from_vectors(
-            &alg, &Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])
-        ).unwrap();
+            &alg,
+            &Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]),
+        )
+        .unwrap();
 
         let output = mlp.forward(&input).unwrap();
         assert_eq!(output.data.shape().dims(), &[2, 8]);
@@ -356,9 +379,9 @@ mod tests {
     fn test_geometric_mlp_finite_output() {
         let alg = cl30();
         let mlp = GeometricMLP::new(&alg, 2, 3);
-        let input = MultivectorTensor::from_vectors(
-            &alg, &Tensor::from_f32(&[0.5, -0.3, 1.2], &[1, 3])
-        ).unwrap();
+        let input =
+            MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[0.5, -0.3, 1.2], &[1, 3]))
+                .unwrap();
 
         let output = mlp.forward(&input).unwrap();
         let data = output.data.as_f32_slice().unwrap();
@@ -374,7 +397,7 @@ mod tests {
         let mut mv = MultivectorTensor::zeros(&alg, &[1]);
         let mut m = kore_clifford::Multivector::zero(&alg);
         m.coeffs[0] = -5.0; // negative scalar
-        m.coeffs[1] = 2.0;  // e1 component
+        m.coeffs[1] = 2.0; // e1 component
         mv.set(0, &m);
 
         let activated = mlp.grade_activation(&mv);
@@ -396,12 +419,12 @@ mod tests {
         let layer = EquivariantLinear::new(&alg, 2, false);
 
         // Two different inputs
-        let v1 = MultivectorTensor::from_vectors(
-            &alg, &Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3])
-        ).unwrap();
-        let v2 = MultivectorTensor::from_vectors(
-            &alg, &Tensor::from_f32(&[0.0, 1.0, 0.0], &[1, 3])
-        ).unwrap();
+        let v1 =
+            MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3]))
+                .unwrap();
+        let v2 =
+            MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[0.0, 1.0, 0.0], &[1, 3]))
+                .unwrap();
 
         let out1 = layer.forward(&v1).unwrap();
         let out2 = layer.forward(&v2).unwrap();

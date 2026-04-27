@@ -13,9 +13,9 @@ use std::collections::HashMap;
 
 use kore_core::{DType, KoreError, Tensor};
 
-use crate::module::Module;
-use crate::linear::Linear;
 use crate::bit_linear::BitLinear;
+use crate::linear::Linear;
+use crate::module::Module;
 
 /// LoRA adapter on top of a standard f32 Linear layer.
 ///
@@ -73,19 +73,34 @@ impl LoraLinear {
     }
 
     /// Create a standalone LoRA linear (no pre-existing base weight).
-    pub fn new(in_features: usize, out_features: usize, rank: usize, alpha: f32, bias: bool) -> Self {
+    pub fn new(
+        in_features: usize,
+        out_features: usize,
+        rank: usize,
+        alpha: f32,
+        bias: bool,
+    ) -> Self {
         let linear = Linear::new(in_features, out_features, bias);
         Self::from_linear(&linear, rank, alpha)
     }
 
-    pub fn rank(&self) -> usize { self.rank }
-    pub fn alpha(&self) -> f32 { self.alpha }
-    pub fn in_features(&self) -> usize { self.in_features }
-    pub fn out_features(&self) -> usize { self.out_features }
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+    pub fn alpha(&self) -> f32 {
+        self.alpha
+    }
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
 
     /// Number of trainable parameters (only A and B).
     pub fn trainable_params(&self) -> usize {
-        self.rank * self.in_features + self.out_features * self.rank
+        self.rank * self.in_features
+            + self.out_features * self.rank
             + self.bias.as_ref().map_or(0, |b| b.numel())
     }
 
@@ -100,8 +115,7 @@ impl LoraLinear {
         let scaling = self.alpha / self.rank as f32;
 
         // delta_W = scaling * B @ A → [out_features, in_features]
-        let delta = self.lora_b.matmul(&self.lora_a)?
-            .mul_scalar(scaling)?;
+        let delta = self.lora_b.matmul(&self.lora_a)?.mul_scalar(scaling)?;
 
         let merged_weight = self.base_weight.add(&delta)?;
 
@@ -120,7 +134,8 @@ impl Module for LoraLinear {
         // LoRA: input @ A^T @ B^T * scaling
         let at = self.lora_a.transpose()?;
         let bt = self.lora_b.transpose()?;
-        let lora_out = input.matmul(&at.contiguous())?
+        let lora_out = input
+            .matmul(&at.contiguous())?
             .matmul(&bt.contiguous())?
             .mul_scalar(scaling)?;
 
@@ -142,10 +157,7 @@ impl Module for LoraLinear {
     }
 
     fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
-        let mut params = vec![
-            ("lora_a", &self.lora_a),
-            ("lora_b", &self.lora_b),
-        ];
+        let mut params = vec![("lora_a", &self.lora_a), ("lora_b", &self.lora_b)];
         if let Some(ref b) = self.bias {
             params.push(("bias", b));
         }
@@ -255,14 +267,23 @@ impl QLoraLinear {
         }
     }
 
-    pub fn rank(&self) -> usize { self.rank }
-    pub fn alpha(&self) -> f32 { self.alpha }
-    pub fn in_features(&self) -> usize { self.in_features }
-    pub fn out_features(&self) -> usize { self.out_features }
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+    pub fn alpha(&self) -> f32 {
+        self.alpha
+    }
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
 
     /// Trainable parameter count (only LoRA A, B, and bias).
     pub fn trainable_params(&self) -> usize {
-        self.rank * self.in_features + self.out_features * self.rank
+        self.rank * self.in_features
+            + self.out_features * self.rank
             + self.bias.as_ref().map_or(0, |b| b.numel())
     }
 
@@ -282,7 +303,8 @@ impl Module for QLoraLinear {
         // LoRA: input @ A^T @ B^T * scaling
         let at = self.lora_a.transpose()?;
         let bt = self.lora_b.transpose()?;
-        let lora_out = input.matmul(&at.contiguous())?
+        let lora_out = input
+            .matmul(&at.contiguous())?
             .matmul(&bt.contiguous())?
             .mul_scalar(scaling)?;
 
@@ -304,10 +326,7 @@ impl Module for QLoraLinear {
     }
 
     fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
-        let mut params = vec![
-            ("lora_a", &self.lora_a),
-            ("lora_b", &self.lora_b),
-        ];
+        let mut params = vec![("lora_a", &self.lora_a), ("lora_b", &self.lora_b)];
         if let Some(ref b) = self.bias {
             params.push(("bias", b));
         }
@@ -328,8 +347,12 @@ impl std::fmt::Display for LoraLinear {
         write!(
             f,
             "LoraLinear(in={}, out={}, rank={}, alpha={}, trainable={}/{})",
-            self.in_features, self.out_features, self.rank, self.alpha,
-            self.trainable_params(), self.total_params(),
+            self.in_features,
+            self.out_features,
+            self.rank,
+            self.alpha,
+            self.trainable_params(),
+            self.total_params(),
         )
     }
 }
@@ -339,8 +362,12 @@ impl std::fmt::Display for QLoraLinear {
         write!(
             f,
             "QLoraLinear(in={}, out={}, rank={}, alpha={}, base_compression={:.1}x, trainable={})",
-            self.in_features, self.out_features, self.rank, self.alpha,
-            self.base_compression_ratio(), self.trainable_params(),
+            self.in_features,
+            self.out_features,
+            self.rank,
+            self.alpha,
+            self.base_compression_ratio(),
+            self.trainable_params(),
         )
     }
 }
@@ -385,7 +412,10 @@ mod tests {
         for i in 0..4 {
             assert!(
                 (l_data[i] - r_data[i]).abs() < 1e-4,
-                "mismatch at {}: linear={}, lora={}", i, l_data[i], r_data[i]
+                "mismatch at {}: linear={}, lora={}",
+                i,
+                l_data[i],
+                r_data[i]
             );
         }
     }
@@ -405,7 +435,10 @@ mod tests {
         for i in 0..4 {
             assert!(
                 (l_data[i] - m_data[i]).abs() < 1e-3,
-                "merge mismatch at {}: lora={}, merged={}", i, l_data[i], m_data[i]
+                "merge mismatch at {}: lora={}, merged={}",
+                i,
+                l_data[i],
+                m_data[i]
             );
         }
     }

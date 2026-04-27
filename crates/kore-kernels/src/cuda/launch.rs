@@ -13,8 +13,7 @@ use super::context::CudaError;
 
 /// Registry of compiled PTX modules per device.
 /// Key: (device_idx, module_name)
-static LOADED: std::sync::OnceLock<Mutex<HashSet<(usize, String)>>> =
-    std::sync::OnceLock::new();
+static LOADED: std::sync::OnceLock<Mutex<HashSet<(usize, String)>>> = std::sync::OnceLock::new();
 
 fn loaded_set() -> &'static Mutex<HashSet<(usize, String)>> {
     LOADED.get_or_init(|| Mutex::new(HashSet::new()))

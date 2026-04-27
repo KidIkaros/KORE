@@ -7,23 +7,20 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use kore_core::{KoreError, Tensor};
+use safetensors::tensor::{serialize, TensorView};
 use safetensors::SafeTensors;
-use safetensors::tensor::{TensorView, serialize};
 
 /// Save a state dictionary (name → Tensor) to a safetensors file.
-pub fn save_state_dict(
-    state_dict: &HashMap<String, Tensor>,
-    path: &Path,
-) -> Result<(), KoreError> {
+pub fn save_state_dict(state_dict: &HashMap<String, Tensor>, path: &Path) -> Result<(), KoreError> {
     let mut views = Vec::new();
     let mut buffers: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Convert each tensor to raw f32 bytes
     for (name, tensor) in state_dict {
         let data = tensor.contiguous();
-        let slice = data.as_f32_slice().ok_or_else(|| {
-            KoreError::UnsupportedDType(tensor.dtype())
-        })?;
+        let slice = data
+            .as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(tensor.dtype()))?;
         let bytes: Vec<u8> = slice.iter().flat_map(|f| f.to_le_bytes()).collect();
         buffers.push((name.clone(), bytes));
     }
@@ -40,8 +37,9 @@ pub fn save_state_dict(
     let serialized = serialize(views, &None)
         .map_err(|e| KoreError::StorageError(format!("safetensors serialize error: {}", e)))?;
 
-    std::fs::write(path, &serialized)
-        .map_err(|e| KoreError::StorageError(format!("Failed to write {}: {}", path.display(), e)))?;
+    std::fs::write(path, &serialized).map_err(|e| {
+        KoreError::StorageError(format!("Failed to write {}: {}", path.display(), e))
+    })?;
 
     Ok(())
 }
@@ -49,8 +47,9 @@ pub fn save_state_dict(
 /// Load a state dictionary from a safetensors file.
 /// Returns a HashMap of name → Tensor.
 pub fn load_state_dict(path: &Path) -> Result<HashMap<String, Tensor>, KoreError> {
-    let data = std::fs::read(path)
-        .map_err(|e| KoreError::StorageError(format!("Failed to read {}: {}", path.display(), e)))?;
+    let data = std::fs::read(path).map_err(|e| {
+        KoreError::StorageError(format!("Failed to read {}: {}", path.display(), e))
+    })?;
 
     let tensors = SafeTensors::deserialize(&data)
         .map_err(|e| KoreError::StorageError(format!("safetensors parse error: {}", e)))?;
@@ -77,37 +76,37 @@ pub fn load_module_state(path: &Path) -> Result<HashMap<String, Tensor>, KoreErr
 }
 
 /// Convert a safetensors TensorView to a kore Tensor (f32).
-fn safetensor_view_to_tensor(view: &safetensors::tensor::TensorView<'_>) -> Result<Tensor, KoreError> {
+fn safetensor_view_to_tensor(
+    view: &safetensors::tensor::TensorView<'_>,
+) -> Result<Tensor, KoreError> {
     let shape: Vec<usize> = view.shape().to_vec();
     let dtype = view.dtype();
     let data = view.data();
 
     let f32_data: Vec<f32> = match dtype {
-        safetensors::Dtype::F32 => {
-            data.chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect()
-        }
-        safetensors::Dtype::F16 => {
-            data.chunks_exact(2)
-                .map(|b| {
-                    let bits = u16::from_le_bytes([b[0], b[1]]);
-                    half::f16::from_bits(bits).to_f32()
-                })
-                .collect()
-        }
-        safetensors::Dtype::BF16 => {
-            data.chunks_exact(2)
-                .map(|b| {
-                    let bits = u16::from_le_bytes([b[0], b[1]]);
-                    half::bf16::from_bits(bits).to_f32()
-                })
-                .collect()
-        }
+        safetensors::Dtype::F32 => data
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        safetensors::Dtype::F16 => data
+            .chunks_exact(2)
+            .map(|b| {
+                let bits = u16::from_le_bytes([b[0], b[1]]);
+                half::f16::from_bits(bits).to_f32()
+            })
+            .collect(),
+        safetensors::Dtype::BF16 => data
+            .chunks_exact(2)
+            .map(|b| {
+                let bits = u16::from_le_bytes([b[0], b[1]]);
+                half::bf16::from_bits(bits).to_f32()
+            })
+            .collect(),
         _ => {
-            return Err(KoreError::StorageError(
-                format!("Unsupported safetensors dtype: {:?}", dtype),
-            ));
+            return Err(KoreError::StorageError(format!(
+                "Unsupported safetensors dtype: {:?}",
+                dtype
+            )));
         }
     };
 
@@ -137,14 +136,8 @@ mod tests {
         assert!(loaded.contains_key("bias"));
 
         // Verify shapes match
-        assert_eq!(
-            loaded["weight"].shape().dims(),
-            sd["weight"].shape().dims()
-        );
-        assert_eq!(
-            loaded["bias"].shape().dims(),
-            sd["bias"].shape().dims()
-        );
+        assert_eq!(loaded["weight"].shape().dims(), sd["weight"].shape().dims());
+        assert_eq!(loaded["bias"].shape().dims(), sd["bias"].shape().dims());
 
         // Verify data matches
         let orig = sd["weight"].as_f32_slice().unwrap();

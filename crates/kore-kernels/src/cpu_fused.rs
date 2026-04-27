@@ -94,7 +94,8 @@ pub fn fused_linear_gelu(
             }
 
             // Fused GELU
-            let inner = std::f32::consts::FRAC_2_SQRT_PI * std::f32::consts::FRAC_1_SQRT_2
+            let inner = std::f32::consts::FRAC_2_SQRT_PI
+                * std::f32::consts::FRAC_1_SQRT_2
                 * (acc + 0.044715 * acc * acc * acc);
             out[i * n + j] = 0.5 * acc * (1.0 + inner.tanh());
         }
@@ -156,11 +157,7 @@ pub fn fused_layer_norm(
 /// Fused RMS Normalization: x / rms(x) * gamma
 ///
 /// Used in LLaMA, Mistral, etc. Simpler than LayerNorm (no mean subtraction).
-pub fn fused_rms_norm(
-    input: &Tensor,
-    gamma: &Tensor,
-    eps: f32,
-) -> Result<Tensor, KoreError> {
+pub fn fused_rms_norm(input: &Tensor, gamma: &Tensor, eps: f32) -> Result<Tensor, KoreError> {
     if input.dtype() != DType::F32 {
         return Err(KoreError::UnsupportedDType(input.dtype()));
     }
@@ -315,9 +312,13 @@ mod tests {
         let batch = 2;
 
         // Random-ish input
-        let x_data: Vec<f32> = (0..batch * hidden).map(|i| (i as f32 * 0.3 - 1.0)).collect();
+        let x_data: Vec<f32> = (0..batch * hidden)
+            .map(|i| (i as f32 * 0.3 - 1.0))
+            .collect();
         let gamma_data: Vec<f32> = (0..hidden).map(|i| 1.0 + i as f32 * 0.1).collect();
-        let w_data: Vec<f32> = (0..out_dim * hidden).map(|i| (i as f32 * 0.1 - 0.5)).collect();
+        let w_data: Vec<f32> = (0..out_dim * hidden)
+            .map(|i| (i as f32 * 0.1 - 0.5))
+            .collect();
 
         let input = Tensor::from_f32(&x_data, &[batch, hidden]);
         let gamma = Tensor::from_f32(&gamma_data, &[hidden]);
@@ -357,8 +358,13 @@ mod tests {
         }
 
         for i in 0..expected.len() {
-            assert!((expected[i] - fused[i]).abs() < 1e-5,
-                "mismatch at {}: expected={}, fused={}", i, expected[i], fused[i]);
+            assert!(
+                (expected[i] - fused[i]).abs() < 1e-5,
+                "mismatch at {}: expected={}, fused={}",
+                i,
+                expected[i],
+                fused[i]
+            );
         }
     }
 
@@ -366,7 +372,7 @@ mod tests {
     /// Validates: C = dequant(A_packed) @ B matches explicit unpack + matmul.
     #[test]
     fn test_dequant_quat_matmul_cpu_reference() {
-        use kore_btes::encoder::{Quat, pack_quats};
+        use kore_btes::encoder::{pack_quats, Quat};
 
         let m = 4;
         let k = 8;
@@ -375,8 +381,14 @@ mod tests {
 
         // Create quaternary weight matrix and pack it
         let quat_weights: Vec<Quat> = vec![
-            Quat::Pos3, Quat::Neg1, Quat::Pos1, Quat::Neg3,
-            Quat::Pos1, Quat::Pos3, Quat::Neg1, Quat::Neg3,
+            Quat::Pos3,
+            Quat::Neg1,
+            Quat::Pos1,
+            Quat::Neg3,
+            Quat::Pos1,
+            Quat::Pos3,
+            Quat::Neg1,
+            Quat::Neg3,
         ];
         // Repeat for m rows
         let mut packed = Vec::new();
@@ -423,8 +435,13 @@ mod tests {
         }
 
         for i in 0..expected.len() {
-            assert!((expected[i] - fused[i]).abs() < 1e-5,
-                "mismatch at {}: expected={}, fused={}", i, expected[i], fused[i]);
+            assert!(
+                (expected[i] - fused[i]).abs() < 1e-5,
+                "mismatch at {}: expected={}, fused={}",
+                i,
+                expected[i],
+                fused[i]
+            );
         }
     }
 
@@ -458,7 +475,11 @@ mod tests {
         assert!(expected.iter().all(|v| v.is_finite()));
         // SiLU(0) = 0, so for z=0.0 the output should be 0
         // z_data[5] = 0.0, so expected[5] should be ~0
-        assert!(expected[5].abs() < 1e-5, "SiLU(0) gate should zero output, got {}", expected[5]);
+        assert!(
+            expected[5].abs() < 1e-5,
+            "SiLU(0) gate should zero output, got {}",
+            expected[5]
+        );
     }
 
     // ====================================================================
@@ -488,8 +509,12 @@ mod tests {
         let inv_rms = 1.0 / (sum_sq / hidden as f32 + eps).sqrt();
         fused = x[0] * inv_rms * gamma[0] * w[0];
 
-        assert!((expected - fused).abs() < 1e-5,
-            "single-element: expected={}, fused={}", expected, fused);
+        assert!(
+            (expected - fused).abs() < 1e-5,
+            "single-element: expected={}, fused={}",
+            expected,
+            fused
+        );
     }
 
     /// Fused RMSNorm+Proj edge case: with bias vector.
@@ -518,14 +543,17 @@ mod tests {
         }
 
         // Verify bias actually shifts the result
-        assert!((expected[0] - expected[1] - 15.0).abs() < 1e-4,
-            "bias shift: diff should be ~15.0, got {}", expected[0] - expected[1]);
+        assert!(
+            (expected[0] - expected[1] - 15.0).abs() < 1e-4,
+            "bias shift: diff should be ~15.0, got {}",
+            expected[0] - expected[1]
+        );
     }
 
     /// Dequant matmul edge case: K not divisible by 4 (partial packed byte).
     #[test]
     fn test_dequant_matmul_edge_partial_packing() {
-        use kore_btes::encoder::{Quat, pack_quats};
+        use kore_btes::encoder::{pack_quats, Quat};
 
         let m = 1;
         let k = 5; // Not divisible by 4
@@ -534,14 +562,22 @@ mod tests {
 
         // Pack 5 quat values: 4 in first byte, 1 in second (3 padding slots)
         let quat_weights = vec![
-            Quat::Pos1, Quat::Neg1, Quat::Pos3, Quat::Neg3, // byte 0
-            Quat::Pos1,                                       // byte 1, slots 1-3 unused
+            Quat::Pos1,
+            Quat::Neg1,
+            Quat::Pos3,
+            Quat::Neg3, // byte 0
+            Quat::Pos1, // byte 1, slots 1-3 unused
         ];
         let lut = [-3.0f32, -1.0, 1.0, 3.0];
 
         let mut packed = Vec::new();
         // First 4
-        let block0 = [quat_weights[0], quat_weights[1], quat_weights[2], quat_weights[3]];
+        let block0 = [
+            quat_weights[0],
+            quat_weights[1],
+            quat_weights[2],
+            quat_weights[3],
+        ];
         packed.push(pack_quats(&block0));
         // Last 1 (pad with Neg3 = 0b00 which maps to -3.0, but only slot 0 used)
         let block1 = [quat_weights[4], Quat::Neg3, Quat::Neg3, Quat::Neg3];
@@ -564,15 +600,19 @@ mod tests {
         }
         fused *= scale;
 
-        assert!((expected - fused).abs() < 1e-5,
-            "partial-pack: expected={}, fused={}", expected, fused);
+        assert!(
+            (expected - fused).abs() < 1e-5,
+            "partial-pack: expected={}, fused={}",
+            expected,
+            fused
+        );
     }
 
     /// Dequant matmul edge case: all-zero quaternary weights (Quat::Neg3 maps to -3, but
     /// we test Pos1 - Pos1 cancellation to verify accumulation correctness).
     #[test]
     fn test_dequant_matmul_edge_cancellation() {
-        use kore_btes::encoder::{Quat, pack_quats};
+        use kore_btes::encoder::{pack_quats, Quat};
 
         let m = 2;
         let k = 4;
@@ -603,10 +643,16 @@ mod tests {
             }
         }
 
-        assert!(result[0].abs() < 1e-5,
-            "cancellation: row0 should be 0, got {}", result[0]);
-        assert!((result[1] - 12.0).abs() < 1e-5,
-            "cancellation: row1 should be 12, got {}", result[1]);
+        assert!(
+            result[0].abs() < 1e-5,
+            "cancellation: row0 should be 0, got {}",
+            result[0]
+        );
+        assert!(
+            (result[1] - 12.0).abs() < 1e-5,
+            "cancellation: row1 should be 12, got {}",
+            result[1]
+        );
     }
 
     /// Fused RMSNorm + SiLU gate edge case: extreme values (large positive, large negative).
@@ -632,10 +678,21 @@ mod tests {
         }
 
         // All values must be finite even with extreme inputs
-        assert!(expected.iter().all(|v| v.is_finite()),
-            "extreme values: non-finite output detected: {:?}", expected);
+        assert!(
+            expected.iter().all(|v| v.is_finite()),
+            "extreme values: non-finite output detected: {:?}",
+            expected
+        );
         // SiLU(50) ≈ 50, SiLU(-50) ≈ 0, SiLU(0) = 0
-        assert!(expected[1].abs() < 1e-10, "SiLU(-50) should gate to ~0, got {}", expected[1]);
-        assert!(expected[2].abs() < 1e-10, "SiLU(0) should gate to 0, got {}", expected[2]);
+        assert!(
+            expected[1].abs() < 1e-10,
+            "SiLU(-50) should gate to ~0, got {}",
+            expected[1]
+        );
+        assert!(
+            expected[2].abs() < 1e-10,
+            "SiLU(0) should gate to 0, got {}",
+            expected[2]
+        );
     }
 }

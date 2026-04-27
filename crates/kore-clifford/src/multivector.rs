@@ -89,7 +89,11 @@ impl Multivector {
         let mut result = self.clone();
         for (i, coeff) in result.coeffs.iter_mut().enumerate() {
             let k = alg.grade(i);
-            let sign = if (k * (k.wrapping_sub(1)) / 2).is_multiple_of(2) { 1.0 } else { -1.0 };
+            let sign = if (k * (k.wrapping_sub(1)) / 2).is_multiple_of(2) {
+                1.0
+            } else {
+                -1.0
+            };
             *coeff *= sign;
         }
         result
@@ -121,7 +125,9 @@ impl Multivector {
 impl std::ops::Add for &Multivector {
     type Output = Multivector;
     fn add(self, rhs: &Multivector) -> Multivector {
-        let coeffs: Vec<f32> = self.coeffs.iter()
+        let coeffs: Vec<f32> = self
+            .coeffs
+            .iter()
             .zip(rhs.coeffs.iter())
             .map(|(&a, &b)| a + b)
             .collect();
@@ -132,7 +138,9 @@ impl std::ops::Add for &Multivector {
 impl std::ops::Sub for &Multivector {
     type Output = Multivector;
     fn sub(self, rhs: &Multivector) -> Multivector {
-        let coeffs: Vec<f32> = self.coeffs.iter()
+        let coeffs: Vec<f32> = self
+            .coeffs
+            .iter()
             .zip(rhs.coeffs.iter())
             .map(|(&a, &b)| a - b)
             .collect();
@@ -243,13 +251,13 @@ mod tests {
         // Grade 1: sign = +1 (k(k-1)/2 = 0)
         // Grade 2: sign = -1 (k(k-1)/2 = 1)
         let mut mv = Multivector::zero(&alg);
-        mv.coeffs[0] = 1.0;    // scalar
+        mv.coeffs[0] = 1.0; // scalar
         mv.coeffs[0b01] = 2.0; // e1
         mv.coeffs[0b11] = 3.0; // e12
 
         let rev = mv.reverse(&alg);
-        assert_eq!(rev.coeffs[0], 1.0);     // unchanged
-        assert_eq!(rev.coeffs[0b01], 2.0);  // unchanged
+        assert_eq!(rev.coeffs[0], 1.0); // unchanged
+        assert_eq!(rev.coeffs[0b01], 2.0); // unchanged
         assert_eq!(rev.coeffs[0b11], -3.0); // flipped
     }
 
@@ -257,9 +265,9 @@ mod tests {
     fn test_grade_project() {
         let alg = CliffordAlgebra::new(3, 0);
         let mut mv = Multivector::zero(&alg);
-        mv.coeffs[0] = 1.0;      // grade 0
-        mv.coeffs[0b001] = 2.0;  // grade 1
-        mv.coeffs[0b011] = 3.0;  // grade 2
+        mv.coeffs[0] = 1.0; // grade 0
+        mv.coeffs[0b001] = 2.0; // grade 1
+        mv.coeffs[0b011] = 3.0; // grade 2
 
         let g1 = mv.grade_project(&alg, 1);
         assert_eq!(g1.coeffs[0], 0.0);

@@ -24,9 +24,8 @@ pub fn get_device(device_idx: usize) -> Result<Arc<CudaDevice>, CudaError> {
     if let Some(dev) = map.get(&device_idx) {
         return Ok(Arc::clone(dev));
     }
-    let dev = CudaDevice::new(device_idx).map_err(|e| CudaError::DeviceInit(
-        format!("device {}: {}", device_idx, e),
-    ))?;
+    let dev = CudaDevice::new(device_idx)
+        .map_err(|e| CudaError::DeviceInit(format!("device {}: {}", device_idx, e)))?;
     map.insert(device_idx, Arc::clone(&dev));
     Ok(dev)
 }

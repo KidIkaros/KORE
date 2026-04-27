@@ -23,7 +23,11 @@ pub fn causal_mask(seq_len: usize) -> Tensor {
 pub fn sliding_window_mask(seq_len: usize, window_size: usize) -> Tensor {
     let mut data = vec![f32::NEG_INFINITY; seq_len * seq_len];
     for i in 0..seq_len {
-        let start = if i >= window_size { i - window_size + 1 } else { 0 };
+        let start = if i >= window_size {
+            i - window_size + 1
+        } else {
+            0
+        };
         for j in start..=i {
             data[i * seq_len + j] = 0.0;
         }
@@ -73,8 +77,8 @@ mod tests {
 
         // Row 5: can attend to positions 3,4,5 only
         assert!(data[5 * 6 + 2].is_infinite()); // pos 2: masked
-        assert_eq!(data[5 * 6 + 3], 0.0);       // pos 3: visible
-        assert_eq!(data[5 * 6 + 5], 0.0);       // pos 5: visible
+        assert_eq!(data[5 * 6 + 3], 0.0); // pos 3: visible
+        assert_eq!(data[5 * 6 + 5], 0.0); // pos 5: visible
     }
 
     #[test]

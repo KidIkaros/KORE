@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use kore_core::{Tensor, Result};
+use kore_core::{Result, Tensor};
 
 /// Base trait for all neural network modules.
 ///

@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use kore_core::{KoreError, Tensor, DType};
 use kore_core::autograd::{self, GradFn, GradNode};
+use kore_core::{DType, KoreError, Tensor};
 
 /// Cross-entropy loss: -sum(target * log_softmax(logits)) / batch_size.
 ///
@@ -20,10 +20,10 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Result<Tensor, K
     let target_dims = targets.shape().dims();
 
     if logit_dims.len() != 2 || target_dims.len() != 1 {
-        return Err(KoreError::StorageError(
-            format!("cross_entropy: expected logits [B, C] and targets [B], got {:?} and {:?}",
-                logit_dims, target_dims)
-        ));
+        return Err(KoreError::StorageError(format!(
+            "cross_entropy: expected logits [B, C] and targets [B], got {:?} and {:?}",
+            logit_dims, target_dims
+        )));
     }
 
     let batch = logit_dims[0];
@@ -37,19 +37,22 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Result<Tensor, K
     }
 
     let log_probs = logits.log_softmax(-1)?;
-    let lp_data = log_probs.as_f32_slice()
+    let lp_data = log_probs
+        .as_f32_slice()
         .ok_or_else(|| kore_core::KoreError::UnsupportedDType(log_probs.dtype()))?;
     let t_data = targets.contiguous();
-    let t_slice = t_data.as_f32_slice()
+    let t_slice = t_data
+        .as_f32_slice()
         .ok_or_else(|| kore_core::KoreError::UnsupportedDType(targets.dtype()))?;
 
     let mut total_loss = 0.0f32;
     for b in 0..batch {
         let class_idx = t_slice[b] as usize;
         if class_idx >= num_classes {
-            return Err(KoreError::StorageError(
-                format!("cross_entropy: target {} out of range for {} classes", class_idx, num_classes)
-            ));
+            return Err(KoreError::StorageError(format!(
+                "cross_entropy: target {} out of range for {} classes",
+                class_idx, num_classes
+            )));
         }
         total_loss -= lp_data[b * num_classes + class_idx];
     }
@@ -60,7 +63,9 @@ pub fn cross_entropy_loss(logits: &Tensor, targets: &Tensor) -> Result<Tensor, K
     let tracks = autograd::is_grad_enabled() && logits.tracks_grad();
     if tracks {
         let mut inputs = Vec::new();
-        if let Some(n) = logits.grad_node() { inputs.push(Arc::clone(n)); }
+        if let Some(n) = logits.grad_node() {
+            inputs.push(Arc::clone(n));
+        }
         let grad_fn = Box::new(FusedCrossEntropyBackward {
             logits: logits.clone(),
             targets: targets.clone(),
@@ -90,10 +95,12 @@ pub fn cross_entropy_loss_smoothed(
     let num_classes = logit_dims[1];
 
     let log_probs = logits.log_softmax(-1)?;
-    let lp_data = log_probs.as_f32_slice()
+    let lp_data = log_probs
+        .as_f32_slice()
         .ok_or_else(|| KoreError::UnsupportedDType(log_probs.dtype()))?;
     let t_data = targets.contiguous();
-    let t_slice = t_data.as_f32_slice()
+    let t_slice = t_data
+        .as_f32_slice()
         .ok_or_else(|| KoreError::UnsupportedDType(targets.dtype()))?;
 
     let confidence = 1.0 - smoothing;
@@ -138,17 +145,22 @@ pub fn nll_loss(log_probs: &Tensor, targets: &Tensor) -> Result<Tensor, KoreErro
     let num_classes = dims[1];
 
     let lp_data = log_probs.contiguous();
-    let lp_slice = lp_data.as_f32_slice().ok_or(KoreError::UnsupportedDType(log_probs.dtype()))?;
+    let lp_slice = lp_data
+        .as_f32_slice()
+        .ok_or(KoreError::UnsupportedDType(log_probs.dtype()))?;
     let t_data = targets.contiguous();
-    let t_slice = t_data.as_f32_slice().ok_or(KoreError::UnsupportedDType(targets.dtype()))?;
+    let t_slice = t_data
+        .as_f32_slice()
+        .ok_or(KoreError::UnsupportedDType(targets.dtype()))?;
 
     let mut total = 0.0f32;
     for b in 0..batch {
         let idx = t_slice[b] as usize;
         if idx >= num_classes {
-            return Err(KoreError::StorageError(
-                format!("nll_loss: target {} out of range", idx)
-            ));
+            return Err(KoreError::StorageError(format!(
+                "nll_loss: target {} out of range",
+                idx
+            )));
         }
         total -= lp_slice[b * num_classes + idx];
     }
@@ -171,12 +183,14 @@ impl GradFn for FusedCrossEntropyBackward {
         // grad_output is a scalar (the loss); the fused kernel already divides by batch.
         // Scale by grad_output if it's not 1.0.
         match kore_kernels::cpu_fused_backward::fused_cross_entropy_backward(
-            &self.logits, &self.targets,
+            &self.logits,
+            &self.targets,
         ) {
             Ok(d_logits) => {
                 let go_val = _grad_output.get_f32(0).unwrap_or(1.0);
                 if (go_val - 1.0).abs() > 1e-7 {
-                    let scaled = d_logits.mul_scalar(go_val)
+                    let scaled = d_logits
+                        .mul_scalar(go_val)
                         .expect("FusedCrossEntropyBackward scale failed");
                     vec![Some(scaled)]
                 } else {
@@ -190,7 +204,9 @@ impl GradFn for FusedCrossEntropyBackward {
         }
     }
 
-    fn name(&self) -> &str { "FusedCrossEntropyBackward" }
+    fn name(&self) -> &str {
+        "FusedCrossEntropyBackward"
+    }
 }
 
 /// Fused softmax backward: dx = y * (dy - sum(y * dy)).
@@ -200,9 +216,7 @@ pub struct FusedSoftmaxBackward {
 
 impl GradFn for FusedSoftmaxBackward {
     fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
-        match kore_kernels::cpu_fused_backward::fused_softmax_backward(
-            grad_output, &self.output,
-        ) {
+        match kore_kernels::cpu_fused_backward::fused_softmax_backward(grad_output, &self.output) {
             Ok(dx) => vec![Some(dx)],
             Err(e) => {
                 eprintln!("FusedSoftmaxBackward failed: {e}");
@@ -211,7 +225,9 @@ impl GradFn for FusedSoftmaxBackward {
         }
     }
 
-    fn name(&self) -> &str { "FusedSoftmaxBackward" }
+    fn name(&self) -> &str {
+        "FusedSoftmaxBackward"
+    }
 }
 
 #[cfg(test)]
@@ -221,26 +237,40 @@ mod tests {
     #[test]
     fn test_cross_entropy_basic() {
         // Perfect prediction for class 1 should give low loss
-        let logits = Tensor::from_f32(&[
-            -10.0, 10.0, -10.0,  // batch 0: class 1 is dominant
-            10.0, -10.0, -10.0,  // batch 1: class 0 is dominant
-        ], &[2, 3]);
+        let logits = Tensor::from_f32(
+            &[
+                -10.0, 10.0, -10.0, // batch 0: class 1 is dominant
+                10.0, -10.0, -10.0, // batch 1: class 0 is dominant
+            ],
+            &[2, 3],
+        );
         let targets = Tensor::from_f32(&[1.0, 0.0], &[2]);
         let loss = cross_entropy_loss(&logits, &targets).unwrap();
         let val = loss.get_f32(0).unwrap();
-        assert!(val < 0.01, "loss should be near 0 for correct predictions, got {}", val);
+        assert!(
+            val < 0.01,
+            "loss should be near 0 for correct predictions, got {}",
+            val
+        );
     }
 
     #[test]
     fn test_cross_entropy_wrong_prediction() {
         // Wrong predictions should give high loss
-        let logits = Tensor::from_f32(&[
-            10.0, -10.0, -10.0,  // predicts class 0
-        ], &[1, 3]);
+        let logits = Tensor::from_f32(
+            &[
+                10.0, -10.0, -10.0, // predicts class 0
+            ],
+            &[1, 3],
+        );
         let targets = Tensor::from_f32(&[2.0], &[1]); // actual class 2
         let loss = cross_entropy_loss(&logits, &targets).unwrap();
         let val = loss.get_f32(0).unwrap();
-        assert!(val > 5.0, "loss should be high for wrong prediction, got {}", val);
+        assert!(
+            val > 5.0,
+            "loss should be high for wrong prediction, got {}",
+            val
+        );
     }
 
     #[test]
@@ -248,8 +278,14 @@ mod tests {
         let logits = Tensor::from_f32(&[-10.0, 10.0, -10.0], &[1, 3]);
         let targets = Tensor::from_f32(&[1.0], &[1]);
 
-        let loss_no_smooth = cross_entropy_loss(&logits, &targets).unwrap().get_f32(0).unwrap();
-        let loss_smooth = cross_entropy_loss_smoothed(&logits, &targets, 0.1).unwrap().get_f32(0).unwrap();
+        let loss_no_smooth = cross_entropy_loss(&logits, &targets)
+            .unwrap()
+            .get_f32(0)
+            .unwrap();
+        let loss_smooth = cross_entropy_loss_smoothed(&logits, &targets, 0.1)
+            .unwrap()
+            .get_f32(0)
+            .unwrap();
 
         // Smoothed loss should be slightly higher than unsmoothed for correct predictions
         assert!(loss_smooth > loss_no_smooth);
@@ -283,10 +319,13 @@ mod tests {
 
     #[test]
     fn test_nll_loss() {
-        let log_probs = Tensor::from_f32(&[
-            -2.0, -0.1, -3.0,  // batch 0
-            -0.5, -1.0, -2.0,  // batch 1
-        ], &[2, 3]);
+        let log_probs = Tensor::from_f32(
+            &[
+                -2.0, -0.1, -3.0, // batch 0
+                -0.5, -1.0, -2.0, // batch 1
+            ],
+            &[2, 3],
+        );
         let targets = Tensor::from_f32(&[1.0, 0.0], &[2]);
         let loss = nll_loss(&log_probs, &targets).unwrap();
         // loss = -(-0.1 + -0.5) / 2 = 0.3

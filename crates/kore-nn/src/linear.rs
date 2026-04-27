@@ -41,7 +41,11 @@ impl Linear {
 
     /// Create a Linear layer from existing weight and optional bias tensors.
     pub fn from_weight(weight: Tensor, bias: Option<Tensor>) -> Self {
-        Self { weight, bias, training: false }
+        Self {
+            weight,
+            bias,
+            training: false,
+        }
     }
 
     /// Get the weight tensor.

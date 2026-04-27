@@ -50,10 +50,7 @@ mod tests {
         // c = a + b
         let a = GradNode::leaf();
         let b = GradNode::leaf();
-        let c = GradNode::with_grad_fn(
-            Box::new(AddBackward),
-            vec![Arc::clone(&a), Arc::clone(&b)],
-        );
+        let c = GradNode::with_grad_fn(Box::new(AddBackward), vec![Arc::clone(&a), Arc::clone(&b)]);
 
         // dc/dc = 1
         backward(&c, Tensor::scalar(1.0));
@@ -95,10 +92,7 @@ mod tests {
         let b = GradNode::leaf();
 
         // c = a + b
-        let c = GradNode::with_grad_fn(
-            Box::new(AddBackward),
-            vec![Arc::clone(&a), Arc::clone(&b)],
-        );
+        let c = GradNode::with_grad_fn(Box::new(AddBackward), vec![Arc::clone(&a), Arc::clone(&b)]);
 
         // d = c * b (c=5, b=3)
         let d = GradNode::with_grad_fn(

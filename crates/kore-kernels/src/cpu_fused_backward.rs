@@ -68,10 +68,7 @@ pub fn fused_rms_norm_backward(
         }
     }
 
-    Ok((
-        Tensor::from_f32(&dx, dims),
-        Tensor::from_f32(&dgamma, &[d]),
-    ))
+    Ok((Tensor::from_f32(&dx, dims), Tensor::from_f32(&dgamma, &[d])))
 }
 
 /// Fused softmax backward.
@@ -83,10 +80,7 @@ pub fn fused_rms_norm_backward(
 /// `output`: [batch, d] — softmax output (from forward pass)
 ///
 /// Returns `grad_input`.
-pub fn fused_softmax_backward(
-    grad_output: &Tensor,
-    output: &Tensor,
-) -> Result<Tensor, KoreError> {
+pub fn fused_softmax_backward(grad_output: &Tensor, output: &Tensor) -> Result<Tensor, KoreError> {
     if output.dtype() != DType::F32 {
         return Err(KoreError::UnsupportedDType(output.dtype()));
     }

@@ -28,7 +28,10 @@ pub struct TokenBatcher {
 impl TokenBatcher {
     /// Create a new TokenBatcher.
     pub fn new(padding: PaddingStrategy, pad_token_id: usize) -> Self {
-        Self { padding, pad_token_id }
+        Self {
+            padding,
+            pad_token_id,
+        }
     }
 
     /// Batch a set of token sequences into a padded Tensor.
@@ -84,7 +87,11 @@ impl TokenBatcher {
         let (input_ids, attention_mask) = self.batch(sequences);
         let dims = input_ids.shape().dims();
         if dims[0] == 0 || dims[1] == 0 {
-            return (input_ids, attention_mask, Tensor::zeros(&[0, 0], DType::F32));
+            return (
+                input_ids,
+                attention_mask,
+                Tensor::zeros(&[0, 0], DType::F32),
+            );
         }
 
         let batch_size = dims[0];
@@ -115,10 +122,7 @@ mod tests {
     #[test]
     fn test_batch_longest() {
         let batcher = TokenBatcher::new(PaddingStrategy::LongestInBatch, 0);
-        let sequences = vec![
-            vec![1, 2, 3],
-            vec![4, 5],
-        ];
+        let sequences = vec![vec![1, 2, 3], vec![4, 5]];
 
         let (ids, mask) = batcher.batch(&sequences);
         assert_eq!(ids.shape().dims(), &[2, 3]);
@@ -146,10 +150,7 @@ mod tests {
     #[test]
     fn test_batch_no_padding() {
         let batcher = TokenBatcher::new(PaddingStrategy::NoPadding, 0);
-        let sequences = vec![
-            vec![1, 2, 3],
-            vec![4, 5, 6],
-        ];
+        let sequences = vec![vec![1, 2, 3], vec![4, 5, 6]];
 
         let (ids, _mask) = batcher.batch(&sequences);
         assert_eq!(ids.shape().dims(), &[2, 3]);
@@ -158,9 +159,7 @@ mod tests {
     #[test]
     fn test_batch_with_labels() {
         let batcher = TokenBatcher::new(PaddingStrategy::LongestInBatch, 0);
-        let sequences = vec![
-            vec![10, 20, 30, 40],
-        ];
+        let sequences = vec![vec![10, 20, 30, 40]];
 
         let (ids, _mask, labels) = batcher.batch_with_labels(&sequences);
         assert_eq!(ids.shape().dims(), &[1, 4]);
@@ -177,10 +176,7 @@ mod tests {
     #[test]
     fn test_batch_with_labels_padding() {
         let batcher = TokenBatcher::new(PaddingStrategy::LongestInBatch, 0);
-        let sequences = vec![
-            vec![10, 20, 30],
-            vec![40, 50],
-        ];
+        let sequences = vec![vec![10, 20, 30], vec![40, 50]];
 
         let (_ids, _mask, labels) = batcher.batch_with_labels(&sequences);
         let label_data = labels.as_f32_slice().unwrap();

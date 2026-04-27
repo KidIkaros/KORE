@@ -16,9 +16,7 @@ pub fn wasm_matmul_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, 
             let mut acc = f32x4_splat(0.0);
             for p in 0..k {
                 let a_val = f32x4_splat(a[i * k + p]);
-                let b_vec = unsafe {
-                    v128_load(b.as_ptr().add(p * n + j) as *const v128)
-                };
+                let b_vec = unsafe { v128_load(b.as_ptr().add(p * n + j) as *const v128) };
                 acc = f32x4_add(acc, f32x4_mul(a_val, b_vec));
             }
             unsafe {
@@ -45,8 +43,13 @@ pub fn wasm_matmul_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, 
 /// columns at a time using f32x4 SIMD.
 #[cfg(target_arch = "wasm32")]
 pub fn wasm_matmul_ternary(
-    a_packed: &[u8], a_scales: &[f32], b: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
+    a_packed: &[u8],
+    a_scales: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) {
     use core::arch::wasm32::*;
 
@@ -70,7 +73,9 @@ pub fn wasm_matmul_ternary(
         // A-stationary: iterate K, scatter into N outputs using SIMD
         for ki in 0..k {
             let t = trits[ki];
-            if t == 0 { continue; }
+            if t == 0 {
+                continue;
+            }
             let t_f32 = t as f32;
             let t_vec = f32x4_splat(t_f32);
             let b_off = ki * n;
@@ -81,7 +86,9 @@ pub fn wasm_matmul_ternary(
                 let b_vec = unsafe { v128_load(b.as_ptr().add(b_off + col) as *const v128) };
                 let c_vec = unsafe { v128_load(c_row.as_ptr().add(col) as *const v128) };
                 let result = f32x4_add(c_vec, f32x4_mul(t_vec, b_vec));
-                unsafe { v128_store(c_row.as_mut_ptr().add(col) as *mut v128, result); }
+                unsafe {
+                    v128_store(c_row.as_mut_ptr().add(col) as *mut v128, result);
+                }
                 col += 4;
             }
             // Scalar tail
@@ -97,7 +104,9 @@ pub fn wasm_matmul_ternary(
         while col + 4 <= n {
             let c_vec = unsafe { v128_load(c_row.as_ptr().add(col) as *const v128) };
             let result = f32x4_mul(c_vec, scale_vec);
-            unsafe { v128_store(c_row.as_mut_ptr().add(col) as *mut v128, result); }
+            unsafe {
+                v128_store(c_row.as_mut_ptr().add(col) as *mut v128, result);
+            }
             col += 4;
         }
         while col < n {
@@ -114,8 +123,13 @@ pub fn wasm_matmul_ternary(
 /// 4 output columns at a time using f32x4 SIMD.
 #[cfg(target_arch = "wasm32")]
 pub fn wasm_matmul_quaternary(
-    a_packed: &[u8], a_scales: &[f32], b: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
+    a_packed: &[u8],
+    a_scales: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) {
     use core::arch::wasm32::*;
 
@@ -149,7 +163,9 @@ pub fn wasm_matmul_quaternary(
                 let b_vec = unsafe { v128_load(b.as_ptr().add(b_off + col) as *const v128) };
                 let c_vec = unsafe { v128_load(c_row.as_ptr().add(col) as *const v128) };
                 let result = f32x4_add(c_vec, f32x4_mul(w_vec, b_vec));
-                unsafe { v128_store(c_row.as_mut_ptr().add(col) as *mut v128, result); }
+                unsafe {
+                    v128_store(c_row.as_mut_ptr().add(col) as *mut v128, result);
+                }
                 col += 4;
             }
             // Scalar tail
@@ -165,7 +181,9 @@ pub fn wasm_matmul_quaternary(
         while col + 4 <= n {
             let c_vec = unsafe { v128_load(c_row.as_ptr().add(col) as *const v128) };
             let result = f32x4_mul(c_vec, scale_vec);
-            unsafe { v128_store(c_row.as_mut_ptr().add(col) as *mut v128, result); }
+            unsafe {
+                v128_store(c_row.as_mut_ptr().add(col) as *mut v128, result);
+            }
             col += 4;
         }
         while col < n {
@@ -181,10 +199,26 @@ pub fn wasm_matmul_f32(_a: &[f32], _b: &[f32], _c: &mut [f32], _m: usize, _n: us
     unreachable!("WASM SIMD not available on this architecture");
 }
 #[cfg(not(target_arch = "wasm32"))]
-pub fn wasm_matmul_ternary(_a: &[u8], _s: &[f32], _b: &[f32], _c: &mut [f32], _m: usize, _n: usize, _k: usize) {
+pub fn wasm_matmul_ternary(
+    _a: &[u8],
+    _s: &[f32],
+    _b: &[f32],
+    _c: &mut [f32],
+    _m: usize,
+    _n: usize,
+    _k: usize,
+) {
     unreachable!("WASM SIMD not available on this architecture");
 }
 #[cfg(not(target_arch = "wasm32"))]
-pub fn wasm_matmul_quaternary(_a: &[u8], _s: &[f32], _b: &[f32], _c: &mut [f32], _m: usize, _n: usize, _k: usize) {
+pub fn wasm_matmul_quaternary(
+    _a: &[u8],
+    _s: &[f32],
+    _b: &[f32],
+    _c: &mut [f32],
+    _m: usize,
+    _n: usize,
+    _k: usize,
+) {
     unreachable!("WASM SIMD not available on this architecture");
 }

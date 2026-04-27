@@ -45,7 +45,13 @@ pub struct Rng {
 
 impl Rng {
     pub fn new(seed: u64) -> Self {
-        Self { state: if seed == 0 { 0xDEAD_BEEF_CAFE_1234 } else { seed } }
+        Self {
+            state: if seed == 0 {
+                0xDEAD_BEEF_CAFE_1234
+            } else {
+                seed
+            },
+        }
     }
 
     /// Returns a random u64.
@@ -232,7 +238,10 @@ mod tests {
     #[test]
     fn test_temperature_zero_is_greedy() {
         let logits = vec![1.0, 5.0, 3.0];
-        let config = SamplerConfig { temperature: 0.0, ..Default::default() };
+        let config = SamplerConfig {
+            temperature: 0.0,
+            ..Default::default()
+        };
         let mut rng = Rng::new(42);
         for _ in 0..10 {
             assert_eq!(sample(&logits, &[], &config, &mut rng), 1);

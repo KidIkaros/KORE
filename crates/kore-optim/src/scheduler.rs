@@ -235,7 +235,11 @@ mod tests {
 
         // End of warmup: lr_max
         let warmup_end = sched.get_lr(100);
-        assert!((warmup_end - 0.01).abs() < 1e-4, "warmup_end={}", warmup_end);
+        assert!(
+            (warmup_end - 0.01).abs() < 1e-4,
+            "warmup_end={}",
+            warmup_end
+        );
 
         // After warmup, should decrease
         let after = sched.get_lr(500);

@@ -2,8 +2,8 @@
 
 use rand::Rng;
 
-use kore_core::{DType, Tensor};
 use crate::module::Module;
+use kore_core::{DType, Tensor};
 
 /// 1D convolution layer: y = conv1d(x, weight) + bias
 ///
@@ -11,8 +11,8 @@ use crate::module::Module;
 /// Output shape: [batch, out_channels, out_length]
 /// where out_length = (length - kernel_size + 2*padding) / stride + 1
 pub struct Conv1d {
-    weight: Tensor,  // [out_channels, in_channels, kernel_size]
-    bias: Option<Tensor>,  // [out_channels]
+    weight: Tensor,       // [out_channels, in_channels, kernel_size]
+    bias: Option<Tensor>, // [out_channels]
     in_channels: usize,
     out_channels: usize,
     kernel_size: usize,
@@ -36,9 +36,7 @@ impl Conv1d {
         let limit = (6.0 / fan_in as f32).sqrt();
         let total = out_channels * in_channels * kernel_size;
         let mut rng = rand::thread_rng();
-        let weight_data: Vec<f32> = (0..total)
-            .map(|_| rng.gen_range(-limit..limit))
-            .collect();
+        let weight_data: Vec<f32> = (0..total).map(|_| rng.gen_range(-limit..limit)).collect();
 
         let mut weight = Tensor::from_f32(&weight_data, &[out_channels, in_channels, kernel_size]);
         weight.set_requires_grad(true);
@@ -91,10 +89,12 @@ impl Module for Conv1d {
         let _in_ch = dims[1];
         let in_len = dims[2];
         let out_len = self.output_length(in_len)?;
-        let x = data.as_f32_slice()
+        let x = data
+            .as_f32_slice()
             .ok_or_else(|| kore_core::KoreError::UnsupportedDType(data.dtype()))?;
         let w = self.weight.contiguous();
-        let w_data = w.as_f32_slice()
+        let w_data = w
+            .as_f32_slice()
             .ok_or_else(|| kore_core::KoreError::UnsupportedDType(self.weight.dtype()))?;
 
         let mut output = vec![0.0f32; batch * self.out_channels * out_len];
@@ -126,7 +126,8 @@ impl Module for Conv1d {
                     }
 
                     if let Some(ref bias) = self.bias {
-                        let b_data = bias.as_f32_slice()
+                        let b_data = bias
+                            .as_f32_slice()
                             .ok_or_else(|| kore_core::KoreError::UnsupportedDType(bias.dtype()))?;
                         acc += b_data[oc];
                     }
@@ -136,7 +137,10 @@ impl Module for Conv1d {
             }
         }
 
-        Ok(Tensor::from_f32(&output, &[batch, self.out_channels, out_len]))
+        Ok(Tensor::from_f32(
+            &output,
+            &[batch, self.out_channels, out_len],
+        ))
     }
 
     fn parameters(&self) -> Vec<&Tensor> {
@@ -169,7 +173,7 @@ impl Module for Conv1d {
 /// Input shape: [batch, in_channels, height, width]
 /// Output shape: [batch, out_channels, out_h, out_w]
 pub struct Conv2d {
-    weight: Tensor,  // [out_channels, in_channels, kh, kw]
+    weight: Tensor, // [out_channels, in_channels, kh, kw]
     bias: Option<Tensor>,
     in_channels: usize,
     out_channels: usize,
@@ -190,7 +194,15 @@ impl Conv2d {
         padding: usize,
         bias: bool,
     ) -> Self {
-        Self::new_rect(in_channels, out_channels, kernel_size, kernel_size, stride, padding, bias)
+        Self::new_rect(
+            in_channels,
+            out_channels,
+            kernel_size,
+            kernel_size,
+            stride,
+            padding,
+            bias,
+        )
     }
 
     /// Create with rectangular kernel.
@@ -207,11 +219,12 @@ impl Conv2d {
         let limit = (6.0 / fan_in as f32).sqrt();
         let total = out_channels * in_channels * kernel_h * kernel_w;
         let mut rng = rand::thread_rng();
-        let weight_data: Vec<f32> = (0..total)
-            .map(|_| rng.gen_range(-limit..limit))
-            .collect();
+        let weight_data: Vec<f32> = (0..total).map(|_| rng.gen_range(-limit..limit)).collect();
 
-        let mut weight = Tensor::from_f32(&weight_data, &[out_channels, in_channels, kernel_h, kernel_w]);
+        let mut weight = Tensor::from_f32(
+            &weight_data,
+            &[out_channels, in_channels, kernel_h, kernel_w],
+        );
         weight.set_requires_grad(true);
 
         let bias_tensor = if bias {
@@ -239,7 +252,12 @@ impl Conv2d {
     ///
     /// Weight shape: [out_channels, in_channels, kernel_h, kernel_w]
     /// Bias shape: [out_channels]
-    pub fn from_weight(weight: Tensor, bias: Option<Tensor>, stride: usize, padding: usize) -> Self {
+    pub fn from_weight(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        stride: usize,
+        padding: usize,
+    ) -> Self {
         let dims = weight.shape().dims();
         assert_eq!(dims.len(), 4, "Conv2d weight must be 4D");
         Self {
@@ -256,19 +274,29 @@ impl Conv2d {
     }
 
     /// Input channels.
-    pub fn in_channels(&self) -> usize { self.in_channels }
+    pub fn in_channels(&self) -> usize {
+        self.in_channels
+    }
 
     /// Output channels.
-    pub fn out_channels(&self) -> usize { self.out_channels }
+    pub fn out_channels(&self) -> usize {
+        self.out_channels
+    }
 
     /// Kernel size (square kernels return kernel_h).
-    pub fn kernel_size(&self) -> usize { self.kernel_h }
+    pub fn kernel_size(&self) -> usize {
+        self.kernel_h
+    }
 
     /// Stride.
-    pub fn stride(&self) -> usize { self.stride }
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
 
     /// Padding.
-    pub fn padding(&self) -> usize { self.padding }
+    pub fn padding(&self) -> usize {
+        self.padding
+    }
 
     /// Compute output dimensions.
     pub fn output_size(&self, in_h: usize, in_w: usize) -> kore_core::Result<(usize, usize)> {
@@ -301,10 +329,12 @@ impl Module for Conv2d {
         let in_h = dims[2];
         let in_w = dims[3];
         let (out_h, out_w) = self.output_size(in_h, in_w)?;
-        let x = data.as_f32_slice()
+        let x = data
+            .as_f32_slice()
             .ok_or_else(|| kore_core::KoreError::UnsupportedDType(data.dtype()))?;
         let w = self.weight.contiguous();
-        let w_data = w.as_f32_slice()
+        let w_data = w
+            .as_f32_slice()
             .ok_or_else(|| kore_core::KoreError::UnsupportedDType(self.weight.dtype()))?;
 
         let mut output = vec![0.0f32; batch * self.out_channels * out_h * out_w];
@@ -321,26 +351,38 @@ impl Module for Conv2d {
                                     let ih = oh * self.stride + kh;
                                     let iw = ow * self.stride + kw;
 
-                                    let ih = if ih >= self.padding { ih - self.padding } else { continue };
-                                    let iw = if iw >= self.padding { iw - self.padding } else { continue };
-                                    if ih >= in_h || iw >= in_w { continue; }
+                                    let ih = if ih >= self.padding {
+                                        ih - self.padding
+                                    } else {
+                                        continue;
+                                    };
+                                    let iw = if iw >= self.padding {
+                                        iw - self.padding
+                                    } else {
+                                        continue;
+                                    };
+                                    if ih >= in_h || iw >= in_w {
+                                        continue;
+                                    }
 
                                     let x_idx = b * self.in_channels * in_h * in_w
                                         + ic * in_h * in_w
                                         + ih * in_w
                                         + iw;
-                                    let w_idx = oc * self.in_channels * self.kernel_h * self.kernel_w
-                                        + ic * self.kernel_h * self.kernel_w
-                                        + kh * self.kernel_w
-                                        + kw;
+                                    let w_idx =
+                                        oc * self.in_channels * self.kernel_h * self.kernel_w
+                                            + ic * self.kernel_h * self.kernel_w
+                                            + kh * self.kernel_w
+                                            + kw;
                                     acc += x[x_idx] * w_data[w_idx];
                                 }
                             }
                         }
 
                         if let Some(ref bias) = self.bias {
-                            let b_data = bias.as_f32_slice()
-                                .ok_or_else(|| kore_core::KoreError::UnsupportedDType(bias.dtype()))?;
+                            let b_data = bias.as_f32_slice().ok_or_else(|| {
+                                kore_core::KoreError::UnsupportedDType(bias.dtype())
+                            })?;
                             acc += b_data[oc];
                         }
 
@@ -354,7 +396,10 @@ impl Module for Conv2d {
             }
         }
 
-        Ok(Tensor::from_f32(&output, &[batch, self.out_channels, out_h, out_w]))
+        Ok(Tensor::from_f32(
+            &output,
+            &[batch, self.out_channels, out_h, out_w],
+        ))
     }
 
     fn parameters(&self) -> Vec<&Tensor> {

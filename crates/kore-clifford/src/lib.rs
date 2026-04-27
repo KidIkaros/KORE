@@ -11,8 +11,8 @@
 
 pub mod algebra;
 pub mod multivector;
-pub mod products;
 pub mod ops;
+pub mod products;
 pub mod tensor_bridge;
 
 pub use algebra::CliffordAlgebra;

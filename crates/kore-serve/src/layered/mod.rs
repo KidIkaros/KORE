@@ -22,13 +22,13 @@
 //! - [`shard_model`](sharder::shard_model) — split safetensors into per-layer shards
 //! - [`LayeredEngine`] — orchestrates layer-by-layer forward passes
 
-pub mod config;
 pub mod cache;
+pub mod config;
+pub mod engine;
 pub mod prefetcher;
 pub mod sharder;
-pub mod engine;
 
-pub use config::LayeredConfig;
 pub use cache::LayerCache;
+pub use config::LayeredConfig;
+pub use engine::{KvCache, LayeredEngine};
 pub use prefetcher::LayerPrefetcher;
-pub use engine::{LayeredEngine, KvCache};

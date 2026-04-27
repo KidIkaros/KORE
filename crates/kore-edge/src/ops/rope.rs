@@ -56,7 +56,10 @@ mod tests {
         let original = data.clone();
         apply_rope(&mut data, 1, 1, 4, 5, 10000.0);
         // At position 5, values should change
-        let changed = data.iter().zip(original.iter()).any(|(a, b)| (a - b).abs() > 1e-5);
+        let changed = data
+            .iter()
+            .zip(original.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-5);
         assert!(changed, "RoPE should modify values at non-zero position");
     }
 

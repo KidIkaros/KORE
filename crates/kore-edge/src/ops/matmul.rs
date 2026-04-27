@@ -18,7 +18,15 @@ pub fn matmul_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: us
 }
 
 /// f32 matmul with bias: C[M,N] = A[M,K] @ B[K,N] + bias[N]
-pub fn matmul_f32_bias(a: &[f32], b: &[f32], bias: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+pub fn matmul_f32_bias(
+    a: &[f32],
+    b: &[f32],
+    bias: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
     for i in 0..m {
         for j in 0..n {
             let mut acc = bias[j];
@@ -67,7 +75,9 @@ pub fn matmul_ternary(
         // A-stationary: iterate K, scatter into N outputs
         for ki in 0..k {
             let t = trits[ki];
-            if t == 0 { continue; }
+            if t == 0 {
+                continue;
+            }
             let t_f32 = t as f32;
             let b_row = &b[ki * n..ki * n + n];
             for (c_val, &b_val) in c_row.iter_mut().zip(b_row.iter()) {
@@ -167,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_matmul_ternary_identity() {
-        use kore_btes::encoder::{Trit, encode_trits};
+        use kore_btes::encoder::{encode_trits, Trit};
         // A = [[+1, 0], [0, +1]] (ternary identity), B = [[2, 0], [0, 3]]
         // C = A @ B = [[2, 0], [0, 3]]
         let row0 = encode_trits(&[Trit::Pos, Trit::Zero, Trit::Zero, Trit::Zero, Trit::Zero]);
@@ -185,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_matmul_ternary_with_scale() {
-        use kore_btes::encoder::{Trit, encode_trits};
+        use kore_btes::encoder::{encode_trits, Trit};
         // A = [[+1, -1]] with scale=2.0, B = [[3], [1]] → C = (1*3 + (-1)*1) * 2 = 4
         let row0 = encode_trits(&[Trit::Pos, Trit::Neg, Trit::Zero, Trit::Zero, Trit::Zero]);
         let packed = [row0];

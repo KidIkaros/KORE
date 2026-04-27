@@ -1,7 +1,7 @@
 //! Embedding layer — lookup table for token IDs to dense vectors.
 
-use kore_core::Tensor;
 use crate::module::Module;
+use kore_core::Tensor;
 
 /// Embedding lookup table: maps integer token IDs to dense vectors.
 pub struct Embedding {
@@ -54,7 +54,8 @@ impl Embedding {
     /// Returns tensor of shape [ids.len(), embedding_dim].
     pub fn lookup(&self, ids: &[usize]) -> Tensor {
         let w = self.weight.contiguous();
-        let w_data = w.as_f32_slice()
+        let w_data = w
+            .as_f32_slice()
             .expect("Embedding: weight tensor must be F32");
         let dim = self.embedding_dim;
 
@@ -90,9 +91,9 @@ impl Module for Embedding {
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         // Input is expected to be a 1D tensor of token IDs (as f32, cast to usize)
         let data = input.contiguous();
-        let slice = data.as_f32_slice().ok_or_else(|| {
-            kore_core::KoreError::UnsupportedDType(input.dtype())
-        })?;
+        let slice = data
+            .as_f32_slice()
+            .ok_or_else(|| kore_core::KoreError::UnsupportedDType(input.dtype()))?;
         let ids: Vec<usize> = slice.iter().map(|&v| v as usize).collect();
         Ok(self.lookup(&ids))
     }

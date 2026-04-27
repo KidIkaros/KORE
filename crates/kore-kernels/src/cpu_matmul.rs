@@ -95,7 +95,14 @@ fn tiled_matmul_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k:
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn tiled_matmul_avx2_inner(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+unsafe fn tiled_matmul_avx2_inner(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
     use std::arch::x86_64::*;
 
     for i0 in (0..m).step_by(TILE_M) {
@@ -183,7 +190,9 @@ mod tests {
             assert!(
                 (f - r).abs() < 1e-3,
                 "Mismatch at index {}: fast={}, ref={}",
-                i, f, r
+                i,
+                f,
+                r
             );
         }
     }

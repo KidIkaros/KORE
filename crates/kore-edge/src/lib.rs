@@ -12,13 +12,13 @@
 //! - Portable operator library with SIMD backends (NEON + WASM SIMD128)
 //! - C FFI for Swift/Kotlin + wasm-bindgen JS/TS API
 
-pub mod format;
 pub mod arena;
+pub mod format;
+pub mod loader;
 pub mod ops;
 pub mod plan;
 pub mod runtime;
 pub mod simd_dispatch;
-pub mod loader;
 
 #[cfg(target_arch = "aarch64")]
 pub mod neon;
@@ -31,7 +31,7 @@ pub mod wasm_api;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
-pub use format::{KorefModel, KorefHeader, TensorEntry};
 pub use arena::Arena;
-pub use runtime::Session;
+pub use format::{KorefHeader, KorefModel, TensorEntry};
 pub use plan::ExecutionPlan;
+pub use runtime::Session;

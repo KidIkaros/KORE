@@ -19,11 +19,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use kore_core::{KoreError, Tensor};
-use crate::conv::Conv2d;
-use crate::pool::{MaxPool2d, AdaptiveAvgPool2d};
 use crate::activations::relu;
+use crate::conv::Conv2d;
 use crate::module::Module;
+use crate::pool::{AdaptiveAvgPool2d, MaxPool2d};
+use kore_core::{KoreError, Tensor};
 
 /// Fire module: the core building block of SqueezeNet.
 ///
@@ -81,9 +81,9 @@ impl Fire {
     /// - `{prefix}.expand3x3.weight`, `{prefix}.expand3x3.bias`
     pub fn from_state_dict(sd: &HashMap<String, Tensor>, prefix: &str) -> Result<Self, KoreError> {
         let get = |key: &str| -> Result<Tensor, KoreError> {
-            sd.get(key).cloned().ok_or_else(|| {
-                KoreError::StorageError(format!("missing key: {}", key))
-            })
+            sd.get(key)
+                .cloned()
+                .ok_or_else(|| KoreError::StorageError(format!("missing key: {}", key)))
         };
         let get_opt = |key: &str| -> Option<Tensor> { sd.get(key).cloned() };
 
@@ -205,19 +205,19 @@ impl SqueezeNet {
     }
 
     /// Load SqueezeNet v1.1 from a pre-loaded state dict (torchvision key format).
-    pub fn from_state_dict(sd: &HashMap<String, Tensor>, num_classes: usize) -> Result<Self, KoreError> {
+    pub fn from_state_dict(
+        sd: &HashMap<String, Tensor>,
+        num_classes: usize,
+    ) -> Result<Self, KoreError> {
         let get = |key: &str| -> Result<Tensor, KoreError> {
-            sd.get(key).cloned().ok_or_else(|| {
-                KoreError::StorageError(format!("missing key: {}", key))
-            })
+            sd.get(key)
+                .cloned()
+                .ok_or_else(|| KoreError::StorageError(format!("missing key: {}", key)))
         };
         let get_opt = |key: &str| -> Option<Tensor> { sd.get(key).cloned() };
 
-        let conv1 = Conv2d::from_weight(
-            get("features.0.weight")?,
-            get_opt("features.0.bias"),
-            2, 0,
-        );
+        let conv1 =
+            Conv2d::from_weight(get("features.0.weight")?, get_opt("features.0.bias"), 2, 0);
 
         // Fire modules: torchvision feature indices
         let fire2 = Fire::from_state_dict(sd, "features.3")?;
@@ -232,7 +232,8 @@ impl SqueezeNet {
         let classifier_conv = Conv2d::from_weight(
             get("classifier.1.weight")?,
             get_opt("classifier.1.bias"),
-            1, 0,
+            1,
+            0,
         );
 
         Ok(Self {
@@ -262,9 +263,7 @@ impl SqueezeNet {
 
     /// Count total trainable parameters.
     pub fn num_parameters(&self) -> usize {
-        self.parameters().iter()
-            .map(|t| t.numel())
-            .sum()
+        self.parameters().iter().map(|t| t.numel()).sum()
     }
 
     /// Model info string.
@@ -330,7 +329,8 @@ impl Module for SqueezeNet {
 
     fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
         // Simplified: return all parameters with generic names
-        self.parameters().into_iter()
+        self.parameters()
+            .into_iter()
             .enumerate()
             .map(|(i, t)| {
                 // Leak a string for the name — acceptable for debugging
@@ -460,16 +460,28 @@ mod tests {
             ("features.12", 512, 64, 256, 256),
         ];
         for (prefix, in_ch, sq, e1, e3) in &fires {
-            sd.insert(format!("{}.squeeze.weight", prefix), rand_tensor(&[*sq, *in_ch, 1, 1]));
+            sd.insert(
+                format!("{}.squeeze.weight", prefix),
+                rand_tensor(&[*sq, *in_ch, 1, 1]),
+            );
             sd.insert(format!("{}.squeeze.bias", prefix), rand_tensor(&[*sq]));
-            sd.insert(format!("{}.expand1x1.weight", prefix), rand_tensor(&[*e1, *sq, 1, 1]));
+            sd.insert(
+                format!("{}.expand1x1.weight", prefix),
+                rand_tensor(&[*e1, *sq, 1, 1]),
+            );
             sd.insert(format!("{}.expand1x1.bias", prefix), rand_tensor(&[*e1]));
-            sd.insert(format!("{}.expand3x3.weight", prefix), rand_tensor(&[*e3, *sq, 3, 3]));
+            sd.insert(
+                format!("{}.expand3x3.weight", prefix),
+                rand_tensor(&[*e3, *sq, 3, 3]),
+            );
             sd.insert(format!("{}.expand3x3.bias", prefix), rand_tensor(&[*e3]));
         }
 
         // classifier: 512→1000, k=1
-        sd.insert("classifier.1.weight".into(), rand_tensor(&[1000, 512, 1, 1]));
+        sd.insert(
+            "classifier.1.weight".into(),
+            rand_tensor(&[1000, 512, 1, 1]),
+        );
         sd.insert("classifier.1.bias".into(), rand_tensor(&[1000]));
 
         sd

@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
-use super::context::{set_device, device_synchronize, RocmError};
+use super::context::{device_synchronize, set_device, RocmError};
 use super::ffi::{self, check_hip, check_hiprtc, HipFunction, HipModule};
 
 /// Wrapper around `HipModule` (`*mut c_void`) to make it Send+Sync.
@@ -58,16 +58,14 @@ pub fn ensure_module(
 
     // Prepend HIP shim to source
     let full_source = format!("{}\n{}", HIP_SHIM, kernel_source);
-    let c_source = CString::new(full_source)
-        .map_err(|_| RocmError::CompileError {
-            module: module_name.to_string(),
-            log: "source contains null byte".to_string(),
-        })?;
-    let c_name = CString::new(module_name)
-        .map_err(|_| RocmError::CompileError {
-            module: module_name.to_string(),
-            log: "module name contains null byte".to_string(),
-        })?;
+    let c_source = CString::new(full_source).map_err(|_| RocmError::CompileError {
+        module: module_name.to_string(),
+        log: "source contains null byte".to_string(),
+    })?;
+    let c_name = CString::new(module_name).map_err(|_| RocmError::CompileError {
+        module: module_name.to_string(),
+        log: "module name contains null byte".to_string(),
+    })?;
 
     // Create hiprtc program
     let mut prog: ffi::HiprtcProgram = std::ptr::null_mut();
@@ -86,18 +84,15 @@ pub fn ensure_module(
     )?;
 
     // Compile with default options
-    let compile_result = unsafe {
-        (hiprtc.hiprtc_compile_program)(prog, 0, std::ptr::null())
-    };
+    let compile_result = unsafe { (hiprtc.hiprtc_compile_program)(prog, 0, std::ptr::null()) };
 
     if compile_result != ffi::HIPRTC_SUCCESS {
         // Get compile log for error reporting
         let mut log_size: usize = 0;
         let _ = unsafe { (hiprtc.hiprtc_get_program_log_size)(prog, &mut log_size) };
         let mut log_buf = vec![0u8; log_size];
-        let _ = unsafe {
-            (hiprtc.hiprtc_get_program_log)(prog, log_buf.as_mut_ptr() as *mut c_char)
-        };
+        let _ =
+            unsafe { (hiprtc.hiprtc_get_program_log)(prog, log_buf.as_mut_ptr() as *mut c_char) };
         let log = String::from_utf8_lossy(&log_buf).to_string();
         unsafe { (hiprtc.hiprtc_destroy_program)(&mut prog) };
         return Err(RocmError::CompileError {

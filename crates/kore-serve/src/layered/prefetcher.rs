@@ -10,10 +10,10 @@
 //! Layer N+2:                  [LOAD][DECOMPRESS][GPU_XFER]
 //! ```
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 use super::cache::{LayerCache, LayerWeights};
@@ -81,8 +81,13 @@ impl LayerPrefetcher {
     ///
     /// Automatically triggers prefetch of upcoming layers.
     pub async fn get_layer(&self, idx: usize) -> Result<LayerWeights, String> {
-        let layer_name = self.layer_names.get(idx)
-            .ok_or_else(|| format!("layer index {} out of range ({})", idx, self.layer_names.len()))?;
+        let layer_name = self.layer_names.get(idx).ok_or_else(|| {
+            format!(
+                "layer index {} out of range ({})",
+                idx,
+                self.layer_names.len()
+            )
+        })?;
 
         // Check cache first
         if let Some(weights) = self.cache.get(layer_name) {
@@ -100,9 +105,9 @@ impl LayerPrefetcher {
         };
 
         let weights = match pending {
-            Some(PendingLayer::Loading(rx)) => {
-                rx.await.map_err(|_| "prefetch channel closed".to_string())??
-            }
+            Some(PendingLayer::Loading(rx)) => rx
+                .await
+                .map_err(|_| "prefetch channel closed".to_string())??,
             None => {
                 // Not prefetched — load synchronously
                 load_layer_from_disk(&self.shard_dir, layer_name)?
@@ -138,12 +143,22 @@ impl LayerPrefetcher {
         let load_times: Vec<f64> = data.load_times.iter().map(|(_, t)| *t).collect();
         let wait_times: Vec<f64> = data.wait_times.iter().map(|(_, t)| *t).collect();
 
-        let avg = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+        let avg = |v: &[f64]| {
+            if v.is_empty() {
+                0.0
+            } else {
+                v.iter().sum::<f64>() / v.len() as f64
+            }
+        };
         let sum = |v: &[f64]| v.iter().sum::<f64>();
 
         let total_load = sum(&load_times);
         let total_wait = sum(&wait_times);
-        let overlap = if total_load > 0.0 { 1.0 - (total_wait / total_load) } else { 0.0 };
+        let overlap = if total_load > 0.0 {
+            1.0 - (total_wait / total_load)
+        } else {
+            0.0
+        };
 
         Some(PrefetcherStats {
             avg_load_time: avg(&load_times),
@@ -210,7 +225,9 @@ impl LayerPrefetcher {
             .await
             {
                 Ok(inner) => inner,
-                Err(e) => Err(format!("prefetch task for layer {idx} panicked or was cancelled: {e}")),
+                Err(e) => Err(format!(
+                    "prefetch task for layer {idx} panicked or was cancelled: {e}"
+                )),
             };
 
             // If the receiver has been dropped (e.g. caller timed out), this is a no-op.
@@ -252,8 +269,8 @@ pub fn load_layer_from_disk(shard_dir: &Path, layer_name: &str) -> Result<LayerW
         return Err(format!("shard file not found: {}", path.display()));
     }
 
-    let file_bytes = std::fs::read(&path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    let file_bytes =
+        std::fs::read(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
 
     let tensors = safetensors::SafeTensors::deserialize(&file_bytes)
         .map_err(|e| format!("failed to parse safetensors {}: {e}", path.display()))?;

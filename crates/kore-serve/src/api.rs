@@ -4,8 +4,8 @@ use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::{Deserialize, Serialize};
 use kore_nn::sampler::{Rng, SamplerConfig};
+use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
@@ -25,8 +25,12 @@ pub struct CompletionRequest {
     pub stream: bool,
 }
 
-fn default_max_tokens() -> usize { 128 }
-fn default_temperature() -> f32 { 1.0 }
+fn default_max_tokens() -> usize {
+    128
+}
+fn default_temperature() -> f32 {
+    1.0
+}
 
 #[derive(Deserialize)]
 pub struct ChatCompletionRequest {
@@ -203,10 +207,13 @@ fn completions_batch(state: AppState, req: CompletionRequest) -> Json<Completion
                 Err(e) => (format!("[error: {}]", e), 0),
             }
         } else {
-            (format!(
-                "[Kore] No model loaded. Model '{}', prompt {} tokens.",
-                req.model, prompt_len
-            ), 0)
+            (
+                format!(
+                    "[Kore] No model loaded. Model '{}', prompt {} tokens.",
+                    req.model, prompt_len
+                ),
+                0,
+            )
         }
     };
 
@@ -300,8 +307,13 @@ pub async fn chat_completions(
     }
 }
 
-fn chat_completions_batch(state: AppState, req: ChatCompletionRequest) -> Json<ChatCompletionResponse> {
-    let prompt_text: String = req.messages.iter()
+fn chat_completions_batch(
+    state: AppState,
+    req: ChatCompletionRequest,
+) -> Json<ChatCompletionResponse> {
+    let prompt_text: String = req
+        .messages
+        .iter()
         .map(|m| format!("<|{}|>{}", m.role, m.content))
         .collect::<Vec<_>>()
         .join("");
@@ -323,10 +335,14 @@ fn chat_completions_batch(state: AppState, req: ChatCompletionRequest) -> Json<C
                 Err(e) => (format!("[error: {}]", e), 0),
             }
         } else {
-            (format!(
-                "[Kore] No model loaded. Model '{}', {} messages.",
-                req.model, req.messages.len()
-            ), 0)
+            (
+                format!(
+                    "[Kore] No model loaded. Model '{}', {} messages.",
+                    req.model,
+                    req.messages.len()
+                ),
+                0,
+            )
         }
     };
 
@@ -393,7 +409,9 @@ fn chat_completions_stream(
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let id = gen_id();
     let model_name = state.model_name.clone();
-    let prompt_text: String = req.messages.iter()
+    let prompt_text: String = req
+        .messages
+        .iter()
         .map(|m| format!("<|{}|>{}", m.role, m.content))
         .collect::<Vec<_>>()
         .join("");

@@ -38,10 +38,7 @@ impl GradNode {
     }
 
     /// Create a new interior node with a gradient function and inputs.
-    pub fn with_grad_fn(
-        grad_fn: Box<dyn GradFn>,
-        inputs: Vec<Arc<GradNode>>,
-    ) -> Arc<Self> {
+    pub fn with_grad_fn(grad_fn: Box<dyn GradFn>, inputs: Vec<Arc<GradNode>>) -> Arc<Self> {
         let weak_inputs = inputs.iter().map(Arc::downgrade).collect();
         Arc::new(Self {
             id: next_id(),
@@ -109,7 +106,8 @@ impl GradGraph {
         while let Some(node) = queue.pop_front() {
             for weak_input in &node.inputs {
                 if let Some(input) = weak_input.upgrade() {
-                    if let std::collections::hash_map::Entry::Vacant(e) = all_nodes.entry(input.id) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = all_nodes.entry(input.id)
+                    {
                         e.insert(Arc::clone(&input));
                         in_degree.insert(input.id, 0);
                         queue.push_back(Arc::clone(&input));

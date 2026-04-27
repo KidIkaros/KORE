@@ -4,9 +4,9 @@
 //! with shape `[batch..., algebra_dim]`, enabling batched geometric algebra
 //! operations that integrate with the ML pipeline (autograd, GPU, etc.).
 
-use kore_core::{KoreError, Tensor};
 use crate::algebra::CliffordAlgebra;
 use crate::multivector::Multivector;
+use kore_core::{KoreError, Tensor};
 
 /// A batched multivector stored as a Tensor.
 ///
@@ -49,7 +49,10 @@ impl MultivectorTensor {
                 got: vec![last],
             });
         }
-        Ok(Self { data, algebra: alg.clone() })
+        Ok(Self {
+            data,
+            algebra: alg.clone(),
+        })
     }
 
     /// Create a batch of scalar multivectors from a tensor of scalars.
@@ -59,7 +62,8 @@ impl MultivectorTensor {
         let s_dims = scalars.shape().dims();
         let batch_numel = scalars.numel();
         let s_data = scalars.contiguous();
-        let s_slice = s_data.as_f32_slice()
+        let s_slice = s_data
+            .as_f32_slice()
             .ok_or_else(|| KoreError::UnsupportedDType(scalars.dtype()))?;
 
         let mut out = vec![0.0f32; batch_numel * alg.dim];
@@ -97,7 +101,8 @@ impl MultivectorTensor {
 
         let batch_numel: usize = v_dims[..v_dims.len() - 1].iter().product();
         let v_data = vectors.contiguous();
-        let v_slice = v_data.as_f32_slice()
+        let v_slice = v_data
+            .as_f32_slice()
             .ok_or_else(|| KoreError::UnsupportedDType(vectors.dtype()))?;
 
         let grade1_blades = alg.blades_of_grade(1);
@@ -198,10 +203,14 @@ impl MultivectorTensor {
 
             for i in 0..d {
                 let ai = a_slice[a_off + i];
-                if ai.abs() < 1e-10 { continue; }
+                if ai.abs() < 1e-10 {
+                    continue;
+                }
                 for j in 0..d {
                     let bj = b_slice[b_off + j];
-                    if bj.abs() < 1e-10 { continue; }
+                    if bj.abs() < 1e-10 {
+                        continue;
+                    }
                     let entry = &self.algebra.cayley[i][j];
                     out[c_off + entry.blade] += entry.sign.as_f32() * ai * bj;
                 }
@@ -242,12 +251,16 @@ impl MultivectorTensor {
 
             for i in 0..d {
                 let ai = a_slice[a_off + i];
-                if ai.abs() < 1e-10 { continue; }
+                if ai.abs() < 1e-10 {
+                    continue;
+                }
                 let grade_a = self.algebra.grade(i);
 
                 for j in 0..d {
                     let bj = b_slice[b_off + j];
-                    if bj.abs() < 1e-10 { continue; }
+                    if bj.abs() < 1e-10 {
+                        continue;
+                    }
                     let grade_b = self.algebra.grade(j);
                     let entry = &self.algebra.cayley[i][j];
                     let result_grade = self.algebra.grade(entry.blade);
@@ -293,12 +306,16 @@ impl MultivectorTensor {
 
             for i in 0..d {
                 let ai = a_slice[a_off + i];
-                if ai.abs() < 1e-10 { continue; }
+                if ai.abs() < 1e-10 {
+                    continue;
+                }
                 let grade_a = self.algebra.grade(i);
 
                 for j in 0..d {
                     let bj = b_slice[b_off + j];
-                    if bj.abs() < 1e-10 { continue; }
+                    if bj.abs() < 1e-10 {
+                        continue;
+                    }
                     let grade_b = self.algebra.grade(j);
                     let entry = &self.algebra.cayley[i][j];
                     let result_grade = self.algebra.grade(entry.blade);
@@ -328,7 +345,11 @@ impl MultivectorTensor {
         for b in 0..batch_numel {
             for i in 0..d {
                 let k = self.algebra.grade(i);
-                let sign = if (k * k.wrapping_sub(1) / 2).is_multiple_of(2) { 1.0 } else { -1.0 };
+                let sign = if (k * k.wrapping_sub(1) / 2).is_multiple_of(2) {
+                    1.0
+                } else {
+                    -1.0
+                };
                 out[b * d + i] = slice[b * d + i] * sign;
             }
         }
@@ -382,8 +403,11 @@ impl MultivectorTensor {
 impl std::fmt::Display for MultivectorTensor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let dims = self.data.shape().dims();
-        write!(f, "MultivectorTensor(Cl({},{}), shape={:?})",
-            self.algebra.p, self.algebra.q, dims)
+        write!(
+            f,
+            "MultivectorTensor(Cl({},{}), shape={:?})",
+            self.algebra.p, self.algebra.q, dims
+        )
     }
 }
 
@@ -391,8 +415,12 @@ impl std::fmt::Display for MultivectorTensor {
 mod tests {
     use super::*;
 
-    fn cl30() -> CliffordAlgebra { CliffordAlgebra::new(3, 0) }
-    fn cl20() -> CliffordAlgebra { CliffordAlgebra::new(2, 0) }
+    fn cl30() -> CliffordAlgebra {
+        CliffordAlgebra::new(3, 0)
+    }
+    fn cl20() -> CliffordAlgebra {
+        CliffordAlgebra::new(2, 0)
+    }
 
     #[test]
     fn test_zeros() {
@@ -439,8 +467,10 @@ mod tests {
     #[test]
     fn test_geometric_product_scalars() {
         let alg = cl20();
-        let a = MultivectorTensor::from_scalars(&alg, &Tensor::from_f32(&[3.0, 5.0], &[2])).unwrap();
-        let b = MultivectorTensor::from_scalars(&alg, &Tensor::from_f32(&[4.0, 2.0], &[2])).unwrap();
+        let a =
+            MultivectorTensor::from_scalars(&alg, &Tensor::from_f32(&[3.0, 5.0], &[2])).unwrap();
+        let b =
+            MultivectorTensor::from_scalars(&alg, &Tensor::from_f32(&[4.0, 2.0], &[2])).unwrap();
         let c = a.geometric_product(&b).unwrap();
 
         let sp = c.scalar_part();
@@ -453,24 +483,34 @@ mod tests {
     fn test_geometric_product_vectors() {
         let alg = cl20();
         // e1 * e2 = e12
-        let a = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[1.0, 0.0], &[1, 2])).unwrap();
-        let b = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[0.0, 1.0], &[1, 2])).unwrap();
+        let a =
+            MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[1.0, 0.0], &[1, 2])).unwrap();
+        let b =
+            MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[0.0, 1.0], &[1, 2])).unwrap();
         let c = a.geometric_product(&b).unwrap();
 
         let mv = c.get(0);
-        assert!((mv.coeffs[0b11] - 1.0).abs() < 1e-6, "e12 coeff: {}", mv.coeffs[0b11]);
+        assert!(
+            (mv.coeffs[0b11] - 1.0).abs() < 1e-6,
+            "e12 coeff: {}",
+            mv.coeffs[0b11]
+        );
     }
 
     #[test]
     fn test_inner_product_batch() {
         let alg = cl30();
         // Batch of 2: dot products
-        let a = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(
-            &[1.0, 2.0, 3.0, 1.0, 0.0, 0.0], &[2, 3]
-        )).unwrap();
-        let b = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(
-            &[4.0, 5.0, 6.0, 0.0, 0.0, 1.0], &[2, 3]
-        )).unwrap();
+        let a = MultivectorTensor::from_vectors(
+            &alg,
+            &Tensor::from_f32(&[1.0, 2.0, 3.0, 1.0, 0.0, 0.0], &[2, 3]),
+        )
+        .unwrap();
+        let b = MultivectorTensor::from_vectors(
+            &alg,
+            &Tensor::from_f32(&[4.0, 5.0, 6.0, 0.0, 0.0, 1.0], &[2, 3]),
+        )
+        .unwrap();
         let c = a.inner_product(&b).unwrap();
 
         let sp = c.scalar_part();
@@ -484,8 +524,10 @@ mod tests {
     #[test]
     fn test_outer_product_batch() {
         let alg = cl30();
-        let a = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3])).unwrap();
-        let b = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[0.0, 1.0, 0.0], &[1, 3])).unwrap();
+        let a = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[1.0, 0.0, 0.0], &[1, 3]))
+            .unwrap();
+        let b = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[0.0, 1.0, 0.0], &[1, 3]))
+            .unwrap();
         let c = a.outer_product(&b).unwrap();
 
         let mv = c.get(0);
@@ -499,9 +541,9 @@ mod tests {
         let alg = cl20();
         let mut mv = MultivectorTensor::zeros(&alg, &[1]);
         let mut m = Multivector::zero(&alg);
-        m.coeffs[0] = 1.0;     // scalar: unchanged
-        m.coeffs[0b01] = 2.0;  // e1: unchanged
-        m.coeffs[0b11] = 3.0;  // e12: flipped
+        m.coeffs[0] = 1.0; // scalar: unchanged
+        m.coeffs[0b01] = 2.0; // e1: unchanged
+        m.coeffs[0b11] = 3.0; // e12: flipped
         mv.set(0, &m);
 
         let rev = mv.reverse();
@@ -515,7 +557,8 @@ mod tests {
     fn test_norm_squared() {
         let alg = cl30();
         // Vector [1, 2, 3]: norm^2 = 1 + 4 + 9 = 14
-        let v = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3])).unwrap();
+        let v = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&[1.0, 2.0, 3.0], &[1, 3]))
+            .unwrap();
         let ns = v.norm_squared().unwrap();
         let ns_data = ns.as_f32_slice().unwrap();
         assert!((ns_data[0] - 14.0).abs() < 1e-4, "got {}", ns_data[0]);
@@ -526,16 +569,16 @@ mod tests {
         let alg = cl30();
         let mut mv = MultivectorTensor::zeros(&alg, &[1]);
         let mut m = Multivector::zero(&alg);
-        m.coeffs[0] = 5.0;      // grade 0
-        m.coeffs[0b001] = 2.0;  // grade 1
-        m.coeffs[0b011] = 3.0;  // grade 2
+        m.coeffs[0] = 5.0; // grade 0
+        m.coeffs[0b001] = 2.0; // grade 1
+        m.coeffs[0b011] = 3.0; // grade 2
         mv.set(0, &m);
 
         let g1 = mv.grade_project(1);
         let g1_mv = g1.get(0);
-        assert!(g1_mv.coeffs[0].abs() < 1e-6);         // no scalar
+        assert!(g1_mv.coeffs[0].abs() < 1e-6); // no scalar
         assert!((g1_mv.coeffs[0b001] - 2.0).abs() < 1e-6); // e1 kept
-        assert!(g1_mv.coeffs[0b011].abs() < 1e-6);      // no bivector
+        assert!(g1_mv.coeffs[0b011].abs() < 1e-6); // no bivector
     }
 
     #[test]
@@ -551,8 +594,10 @@ mod tests {
         let c_scalar = crate::products::geometric(&alg, &a_mv, &b_mv);
 
         // Tensor API
-        let a_t = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&a_vec, &[1, 3])).unwrap();
-        let b_t = MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&b_vec, &[1, 3])).unwrap();
+        let a_t =
+            MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&a_vec, &[1, 3])).unwrap();
+        let b_t =
+            MultivectorTensor::from_vectors(&alg, &Tensor::from_f32(&b_vec, &[1, 3])).unwrap();
         let c_tensor = a_t.geometric_product(&b_t).unwrap();
         let c_t_mv = c_tensor.get(0);
 
@@ -560,7 +605,9 @@ mod tests {
             assert!(
                 (c_scalar.coeffs[i] - c_t_mv.coeffs[i]).abs() < 1e-4,
                 "blade {}: scalar={}, tensor={}",
-                i, c_scalar.coeffs[i], c_t_mv.coeffs[i]
+                i,
+                c_scalar.coeffs[i],
+                c_t_mv.coeffs[i]
             );
         }
     }

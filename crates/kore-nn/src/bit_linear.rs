@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use kore_core::{DType, Tensor};
-use kore_kernels::cpu_ternary_matmul::{ternary_matmul, pack_weights_ternary};
+use kore_kernels::cpu_ternary_matmul::{pack_weights_ternary, ternary_matmul};
 
 use crate::module::Module;
 
@@ -47,14 +47,21 @@ impl BitLinear {
     ///   |normalized_weight| < threshold are mapped to 0.
     pub fn new(weight: &Tensor, bias: Option<&Tensor>, threshold: f32) -> Self {
         let dims = weight.shape().dims();
-        assert!(dims.len() == 2, "BitLinear weight must be 2D, got {:?}", dims);
+        assert!(
+            dims.len() == 2,
+            "BitLinear weight must be 2D, got {:?}",
+            dims
+        );
         let out_features = dims[0];
         let in_features = dims[1];
 
         let w_data = weight.contiguous();
-        let w_slice = w_data.as_f32_slice().expect("BitLinear requires f32 weights");
+        let w_slice = w_data
+            .as_f32_slice()
+            .expect("BitLinear requires f32 weights");
 
-        let (packed_weights, scales) = pack_weights_ternary(w_slice, out_features, in_features, threshold);
+        let (packed_weights, scales) =
+            pack_weights_ternary(w_slice, out_features, in_features, threshold);
 
         let bias_tensor = bias.cloned();
 
@@ -220,7 +227,8 @@ impl Module for BitLinear {
         if ndim == 1 {
             output = output.reshape(&[self.out_features as isize])?;
         } else if ndim > 2 {
-            let mut out_shape: Vec<isize> = input_dims[..ndim - 1].iter().map(|&d| d as isize).collect();
+            let mut out_shape: Vec<isize> =
+                input_dims[..ndim - 1].iter().map(|&d| d as isize).collect();
             out_shape.push(self.out_features as isize);
             output = output.reshape(&out_shape)?;
         }
@@ -327,8 +335,8 @@ mod tests {
     fn test_bit_linear_approximates_linear() {
         // Create a linear with known weights that are ternary-friendly
         let w_data = vec![
-            1.0, -1.0, 0.0, 1.0,   // row 0
-            -1.0, 1.0, 1.0, 0.0,   // row 1
+            1.0, -1.0, 0.0, 1.0, // row 0
+            -1.0, 1.0, 1.0, 0.0, // row 1
         ];
         let weight = Tensor::from_f32(&w_data, &[2, 4]);
         let bl = BitLinear::new(&weight, None, 0.3);

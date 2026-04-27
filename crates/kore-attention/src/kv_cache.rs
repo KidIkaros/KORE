@@ -50,12 +50,12 @@ impl KvCache {
         let nk = new_keys.contiguous();
         let nv = new_values.contiguous();
 
-        let nk_data = nk.as_f32_slice().ok_or_else(|| {
-            KoreError::UnsupportedDType(new_keys.dtype())
-        })?;
-        let nv_data = nv.as_f32_slice().ok_or_else(|| {
-            KoreError::UnsupportedDType(new_values.dtype())
-        })?;
+        let nk_data = nk
+            .as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(new_keys.dtype()))?;
+        let nv_data = nv
+            .as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(new_values.dtype()))?;
 
         let new_tokens = nk.shape().dims()[0];
 
@@ -137,7 +137,7 @@ mod tests {
 
         // Verify data integrity
         let k_data = ck2.as_f32_slice().unwrap();
-        assert_eq!(k_data[0], 1.0);  // first token
+        assert_eq!(k_data[0], 1.0); // first token
         assert_eq!(k_data[12], 3.0); // fourth token
     }
 

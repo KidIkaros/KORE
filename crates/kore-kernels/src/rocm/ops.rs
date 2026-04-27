@@ -68,8 +68,12 @@ pub fn rocm_mamba3_scan_f32(
     use_rope: bool,
     save_states: bool,
 ) -> Result<RocmScanForwardOut, RocmError> {
-    assert!(d_state <= MAX_DSTATE,
-        "rocm_mamba3_scan_f32: d_state={} exceeds MAX_DSTATE={}", d_state, MAX_DSTATE);
+    assert!(
+        d_state <= MAX_DSTATE,
+        "rocm_mamba3_scan_f32: d_state={} exceeds MAX_DSTATE={}",
+        d_state,
+        MAX_DSTATE
+    );
 
     let num_chunks = (seq_len + SCAN_CHUNK - 1) / SCAN_CHUNK;
     let state_size = d_state * headdim;
@@ -109,7 +113,10 @@ pub fn rocm_mamba3_scan_f32(
 
     // Phase 1: Intra-chunk scan
     let f1 = get_or_load_func(
-        device_idx, "mamba_scan", "mamba3_scan_chunk_f32", MAMBA_SCAN_CU,
+        device_idx,
+        "mamba_scan",
+        "mamba3_scan_chunk_f32",
+        MAMBA_SCAN_CU,
     )?;
     let total_blocks = (batch * nheads * num_chunks) as u32;
 
@@ -179,12 +186,17 @@ pub fn rocm_mamba3_scan_f32(
         block_dim: (block_size, 1, 1),
         shared_mem_bytes: 0,
     };
-    unsafe { launch_kernel(device_idx, f1, &cfg1, &mut params)?; }
+    unsafe {
+        launch_kernel(device_idx, f1, &cfg1, &mut params)?;
+    }
 
     // Phase 2: Inter-chunk prefix scan (only if multiple chunks)
     if num_chunks > 1 {
         let f2 = get_or_load_func(
-            device_idx, "mamba_scan", "mamba3_scan_prefix_f32", MAMBA_SCAN_CU,
+            device_idx,
+            "mamba_scan",
+            "mamba3_scan_prefix_f32",
+            MAMBA_SCAN_CU,
         )?;
         let prefix_blocks = (batch * nheads) as u32;
         let mut ss = state_size as u32;
@@ -210,7 +222,9 @@ pub fn rocm_mamba3_scan_f32(
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
-        unsafe { launch_kernel(device_idx, f2, &cfg2, &mut params2)?; }
+        unsafe {
+            launch_kernel(device_idx, f2, &cfg2, &mut params2)?;
+        }
     }
 
     Ok(RocmScanForwardOut {
@@ -255,8 +269,12 @@ pub fn rocm_mamba3_scan_backward_f32(
     dt_softplus: bool,
     use_rope: bool,
 ) -> Result<(HipBuffer, HipBuffer, HipBuffer, HipBuffer, HipBuffer), RocmError> {
-    assert!(d_state <= MAX_DSTATE,
-        "rocm_mamba3_scan_backward_f32: d_state={} exceeds MAX_DSTATE={}", d_state, MAX_DSTATE);
+    assert!(
+        d_state <= MAX_DSTATE,
+        "rocm_mamba3_scan_backward_f32: d_state={} exceeds MAX_DSTATE={}",
+        d_state,
+        MAX_DSTATE
+    );
 
     // Allocate gradient output buffers (zeroed — atomicAdd accumulates into these)
     let dx = HipBuffer::zeros(device_idx, batch * seq_len * nheads * headdim * 4)?;
@@ -279,7 +297,10 @@ pub fn rocm_mamba3_scan_backward_f32(
     let total_blocks = (batch * nheads) as u32;
 
     let f = get_or_load_func(
-        device_idx, "mamba_scan_backward", "mamba3_scan_backward_f32", MAMBA_SCAN_BWD_CU,
+        device_idx,
+        "mamba_scan_backward",
+        "mamba3_scan_backward_f32",
+        MAMBA_SCAN_BWD_CU,
     )?;
 
     // Build kernel parameter pointers
@@ -350,7 +371,9 @@ pub fn rocm_mamba3_scan_backward_f32(
         block_dim: (block_size, 1, 1),
         shared_mem_bytes: 0,
     };
-    unsafe { launch_kernel(device_idx, f, &cfg, &mut params)?; }
+    unsafe {
+        launch_kernel(device_idx, f, &cfg, &mut params)?;
+    }
 
     Ok((dx, d_dt, d_b, d_c, dz))
 }

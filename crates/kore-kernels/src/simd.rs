@@ -81,17 +81,33 @@ mod tests {
         // Just verify it doesn't panic and returns consistent results
         let cap2 = SimdCapability::detect();
         assert_eq!(cap, cap2);
-        println!("SIMD: {} (avx2={}, avx512={}, neon={}, fma={})",
-            cap.best_tier(), cap.avx2, cap.avx512f, cap.neon, cap.fma);
+        println!(
+            "SIMD: {} (avx2={}, avx512={}, neon={}, fma={})",
+            cap.best_tier(),
+            cap.avx2,
+            cap.avx512f,
+            cap.neon,
+            cap.fma
+        );
     }
 
     #[test]
     fn test_best_tier() {
-        let scalar = SimdCapability { avx2: false, avx512f: false, neon: false, fma: false };
+        let scalar = SimdCapability {
+            avx2: false,
+            avx512f: false,
+            neon: false,
+            fma: false,
+        };
         assert_eq!(scalar.best_tier(), "scalar");
         assert!(!scalar.has_simd());
 
-        let avx2 = SimdCapability { avx2: true, avx512f: false, neon: false, fma: true };
+        let avx2 = SimdCapability {
+            avx2: true,
+            avx512f: false,
+            neon: false,
+            fma: true,
+        };
         assert_eq!(avx2.best_tier(), "AVX2");
         assert!(avx2.has_simd());
     }

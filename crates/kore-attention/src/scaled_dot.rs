@@ -148,10 +148,7 @@ mod tests {
     #[test]
     fn test_self_attention_2d() {
         // Simple self-attention: Q=K=V
-        let x = Tensor::from_f32(
-            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
-            &[3, 2],
-        );
+        let x = Tensor::from_f32(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[3, 2]);
         let out = scaled_dot_product_attention(&x, &x, &x, None, None).unwrap();
         assert_eq!(out.shape().dims(), &[3, 2]);
 
@@ -195,10 +192,7 @@ mod tests {
         // With identical Q and K, attention should be roughly uniform
         let q = Tensor::ones(&[4, 2]);
         let k = Tensor::ones(&[4, 2]);
-        let v = Tensor::from_f32(
-            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0],
-            &[4, 2],
-        );
+        let v = Tensor::from_f32(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0], &[4, 2]);
 
         let out = scaled_dot_product_attention(&q, &k, &v, None, None).unwrap();
         let data = out.as_f32_slice().unwrap();

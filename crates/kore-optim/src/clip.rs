@@ -3,7 +3,7 @@
 //! Provides `clip_grad_norm_` and `clip_grad_value_` for preventing
 //! gradient explosion during training.
 
-use kore_core::{Tensor, KoreError};
+use kore_core::{KoreError, Tensor};
 
 /// Clip gradients by global L2 norm.
 ///
@@ -21,7 +21,8 @@ pub fn clip_grad_norm_(grads: &mut [Tensor], max_norm: f32) -> kore_core::Result
     let mut total_norm_sq = 0.0f32;
     for g in grads.iter_mut() {
         let c = g.contiguous();
-        let data = c.as_f32_slice()
+        let data = c
+            .as_f32_slice()
             .ok_or_else(|| KoreError::UnsupportedDType(g.dtype()))?;
         total_norm_sq += data.iter().map(|v| v * v).sum::<f32>();
     }
@@ -31,7 +32,8 @@ pub fn clip_grad_norm_(grads: &mut [Tensor], max_norm: f32) -> kore_core::Result
         let scale = max_norm / total_norm;
         for g in grads.iter_mut() {
             let c = g.contiguous();
-            let data = c.as_f32_slice()
+            let data = c
+                .as_f32_slice()
                 .ok_or_else(|| KoreError::UnsupportedDType(g.dtype()))?;
             let scaled: Vec<f32> = data.iter().map(|v| v * scale).collect();
             let shape = g.shape().dims().to_vec();
@@ -53,9 +55,13 @@ pub fn clip_grad_norm_(grads: &mut [Tensor], max_norm: f32) -> kore_core::Result
 pub fn clip_grad_value_(grads: &mut [Tensor], clip_value: f32) -> kore_core::Result<()> {
     for g in grads.iter_mut() {
         let c = g.contiguous();
-        let data = c.as_f32_slice()
+        let data = c
+            .as_f32_slice()
             .ok_or_else(|| KoreError::UnsupportedDType(g.dtype()))?;
-        let clipped: Vec<f32> = data.iter().map(|v| v.clamp(-clip_value, clip_value)).collect();
+        let clipped: Vec<f32> = data
+            .iter()
+            .map(|v| v.clamp(-clip_value, clip_value))
+            .collect();
         let shape = g.shape().dims().to_vec();
         *g = Tensor::from_f32(&clipped, &shape);
     }
@@ -69,9 +75,7 @@ mod tests {
     #[test]
     fn test_clip_grad_norm_no_clip() {
         // Small gradients — should not be clipped
-        let mut grads = vec![
-            Tensor::from_f32(&[0.1, 0.2], &[2]),
-        ];
+        let mut grads = vec![Tensor::from_f32(&[0.1, 0.2], &[2])];
         let norm = clip_grad_norm_(&mut grads, 10.0).unwrap();
         assert!(norm < 10.0);
         let data = grads[0].as_f32_slice().unwrap();
@@ -111,9 +115,7 @@ mod tests {
 
     #[test]
     fn test_clip_grad_value() {
-        let mut grads = vec![
-            Tensor::from_f32(&[-5.0, 0.5, 3.0, -0.1], &[4]),
-        ];
+        let mut grads = vec![Tensor::from_f32(&[-5.0, 0.5, 3.0, -0.1], &[4])];
         clip_grad_value_(&mut grads, 1.0).unwrap();
         let data = grads[0].as_f32_slice().unwrap();
         assert_eq!(data, &[-1.0, 0.5, 1.0, -0.1]);

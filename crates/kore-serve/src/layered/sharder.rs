@@ -22,22 +22,27 @@ pub fn shard_model(
     output_dir: &Path,
     config: &LayeredConfig,
 ) -> Result<usize, String> {
-    std::fs::create_dir_all(output_dir)
-        .map_err(|e| format!("failed to create output dir: {e}"))?;
+    std::fs::create_dir_all(output_dir).map_err(|e| format!("failed to create output dir: {e}"))?;
 
     // Collect all safetensors files
     let st_files = find_safetensors_files(model_dir)?;
     if st_files.is_empty() {
-        return Err(format!("no .safetensors files found in {}", model_dir.display()));
+        return Err(format!(
+            "no .safetensors files found in {}",
+            model_dir.display()
+        ));
     }
 
-    tracing::info!("Found {} safetensors files in {}", st_files.len(), model_dir.display());
+    tracing::info!(
+        "Found {} safetensors files in {}",
+        st_files.len(),
+        model_dir.display()
+    );
 
     // Group all tensors by layer
     let layer_names = config.layer_names();
     type TensorEntry = (String, Vec<u8>, safetensors::Dtype, Vec<usize>);
-    let mut layer_tensors: HashMap<String, Vec<TensorEntry>> =
-        HashMap::new();
+    let mut layer_tensors: HashMap<String, Vec<TensorEntry>> = HashMap::new();
 
     for file_path in &st_files {
         let file_bytes = std::fs::read(file_path)
@@ -75,7 +80,11 @@ pub fn shard_model(
         );
     }
 
-    tracing::info!("Sharded model into {} per-layer files in {}", count, output_dir.display());
+    tracing::info!(
+        "Sharded model into {} per-layer files in {}",
+        count,
+        output_dir.display()
+    );
     Ok(count)
 }
 
@@ -83,11 +92,7 @@ pub fn shard_model(
 ///
 /// Maps tensor names like `model.layers.5.self_attn.q_proj.weight` to
 /// the layer key `model.layers.5`.
-fn classify_tensor(
-    tensor_name: &str,
-    layer_names: &[String],
-    config: &LayeredConfig,
-) -> String {
+fn classify_tensor(tensor_name: &str, layer_names: &[String], config: &LayeredConfig) -> String {
     // Check embed
     if tensor_name.starts_with(&config.embed_name) {
         return config.embed_name.clone();
@@ -116,7 +121,9 @@ fn classify_tensor(
     if parts.len() >= 2 {
         tracing::warn!(
             "tensor '{}' did not match any known layer pattern, grouping by prefix '{}.{}'",
-            tensor_name, parts[0], parts[1]
+            tensor_name,
+            parts[0],
+            parts[1]
         );
         format!("{}.{}", parts[0], parts[1])
     } else {
@@ -124,7 +131,8 @@ fn classify_tensor(
             "tensor '{}' could not be classified, assigning to first layer",
             tensor_name
         );
-        layer_names.first()
+        layer_names
+            .first()
             .cloned()
             .unwrap_or_else(|| "unknown".to_string())
     }
@@ -147,8 +155,7 @@ fn write_shard_file(
     let bytes = safetensors::tensor::serialize(tensor_views, &None)
         .map_err(|e| format!("failed to serialize shard: {e}"))?;
 
-    std::fs::write(path, bytes)
-        .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+    std::fs::write(path, bytes).map_err(|e| format!("failed to write {}: {e}", path.display()))?;
 
     Ok(())
 }
@@ -178,9 +185,7 @@ mod tests {
 
     #[test]
     fn test_classify_tensor() {
-        let config = LayeredConfig::llama(
-            PathBuf::from("/tmp"), 32, 4096, 32000, 32, 32, 11008,
-        );
+        let config = LayeredConfig::llama(PathBuf::from("/tmp"), 32, 4096, 32000, 32, 32, 11008);
         let layer_names = config.layer_names();
 
         assert_eq!(
@@ -188,11 +193,19 @@ mod tests {
             "model.embed_tokens"
         );
         assert_eq!(
-            classify_tensor("model.layers.5.self_attn.q_proj.weight", &layer_names, &config),
+            classify_tensor(
+                "model.layers.5.self_attn.q_proj.weight",
+                &layer_names,
+                &config
+            ),
             "model.layers.5"
         );
         assert_eq!(
-            classify_tensor("model.layers.31.mlp.gate_proj.weight", &layer_names, &config),
+            classify_tensor(
+                "model.layers.31.mlp.gate_proj.weight",
+                &layer_names,
+                &config
+            ),
             "model.layers.31"
         );
         assert_eq!(

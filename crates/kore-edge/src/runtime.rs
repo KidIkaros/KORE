@@ -22,8 +22,12 @@ struct KvCache {
 impl KvCache {
     fn new(n_layers: usize, max_seq: usize, kv_dim: usize) -> Self {
         Self {
-            keys: (0..n_layers).map(|_| vec![0.0f32; max_seq * kv_dim]).collect(),
-            values: (0..n_layers).map(|_| vec![0.0f32; max_seq * kv_dim]).collect(),
+            keys: (0..n_layers)
+                .map(|_| vec![0.0f32; max_seq * kv_dim])
+                .collect(),
+            values: (0..n_layers)
+                .map(|_| vec![0.0f32; max_seq * kv_dim])
+                .collect(),
             len: 0,
             _max_seq: max_seq,
             kv_dim,
@@ -121,7 +125,10 @@ impl Session {
             let residual: Vec<f32> = hidden.clone();
 
             // Attention norm
-            if let Some(gamma) = self.model.tensor_f32(&format!("{}.input_layernorm.weight", prefix)) {
+            if let Some(gamma) = self
+                .model
+                .tensor_f32(&format!("{}.input_layernorm.weight", prefix))
+            {
                 norm::rms_norm(&mut hidden, gamma, d, self.model.header.norm_eps);
             }
 
@@ -130,16 +137,48 @@ impl Session {
             let mut k = vec![0.0f32; seq_len * self.n_kv_heads * self.head_dim];
             let mut v = vec![0.0f32; seq_len * self.n_kv_heads * self.head_dim];
 
-            self.project(&hidden, &mut q, seq_len, self.n_heads * self.head_dim, d,
-                &format!("{}.self_attn.q_proj.weight", prefix));
-            self.project(&hidden, &mut k, seq_len, self.n_kv_heads * self.head_dim, d,
-                &format!("{}.self_attn.k_proj.weight", prefix));
-            self.project(&hidden, &mut v, seq_len, self.n_kv_heads * self.head_dim, d,
-                &format!("{}.self_attn.v_proj.weight", prefix));
+            self.project(
+                &hidden,
+                &mut q,
+                seq_len,
+                self.n_heads * self.head_dim,
+                d,
+                &format!("{}.self_attn.q_proj.weight", prefix),
+            );
+            self.project(
+                &hidden,
+                &mut k,
+                seq_len,
+                self.n_kv_heads * self.head_dim,
+                d,
+                &format!("{}.self_attn.k_proj.weight", prefix),
+            );
+            self.project(
+                &hidden,
+                &mut v,
+                seq_len,
+                self.n_kv_heads * self.head_dim,
+                d,
+                &format!("{}.self_attn.v_proj.weight", prefix),
+            );
 
             // RoPE
-            rope::apply_rope(&mut q, seq_len, self.n_heads, self.head_dim, pos, self.model.header.rope_base);
-            rope::apply_rope(&mut k, seq_len, self.n_kv_heads, self.head_dim, pos, self.model.header.rope_base);
+            rope::apply_rope(
+                &mut q,
+                seq_len,
+                self.n_heads,
+                self.head_dim,
+                pos,
+                self.model.header.rope_base,
+            );
+            rope::apply_rope(
+                &mut k,
+                seq_len,
+                self.n_kv_heads,
+                self.head_dim,
+                pos,
+                self.model.header.rope_base,
+            );
 
             // Update KV cache
             self.kv_cache.append_kv(layer, &k, &v, seq_len);
@@ -167,8 +206,14 @@ impl Session {
 
             // Output projection
             let mut attn_proj = vec![0.0f32; seq_len * d];
-            self.project(&attn_out, &mut attn_proj, seq_len, d, self.n_heads * self.head_dim,
-                &format!("{}.self_attn.o_proj.weight", prefix));
+            self.project(
+                &attn_out,
+                &mut attn_proj,
+                seq_len,
+                d,
+                self.n_heads * self.head_dim,
+                &format!("{}.self_attn.o_proj.weight", prefix),
+            );
 
             // Residual add
             elementwise::residual_add(&residual, &attn_proj, &mut hidden);
@@ -177,7 +222,10 @@ impl Session {
             let residual2: Vec<f32> = hidden.clone();
 
             // FFN norm
-            if let Some(gamma) = self.model.tensor_f32(&format!("{}.post_attention_layernorm.weight", prefix)) {
+            if let Some(gamma) = self
+                .model
+                .tensor_f32(&format!("{}.post_attention_layernorm.weight", prefix))
+            {
                 norm::rms_norm(&mut hidden, gamma, d, self.model.header.norm_eps);
             }
 
@@ -185,18 +233,36 @@ impl Session {
             let mut gate = vec![0.0f32; seq_len * self.d_ff];
             let mut up = vec![0.0f32; seq_len * self.d_ff];
 
-            self.project(&hidden, &mut gate, seq_len, self.d_ff, d,
-                &format!("{}.mlp.gate_proj.weight", prefix));
-            self.project(&hidden, &mut up, seq_len, self.d_ff, d,
-                &format!("{}.mlp.up_proj.weight", prefix));
+            self.project(
+                &hidden,
+                &mut gate,
+                seq_len,
+                self.d_ff,
+                d,
+                &format!("{}.mlp.gate_proj.weight", prefix),
+            );
+            self.project(
+                &hidden,
+                &mut up,
+                seq_len,
+                self.d_ff,
+                d,
+                &format!("{}.mlp.up_proj.weight", prefix),
+            );
 
             activation::silu(&mut gate);
             let mut gate_up = vec![0.0f32; seq_len * self.d_ff];
             elementwise::mul(&gate, &up, &mut gate_up);
 
             let mut ffn_out = vec![0.0f32; seq_len * d];
-            self.project(&gate_up, &mut ffn_out, seq_len, d, self.d_ff,
-                &format!("{}.mlp.down_proj.weight", prefix));
+            self.project(
+                &gate_up,
+                &mut ffn_out,
+                seq_len,
+                d,
+                self.d_ff,
+                &format!("{}.mlp.down_proj.weight", prefix),
+            );
 
             elementwise::residual_add(&residual2, &ffn_out, &mut hidden);
         }
@@ -270,7 +336,15 @@ impl Session {
 
     // Internal: project input through a weight matrix.
     // Supports f32 and ternary weights.
-    fn project(&self, input: &[f32], output: &mut [f32], m: usize, n: usize, k: usize, weight_name: &str) {
+    fn project(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        weight_name: &str,
+    ) {
         let entry = self.model.header.tensors.get(weight_name);
 
         match entry.map(|e| e.dtype.as_str()) {
@@ -338,7 +412,9 @@ mod tests {
         let d_ff = 8;
         let _head_dim = d / n_heads;
 
-        let mut builder = KorefBuilder::new("test", vocab, d, n_heads, n_kv_heads, n_layers, d_ff, 32, 1e-5, 10000.0);
+        let mut builder = KorefBuilder::new(
+            "test", vocab, d, n_heads, n_kv_heads, n_layers, d_ff, 32, 1e-5, 10000.0,
+        );
 
         // Embedding
         let embed: Vec<f32> = (0..vocab * d).map(|i| (i as f32 * 0.01) - 0.1).collect();
@@ -350,22 +426,52 @@ mod tests {
         // Norms (gamma = 1)
         let ones = vec![1.0f32; d];
         builder.add_f32(&format!("{}.input_layernorm.weight", prefix), &[d], &ones);
-        builder.add_f32(&format!("{}.post_attention_layernorm.weight", prefix), &[d], &ones);
+        builder.add_f32(
+            &format!("{}.post_attention_layernorm.weight", prefix),
+            &[d],
+            &ones,
+        );
 
         // Attention projections (small identity-like)
-        let q_w: Vec<f32> = (0..d * d).map(|i| if i / d == i % d { 1.0 } else { 0.0 }).collect();
-        builder.add_f32(&format!("{}.self_attn.q_proj.weight", prefix), &[d, d], &q_w);
-        builder.add_f32(&format!("{}.self_attn.k_proj.weight", prefix), &[d, d], &q_w);
-        builder.add_f32(&format!("{}.self_attn.v_proj.weight", prefix), &[d, d], &q_w);
-        builder.add_f32(&format!("{}.self_attn.o_proj.weight", prefix), &[d, d], &q_w);
+        let q_w: Vec<f32> = (0..d * d)
+            .map(|i| if i / d == i % d { 1.0 } else { 0.0 })
+            .collect();
+        builder.add_f32(
+            &format!("{}.self_attn.q_proj.weight", prefix),
+            &[d, d],
+            &q_w,
+        );
+        builder.add_f32(
+            &format!("{}.self_attn.k_proj.weight", prefix),
+            &[d, d],
+            &q_w,
+        );
+        builder.add_f32(
+            &format!("{}.self_attn.v_proj.weight", prefix),
+            &[d, d],
+            &q_w,
+        );
+        builder.add_f32(
+            &format!("{}.self_attn.o_proj.weight", prefix),
+            &[d, d],
+            &q_w,
+        );
 
         // FFN
         let gate_w: Vec<f32> = (0..d_ff * d).map(|i| (i as f32 * 0.01) - 0.05).collect();
         let up_w: Vec<f32> = (0..d_ff * d).map(|i| (i as f32 * 0.01) + 0.01).collect();
         let down_w: Vec<f32> = (0..d * d_ff).map(|i| (i as f32 * 0.01) - 0.02).collect();
-        builder.add_f32(&format!("{}.mlp.gate_proj.weight", prefix), &[d_ff, d], &gate_w);
+        builder.add_f32(
+            &format!("{}.mlp.gate_proj.weight", prefix),
+            &[d_ff, d],
+            &gate_w,
+        );
         builder.add_f32(&format!("{}.mlp.up_proj.weight", prefix), &[d_ff, d], &up_w);
-        builder.add_f32(&format!("{}.mlp.down_proj.weight", prefix), &[d, d_ff], &down_w);
+        builder.add_f32(
+            &format!("{}.mlp.down_proj.weight", prefix),
+            &[d, d_ff],
+            &down_w,
+        );
 
         // Final norm + LM head
         builder.add_f32("model.norm.weight", &[d], &ones);

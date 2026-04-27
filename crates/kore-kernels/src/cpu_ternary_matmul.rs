@@ -11,8 +11,8 @@
 
 use rayon::prelude::*;
 
+use kore_btes::encoder::{decode_trits, encode_trits, Trit};
 use kore_btes::vtalu::TernaryWord64;
-use kore_btes::encoder::{Trit, decode_trits, encode_trits};
 use kore_core::{KoreError, Tensor};
 
 /// Minimum rows before we use rayon parallelism.
@@ -35,9 +35,9 @@ pub fn ternary_matmul(
     k: usize,
 ) -> Result<Tensor, KoreError> {
     let b_cont = b.contiguous();
-    let b_data = b_cont.as_f32_slice().ok_or_else(|| {
-        KoreError::UnsupportedDType(b.dtype())
-    })?;
+    let b_data = b_cont
+        .as_f32_slice()
+        .ok_or_else(|| KoreError::UnsupportedDType(b.dtype()))?;
 
     let k_packed = k.div_ceil(5); // base-243: 5 trits per byte
 
@@ -108,7 +108,9 @@ fn compute_row(trits: &[i8], b_data: &[f32], c_row: &mut [f32], scale: f32, n: u
     // Better cache behavior when N is small (typical for decode: N=1 or small batch).
     for ki in 0..k {
         let t = trits[ki];
-        if t == 0 { continue; }
+        if t == 0 {
+            continue;
+        }
         let t_f32 = t as f32;
         let b_row = &b_data[ki * n..ki * n + n];
         for (c_val, &b_val) in c_row.iter_mut().zip(b_row.iter()) {
@@ -193,7 +195,12 @@ pub fn ternary_ternary_matmul(
 /// Pack f32 weights into ternary format with per-row scales.
 ///
 /// Returns (packed_bytes, scales).
-pub fn pack_weights_ternary(weights: &[f32], m: usize, k: usize, threshold: f32) -> (Vec<u8>, Vec<f32>) {
+pub fn pack_weights_ternary(
+    weights: &[f32],
+    m: usize,
+    k: usize,
+    threshold: f32,
+) -> (Vec<u8>, Vec<f32>) {
     let k_packed = k.div_ceil(5);
     let mut packed = vec![0u8; m * k_packed];
     let mut scales = vec![0.0f32; m];
@@ -291,7 +298,8 @@ mod tests {
         let (a_packed, a_scales) = pack_weights_ternary(&a_weights, 2, 2, 0.3);
         let (b_packed, b_scales) = pack_weights_ternary(&b_weights, 2, 2, 0.3);
 
-        let c = ternary_ternary_matmul(&a_packed, &a_scales, &b_packed, &b_scales, 2, 2, 2).unwrap();
+        let c =
+            ternary_ternary_matmul(&a_packed, &a_scales, &b_packed, &b_scales, 2, 2, 2).unwrap();
         assert_eq!(c.shape().dims(), &[2, 2]);
 
         let c_data = c.as_f32_slice().unwrap();

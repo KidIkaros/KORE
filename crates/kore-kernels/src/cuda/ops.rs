@@ -241,7 +241,13 @@ pub fn cuda_add_scalar_f32(
     scalar: f32,
     n: usize,
 ) -> Result<CudaSlice<u8>, CudaError> {
-    let f = get_or_load_func(dev, dev_idx, "elementwise", "add_scalar_f32", ELEMENTWISE_CU)?;
+    let f = get_or_load_func(
+        dev,
+        dev_idx,
+        "elementwise",
+        "add_scalar_f32",
+        ELEMENTWISE_CU,
+    )?;
     let out = dev
         .alloc_zeros::<u8>(n * 4)
         .map_err(|e| CudaError::MemoryError(e.to_string()))?;
@@ -260,7 +266,13 @@ pub fn cuda_mul_scalar_f32(
     scalar: f32,
     n: usize,
 ) -> Result<CudaSlice<u8>, CudaError> {
-    let f = get_or_load_func(dev, dev_idx, "elementwise", "mul_scalar_f32", ELEMENTWISE_CU)?;
+    let f = get_or_load_func(
+        dev,
+        dev_idx,
+        "elementwise",
+        "mul_scalar_f32",
+        ELEMENTWISE_CU,
+    )?;
     let out = dev
         .alloc_zeros::<u8>(n * 4)
         .map_err(|e| CudaError::MemoryError(e.to_string()))?;
@@ -279,7 +291,13 @@ pub fn cuda_pow_scalar_f32(
     exponent: f32,
     n: usize,
 ) -> Result<CudaSlice<u8>, CudaError> {
-    let f = get_or_load_func(dev, dev_idx, "elementwise", "pow_scalar_f32", ELEMENTWISE_CU)?;
+    let f = get_or_load_func(
+        dev,
+        dev_idx,
+        "elementwise",
+        "pow_scalar_f32",
+        ELEMENTWISE_CU,
+    )?;
     let out = dev
         .alloc_zeros::<u8>(n * 4)
         .map_err(|e| CudaError::MemoryError(e.to_string()))?;
@@ -565,8 +583,17 @@ pub fn cuda_rope_f32(
     let total = seq_len * num_heads * half_dim;
     let cfg = grid_1d(total, BLOCK_SIZE);
     unsafe {
-        f.launch(cfg, (data, freqs, seq_len as u32, num_heads as u32, head_dim as u32))
-            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        f.launch(
+            cfg,
+            (
+                data,
+                freqs,
+                seq_len as u32,
+                num_heads as u32,
+                head_dim as u32,
+            ),
+        )
+        .map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }
     Ok(())
 }
@@ -612,7 +639,10 @@ pub fn cuda_fused_rms_norm_proj_f32(
     // separate kernel launches due to eliminated VRAM round-trip.
     if hidden <= 8192 {
         let f = get_or_load_func(
-            dev, dev_idx, "fused_norm_proj", "fused_rms_norm_proj_smem_f32",
+            dev,
+            dev_idx,
+            "fused_norm_proj",
+            "fused_rms_norm_proj_smem_f32",
             FUSED_NORM_PROJ_CU,
         )?;
         let block = BLOCK_SIZE;
@@ -623,13 +653,29 @@ pub fn cuda_fused_rms_norm_proj_f32(
             shared_mem_bytes: shared_bytes,
         };
         unsafe {
-            f.launch(cfg, (input, gamma, weight, has_bias, bias_ptr, &out,
-                rows as u32, hidden as u32, out_dim as u32, eps))
-                .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+            f.launch(
+                cfg,
+                (
+                    input,
+                    gamma,
+                    weight,
+                    has_bias,
+                    bias_ptr,
+                    &out,
+                    rows as u32,
+                    hidden as u32,
+                    out_dim as u32,
+                    eps,
+                ),
+            )
+            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
         }
     } else {
         let f = get_or_load_func(
-            dev, dev_idx, "fused_norm_proj", "fused_rms_norm_proj_f32",
+            dev,
+            dev_idx,
+            "fused_norm_proj",
+            "fused_rms_norm_proj_f32",
             FUSED_NORM_PROJ_CU,
         )?;
         let grid_y = (out_dim + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -639,9 +685,22 @@ pub fn cuda_fused_rms_norm_proj_f32(
             shared_mem_bytes: 0,
         };
         unsafe {
-            f.launch(cfg, (input, gamma, weight, has_bias, bias_ptr, &out,
-                rows as u32, hidden as u32, out_dim as u32, eps))
-                .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+            f.launch(
+                cfg,
+                (
+                    input,
+                    gamma,
+                    weight,
+                    has_bias,
+                    bias_ptr,
+                    &out,
+                    rows as u32,
+                    hidden as u32,
+                    out_dim as u32,
+                    eps,
+                ),
+            )
+            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
         }
     }
 
@@ -666,7 +725,10 @@ pub fn cuda_fused_rms_norm_silu_gate_f32(
     eps: f32,
 ) -> Result<CudaSlice<u8>, CudaError> {
     let f = get_or_load_func(
-        dev, dev_idx, "fused_norm_proj", "fused_rms_norm_silu_gate_f32",
+        dev,
+        dev_idx,
+        "fused_norm_proj",
+        "fused_rms_norm_silu_gate_f32",
         FUSED_NORM_PROJ_CU,
     )?;
     let out = dev
@@ -679,8 +741,11 @@ pub fn cuda_fused_rms_norm_silu_gate_f32(
         shared_mem_bytes: 0,
     };
     unsafe {
-        f.launch(cfg, (input, gamma, gate, &out, rows as u32, cols as u32, eps))
-            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        f.launch(
+            cfg,
+            (input, gamma, gate, &out, rows as u32, cols as u32, eps),
+        )
+        .map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }
     Ok(out)
 }
@@ -741,9 +806,20 @@ pub fn cuda_dequant_quat_matmul_f32(
 
     let f = get_or_load_func(dev, dev_idx, "dequant_matmul", func_name, DEQUANT_MATMUL_CU)?;
     unsafe {
-        f.launch(cfg, (a_packed, a_scales, b, &out,
-            m as u32, n as u32, k as u32, k_packed as u32))
-            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        f.launch(
+            cfg,
+            (
+                a_packed,
+                a_scales,
+                b,
+                &out,
+                m as u32,
+                n as u32,
+                k as u32,
+                k_packed as u32,
+            ),
+        )
+        .map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }
     Ok(out)
 }
@@ -775,13 +851,28 @@ pub fn cuda_dequant_quat_matmul_bias_relu_f32(
     };
 
     let f = get_or_load_func(
-        dev, dev_idx, "dequant_matmul", "dequant_quat_matmul_bias_relu_f32",
+        dev,
+        dev_idx,
+        "dequant_matmul",
+        "dequant_quat_matmul_bias_relu_f32",
         DEQUANT_MATMUL_CU,
     )?;
     unsafe {
-        f.launch(cfg, (a_packed, a_scales, b, bias, &out,
-            m as u32, n as u32, k as u32, k_packed as u32))
-            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        f.launch(
+            cfg,
+            (
+                a_packed,
+                a_scales,
+                b,
+                bias,
+                &out,
+                m as u32,
+                n as u32,
+                k as u32,
+                k_packed as u32,
+            ),
+        )
+        .map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }
     Ok(out)
 }
@@ -851,8 +942,12 @@ pub fn cuda_mamba3_scan_f32(
     use_rope: bool,
     save_states: bool,
 ) -> Result<MambaScanForwardGpu, CudaError> {
-    assert!(d_state <= MAX_DSTATE,
-        "cuda_mamba3_scan_f32: d_state={} exceeds MAX_DSTATE={}", d_state, MAX_DSTATE);
+    assert!(
+        d_state <= MAX_DSTATE,
+        "cuda_mamba3_scan_f32: d_state={} exceeds MAX_DSTATE={}",
+        d_state,
+        MAX_DSTATE
+    );
 
     let num_chunks = (seq_len + SCAN_CHUNK - 1) / SCAN_CHUNK;
     let state_size = d_state * headdim;
@@ -872,14 +967,18 @@ pub fn cuda_mamba3_scan_f32(
 
     // Allocate per-timestep state buffers if saving for backward
     let h_all_buf = if save_states {
-        Some(dev.alloc_zeros::<u8>(batch * nf * frame * 4)
-            .map_err(|e| CudaError::MemoryError(e.to_string()))?)
+        Some(
+            dev.alloc_zeros::<u8>(batch * nf * frame * 4)
+                .map_err(|e| CudaError::MemoryError(e.to_string()))?,
+        )
     } else {
         None
     };
     let bx_all_buf = if save_states {
-        Some(dev.alloc_zeros::<u8>(batch * nf * frame * 4)
-            .map_err(|e| CudaError::MemoryError(e.to_string()))?)
+        Some(
+            dev.alloc_zeros::<u8>(batch * nf * frame * 4)
+                .map_err(|e| CudaError::MemoryError(e.to_string()))?,
+        )
     } else {
         None
     };
@@ -902,7 +1001,11 @@ pub fn cuda_mamba3_scan_f32(
 
     // Phase 1: Intra-chunk scan
     let f1 = get_or_load_func(
-        dev, dev_idx, "mamba_scan", "mamba3_scan_chunk_f32", MAMBA_SCAN_CU,
+        dev,
+        dev_idx,
+        "mamba_scan",
+        "mamba3_scan_chunk_f32",
+        MAMBA_SCAN_CU,
     )?;
     let total_blocks = batch * nheads * num_chunks;
     let cfg1 = LaunchConfig {
@@ -911,23 +1014,50 @@ pub fn cuda_mamba3_scan_f32(
         shared_mem_bytes: 0,
     };
     unsafe {
-        f1.launch(cfg1, (
-            x, dt, a_real, a_imag, b, c,
-            has_dt_bias, dt_bias_ptr,
-            has_z, z_ptr,
-            has_d_skip, d_skip_ptr,
-            &output, &chunk_last_h, &chunk_last_bx,
-            save_flag, h_all_ptr, bx_all_ptr,
-            batch as u32, seq_len as u32, nheads as u32, headdim as u32,
-            ngroups as u32, d_state as u32, num_chunks as u32,
-            alpha, dt_softplus as u32, use_rope as u32,
-        )).map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        f1.launch(
+            cfg1,
+            (
+                x,
+                dt,
+                a_real,
+                a_imag,
+                b,
+                c,
+                has_dt_bias,
+                dt_bias_ptr,
+                has_z,
+                z_ptr,
+                has_d_skip,
+                d_skip_ptr,
+                &output,
+                &chunk_last_h,
+                &chunk_last_bx,
+                save_flag,
+                h_all_ptr,
+                bx_all_ptr,
+                batch as u32,
+                seq_len as u32,
+                nheads as u32,
+                headdim as u32,
+                ngroups as u32,
+                d_state as u32,
+                num_chunks as u32,
+                alpha,
+                dt_softplus as u32,
+                use_rope as u32,
+            ),
+        )
+        .map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }
 
     // Phase 2: Inter-chunk prefix scan (only if multiple chunks)
     if num_chunks > 1 {
         let f2 = get_or_load_func(
-            dev, dev_idx, "mamba_scan", "mamba3_scan_prefix_f32", MAMBA_SCAN_CU,
+            dev,
+            dev_idx,
+            "mamba_scan",
+            "mamba3_scan_prefix_f32",
+            MAMBA_SCAN_CU,
         )?;
         let prefix_blocks = batch * nheads;
         let cfg2 = LaunchConfig {
@@ -936,13 +1066,25 @@ pub fn cuda_mamba3_scan_f32(
             shared_mem_bytes: 0,
         };
         unsafe {
-            f2.launch(cfg2, (
-                &chunk_last_h, &chunk_last_bx, a_real, dt,
-                has_dt_bias, dt_bias_ptr,
-                batch as u32, seq_len as u32, nheads as u32,
-                state_size as u32, num_chunks as u32,
-                alpha, dt_softplus as u32,
-            )).map_err(|e| CudaError::LaunchError(e.to_string()))?;
+            f2.launch(
+                cfg2,
+                (
+                    &chunk_last_h,
+                    &chunk_last_bx,
+                    a_real,
+                    dt,
+                    has_dt_bias,
+                    dt_bias_ptr,
+                    batch as u32,
+                    seq_len as u32,
+                    nheads as u32,
+                    state_size as u32,
+                    num_chunks as u32,
+                    alpha,
+                    dt_softplus as u32,
+                ),
+            )
+            .map_err(|e| CudaError::LaunchError(e.to_string()))?;
         }
     }
 
@@ -998,9 +1140,22 @@ pub fn cuda_mamba3_scan_backward_f32(
     alpha: f32,
     dt_softplus: bool,
     use_rope: bool,
-) -> Result<(CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>, CudaSlice<u8>), CudaError> {
-    assert!(d_state <= MAX_DSTATE,
-        "cuda_mamba3_scan_backward_f32: d_state={} exceeds MAX_DSTATE={}", d_state, MAX_DSTATE);
+) -> Result<
+    (
+        CudaSlice<u8>,
+        CudaSlice<u8>,
+        CudaSlice<u8>,
+        CudaSlice<u8>,
+        CudaSlice<u8>,
+    ),
+    CudaError,
+> {
+    assert!(
+        d_state <= MAX_DSTATE,
+        "cuda_mamba3_scan_backward_f32: d_state={} exceeds MAX_DSTATE={}",
+        d_state,
+        MAX_DSTATE
+    );
 
     // Allocate gradient output buffers (zeroed — atomicAdd accumulates into these)
     let dx = dev
@@ -1032,7 +1187,11 @@ pub fn cuda_mamba3_scan_backward_f32(
     let total_blocks = batch * nheads;
 
     let f = get_or_load_func(
-        dev, dev_idx, "mamba_scan_backward", "mamba3_scan_backward_f32", MAMBA_SCAN_BWD_CU,
+        dev,
+        dev_idx,
+        "mamba_scan_backward",
+        "mamba3_scan_backward_f32",
+        MAMBA_SCAN_BWD_CU,
     )?;
     let cfg = LaunchConfig {
         grid_dim: (total_blocks as u32, 1, 1),
@@ -1040,17 +1199,41 @@ pub fn cuda_mamba3_scan_backward_f32(
         shared_mem_bytes: 0,
     };
     unsafe {
-        f.launch(cfg, (
-            grad_output, x, dt, a_real, a_imag, b, c,
-            h_all, bx_all,
-            has_dt_bias, dt_bias_ptr,
-            has_z, z_ptr,
-            has_d_skip, d_skip_ptr,
-            &dx, &d_dt, &d_b, &d_c, &dz,
-            batch as u32, seq_len as u32, nheads as u32, headdim as u32,
-            ngroups as u32, d_state as u32,
-            alpha, dt_softplus as u32, use_rope as u32,
-        )).map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        f.launch(
+            cfg,
+            (
+                grad_output,
+                x,
+                dt,
+                a_real,
+                a_imag,
+                b,
+                c,
+                h_all,
+                bx_all,
+                has_dt_bias,
+                dt_bias_ptr,
+                has_z,
+                z_ptr,
+                has_d_skip,
+                d_skip_ptr,
+                &dx,
+                &d_dt,
+                &d_b,
+                &d_c,
+                &dz,
+                batch as u32,
+                seq_len as u32,
+                nheads as u32,
+                headdim as u32,
+                ngroups as u32,
+                d_state as u32,
+                alpha,
+                dt_softplus as u32,
+                use_rope as u32,
+            ),
+        )
+        .map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }
 
     Ok((dx, d_dt, d_b, d_c, dz))

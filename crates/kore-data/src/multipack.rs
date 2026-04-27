@@ -78,7 +78,10 @@ pub struct MultipackSampler {
 impl MultipackSampler {
     /// Create a new MultipackSampler.
     pub fn new(max_seq_len: usize, shuffle: bool) -> Self {
-        Self { max_seq_len, shuffle }
+        Self {
+            max_seq_len,
+            shuffle,
+        }
     }
 
     /// Pack a set of sequences into batches.
@@ -149,7 +152,9 @@ impl MultipackSampler {
     pub fn efficiency(batches: &[PackedBatch], max_seq_len: usize) -> f32 {
         let total_tokens: usize = batches.iter().map(|b| b.tokens.len()).sum();
         let total_capacity = batches.len() * max_seq_len;
-        if total_capacity == 0 { return 0.0; }
+        if total_capacity == 0 {
+            return 0.0;
+        }
         total_tokens as f32 / total_capacity as f32
     }
 }
@@ -162,9 +167,9 @@ mod tests {
     fn test_basic_packing() {
         let sampler = MultipackSampler::new(10, false);
         let sequences = vec![
-            vec![1, 2, 3],       // len 3
-            vec![4, 5, 6, 7],    // len 4
-            vec![8, 9],          // len 2
+            vec![1, 2, 3],    // len 3
+            vec![4, 5, 6, 7], // len 4
+            vec![8, 9],       // len 2
         ];
 
         let batches = sampler.pack(&sequences);
@@ -178,9 +183,9 @@ mod tests {
     fn test_multiple_bins() {
         let sampler = MultipackSampler::new(5, false);
         let sequences = vec![
-            vec![1, 2, 3],    // len 3
-            vec![4, 5, 6],    // len 3
-            vec![7, 8, 9],    // len 3
+            vec![1, 2, 3], // len 3
+            vec![4, 5, 6], // len 3
+            vec![7, 8, 9], // len 3
         ];
 
         let batches = sampler.pack(&sequences);
@@ -194,12 +199,7 @@ mod tests {
     #[test]
     fn test_packing_efficiency() {
         let sampler = MultipackSampler::new(10, false);
-        let sequences = vec![
-            vec![1; 5],
-            vec![2; 5],
-            vec![3; 3],
-            vec![4; 2],
-        ];
+        let sequences = vec![vec![1; 5], vec![2; 5], vec![3; 3], vec![4; 2]];
 
         let batches = sampler.pack(&sequences);
         let eff = MultipackSampler::efficiency(&batches, 10);
@@ -246,12 +246,7 @@ mod tests {
     #[test]
     fn test_empty_sequences_skipped() {
         let sampler = MultipackSampler::new(10, false);
-        let sequences = vec![
-            vec![],
-            vec![1, 2],
-            vec![],
-            vec![3],
-        ];
+        let sequences = vec![vec![], vec![1, 2], vec![], vec![3]];
 
         let batches = sampler.pack(&sequences);
         let total_tokens: usize = batches.iter().map(|b| b.tokens.len()).sum();

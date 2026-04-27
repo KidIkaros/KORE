@@ -85,7 +85,10 @@ pub fn device_count() -> usize {
 /// Synchronize the current HIP device (wait for all pending operations).
 pub fn device_synchronize() -> Result<(), RocmError> {
     let api = ffi::hip_api().ok_or(RocmError::NotAvailable)?;
-    check_hip(unsafe { (api.hip_device_synchronize)() }, "hipDeviceSynchronize")
+    check_hip(
+        unsafe { (api.hip_device_synchronize)() },
+        "hipDeviceSynchronize",
+    )
 }
 
 /// ROCm-specific errors.

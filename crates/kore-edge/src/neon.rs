@@ -43,8 +43,13 @@ pub fn neon_matmul_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, 
 /// NEON-accelerated ternary matmul.
 #[cfg(target_arch = "aarch64")]
 pub fn neon_matmul_ternary(
-    a_packed: &[u8], a_scales: &[f32], b: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
+    a_packed: &[u8],
+    a_scales: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) {
     let k_packed = (k + 4) / 5;
 
@@ -56,7 +61,9 @@ pub fn neon_matmul_ternary(
         for &byte in a_row {
             let decoded = decode_trits(byte);
             for &t in &decoded {
-                if trits.len() >= k { break; }
+                if trits.len() >= k {
+                    break;
+                }
                 trits.push(t as i8);
             }
         }
@@ -81,8 +88,13 @@ pub fn neon_matmul_ternary(
 /// using NEON f32x4 SIMD for 4 columns at a time.
 #[cfg(target_arch = "aarch64")]
 pub fn neon_matmul_quaternary(
-    a_packed: &[u8], a_scales: &[f32], b: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
+    a_packed: &[u8],
+    a_scales: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) {
     const QUAT_VALUES: [f32; 4] = [-3.0, -1.0, 1.0, 3.0];
     let k_packed = (k + 3) / 4;
@@ -201,11 +213,27 @@ pub fn neon_matmul_f32(_a: &[f32], _b: &[f32], _c: &mut [f32], _m: usize, _n: us
     unreachable!("NEON not available on this architecture");
 }
 #[cfg(not(target_arch = "aarch64"))]
-pub fn neon_matmul_ternary(_a: &[u8], _s: &[f32], _b: &[f32], _c: &mut [f32], _m: usize, _n: usize, _k: usize) {
+pub fn neon_matmul_ternary(
+    _a: &[u8],
+    _s: &[f32],
+    _b: &[f32],
+    _c: &mut [f32],
+    _m: usize,
+    _n: usize,
+    _k: usize,
+) {
     unreachable!("NEON not available on this architecture");
 }
 #[cfg(not(target_arch = "aarch64"))]
-pub fn neon_matmul_quaternary(_a: &[u8], _s: &[f32], _b: &[f32], _c: &mut [f32], _m: usize, _n: usize, _k: usize) {
+pub fn neon_matmul_quaternary(
+    _a: &[u8],
+    _s: &[f32],
+    _b: &[f32],
+    _c: &mut [f32],
+    _m: usize,
+    _n: usize,
+    _k: usize,
+) {
     unreachable!("NEON not available on this architecture");
 }
 #[cfg(not(target_arch = "aarch64"))]

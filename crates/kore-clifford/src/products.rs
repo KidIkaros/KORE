@@ -189,7 +189,9 @@ mod tests {
             assert!(
                 (geo.coeffs[i] - sum.coeffs[i]).abs() < 1e-5,
                 "Mismatch at blade {}: geo={}, sum={}",
-                i, geo.coeffs[i], sum.coeffs[i]
+                i,
+                geo.coeffs[i],
+                sum.coeffs[i]
             );
         }
     }

@@ -41,7 +41,11 @@ pub fn sandwich(alg: &CliffordAlgebra, rotor: &Multivector, mv: &Multivector) ->
 /// R = cos(θ/2) - sin(θ/2) * B̂
 ///
 /// This implements the Taylor series for small algebras.
-pub fn rotor_from_bivector(alg: &CliffordAlgebra, bivector: &Multivector, angle: f32) -> Multivector {
+pub fn rotor_from_bivector(
+    alg: &CliffordAlgebra,
+    bivector: &Multivector,
+    angle: f32,
+) -> Multivector {
     let half_angle = angle / 2.0;
 
     // Compute B² to determine if it's a simple bivector
@@ -116,7 +120,9 @@ mod tests {
             assert!(
                 (result.coeffs[i] - v.coeffs[i]).abs() < 1e-5,
                 "Mismatch at {}: {} vs {}",
-                i, result.coeffs[i], v.coeffs[i]
+                i,
+                result.coeffs[i],
+                v.coeffs[i]
             );
         }
     }
@@ -159,8 +165,16 @@ mod tests {
         let rotated = sandwich(&alg, &rotor, &e1);
 
         // Should be approximately e2
-        assert!(rotated.coeffs[0b01].abs() < 0.1, "e1 component: {}", rotated.coeffs[0b01]);
-        assert!((rotated.coeffs[0b10].abs() - 1.0).abs() < 0.1, "e2 component: {}", rotated.coeffs[0b10]);
+        assert!(
+            rotated.coeffs[0b01].abs() < 0.1,
+            "e1 component: {}",
+            rotated.coeffs[0b01]
+        );
+        assert!(
+            (rotated.coeffs[0b10].abs() - 1.0).abs() < 0.1,
+            "e2 component: {}",
+            rotated.coeffs[0b10]
+        );
     }
 
     #[test]

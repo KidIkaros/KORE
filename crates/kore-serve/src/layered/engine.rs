@@ -7,18 +7,18 @@
 
 use std::sync::Arc;
 
-use kore_core::{DType, Tensor};
 use kore_core::storage::Storage;
+use kore_core::{DType, Tensor};
 use kore_nn::embedding::Embedding;
 use kore_nn::linear::Linear;
 use kore_nn::module::Module;
 use kore_nn::rms_norm::RMSNorm;
 use kore_nn::sampler::{self, Rng, SamplerConfig};
 
-use crate::state::InferenceModel;
 use super::cache::{LayerCache, LayerWeights};
 use super::config::LayeredConfig;
 use super::prefetcher::LayerPrefetcher;
+use crate::state::InferenceModel;
 
 /// KV cache for autoregressive generation.
 ///
@@ -44,7 +44,12 @@ struct KvCacheLayer {
 
 impl KvCacheLayer {
     fn new() -> Self {
-        Self { k_buf: Vec::new(), v_buf: Vec::new(), len: 0, dim: 0 }
+        Self {
+            k_buf: Vec::new(),
+            v_buf: Vec::new(),
+            len: 0,
+            dim: 0,
+        }
     }
 
     /// Ensure the buffer is allocated for the given max_seq_len and dim.
@@ -66,7 +71,8 @@ impl KvCacheLayer {
         if end > self.k_buf.len() {
             return Err(format!(
                 "KV cache overflow: need {} but capacity is {} (max_seq_len exceeded)",
-                end, self.k_buf.len()
+                end,
+                self.k_buf.len()
             ));
         }
         self.k_buf[offset..end].copy_from_slice(&k_data[..n]);
@@ -110,7 +116,12 @@ impl KvCache {
     /// buffer without allocating.
     ///
     /// Returns tensors covering all cached positions for this layer.
-    pub fn update(&mut self, layer: usize, new_k: Tensor, new_v: Tensor) -> Result<(Tensor, Tensor), String> {
+    pub fn update(
+        &mut self,
+        layer: usize,
+        new_k: Tensor,
+        new_v: Tensor,
+    ) -> Result<(Tensor, Tensor), String> {
         let dims = new_k.shape().dims();
         if dims.len() != 2 {
             return Err(format!(
@@ -266,7 +277,11 @@ impl LayeredEngine {
         drop(embed_weights);
         prefetcher.release(0);
 
-        tracing::debug!("embed → shape {:?}, start_pos={}", hidden.shape().dims(), start_pos);
+        tracing::debug!(
+            "embed → shape {:?}, start_pos={}",
+            hidden.shape().dims(),
+            start_pos
+        );
 
         // ── 2. Transformer layers ─────────────────────────────────
         let mut hidden = hidden;
@@ -305,7 +320,8 @@ impl LayeredEngine {
         prefetcher.release(head_idx);
 
         // Return logits for the last token position
-        let logits_data = logits.as_f32_slice()
+        let logits_data = logits
+            .as_f32_slice()
             .ok_or("failed to read logits as f32")?;
 
         let seq_len = input_ids.len();
@@ -390,9 +406,7 @@ impl InferenceModel for LayeredEngine {
 /// the async executor. Otherwise, creates a temporary runtime for the load.
 fn load_layer_sync(prefetcher: &LayerPrefetcher, idx: usize) -> Result<LayerWeights, String> {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            tokio::task::block_in_place(|| handle.block_on(prefetcher.get_layer(idx)))
-        }
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(prefetcher.get_layer(idx))),
         Err(_) => {
             // No active runtime — spin up a lightweight one for this call.
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -412,7 +426,10 @@ fn bytes_to_tensor_f32(data: &[u8], shape: &[usize]) -> Result<Tensor, String> {
     if data.len() != expected_bytes {
         return Err(format!(
             "weight size mismatch: expected {} bytes ({} f32s for shape {:?}), got {}",
-            expected_bytes, expected_numel, shape, data.len()
+            expected_bytes,
+            expected_numel,
+            shape,
+            data.len()
         ));
     }
 
@@ -423,7 +440,8 @@ fn bytes_to_tensor_f32(data: &[u8], shape: &[usize]) -> Result<Tensor, String> {
 
 /// Find a weight tensor by suffix in layer weights (e.g. "weight", "self_attn.q_proj.weight").
 fn find_weight<'a>(weights: &'a LayerWeights, suffix: &str) -> Option<&'a Vec<u8>> {
-    weights.iter()
+    weights
+        .iter()
         .find(|(name, _)| name.ends_with(suffix))
         .map(|(_, data)| data)
 }
@@ -434,8 +452,7 @@ fn apply_embedding(
     input_ids: &[usize],
     d_model: usize,
 ) -> Result<Tensor, String> {
-    let w_data = find_weight(weights, "weight")
-        .ok_or("embedding: missing 'weight' tensor")?;
+    let w_data = find_weight(weights, "weight").ok_or("embedding: missing 'weight' tensor")?;
 
     let num_embeddings = w_data.len() / (d_model * 4); // f32 = 4 bytes
     let w_tensor = bytes_to_tensor_f32(w_data, &[num_embeddings, d_model])?;
@@ -463,18 +480,50 @@ fn apply_transformer_block(
 
     // ── Pre-attention norm ─────────────────────────────────────
     let attn_norm = build_rms_norm(weights, "input_layernorm.weight", d, eps)?;
-    let normed = attn_norm.forward(hidden).map_err(|e| format!("attn norm: {e}"))?;
+    let normed = attn_norm
+        .forward(hidden)
+        .map_err(|e| format!("attn norm: {e}"))?;
 
     // ── Self-attention with multi-head GQA, RoPE, and KV cache ──
-    let q_proj = build_linear(weights, "self_attn.q_proj.weight", "self_attn.q_proj.bias", d, n_heads * head_dim)?;
-    let k_proj = build_linear(weights, "self_attn.k_proj.weight", "self_attn.k_proj.bias", d, n_kv_heads * head_dim)?;
-    let v_proj = build_linear(weights, "self_attn.v_proj.weight", "self_attn.v_proj.bias", d, n_kv_heads * head_dim)?;
-    let o_proj = build_linear(weights, "self_attn.o_proj.weight", "self_attn.o_proj.bias", n_heads * head_dim, d)?;
+    let q_proj = build_linear(
+        weights,
+        "self_attn.q_proj.weight",
+        "self_attn.q_proj.bias",
+        d,
+        n_heads * head_dim,
+    )?;
+    let k_proj = build_linear(
+        weights,
+        "self_attn.k_proj.weight",
+        "self_attn.k_proj.bias",
+        d,
+        n_kv_heads * head_dim,
+    )?;
+    let v_proj = build_linear(
+        weights,
+        "self_attn.v_proj.weight",
+        "self_attn.v_proj.bias",
+        d,
+        n_kv_heads * head_dim,
+    )?;
+    let o_proj = build_linear(
+        weights,
+        "self_attn.o_proj.weight",
+        "self_attn.o_proj.bias",
+        n_heads * head_dim,
+        d,
+    )?;
 
     // Project: [seq_len, d] → Q:[seq_len, n_heads*hd], K:[seq_len, n_kv*hd], V:[seq_len, n_kv*hd]
-    let q_full = q_proj.forward(&normed).map_err(|e| format!("q_proj: {e}"))?;
-    let k_new = k_proj.forward(&normed).map_err(|e| format!("k_proj: {e}"))?;
-    let v_new = v_proj.forward(&normed).map_err(|e| format!("v_proj: {e}"))?;
+    let q_full = q_proj
+        .forward(&normed)
+        .map_err(|e| format!("q_proj: {e}"))?;
+    let k_new = k_proj
+        .forward(&normed)
+        .map_err(|e| format!("k_proj: {e}"))?;
+    let v_new = v_proj
+        .forward(&normed)
+        .map_err(|e| format!("v_proj: {e}"))?;
 
     let seq_len = hidden.shape().dims()[0];
 
@@ -484,10 +533,12 @@ fn apply_transformer_block(
     let v_new_heads = split_heads(&v_new, n_kv_heads, head_dim, seq_len);
 
     // Apply RoPE to Q and K heads (using pre-computed inverse frequencies)
-    let q_heads: Vec<Tensor> = q_heads.into_iter()
+    let q_heads: Vec<Tensor> = q_heads
+        .into_iter()
         .map(|h| apply_rope(&h, start_pos, head_dim, rope_inv_freq))
         .collect();
-    let k_new_heads: Vec<Tensor> = k_new_heads.into_iter()
+    let k_new_heads: Vec<Tensor> = k_new_heads
+        .into_iter()
         .map(|h| apply_rope(&h, start_pos, head_dim, rope_inv_freq))
         .collect();
 
@@ -510,13 +561,17 @@ fn apply_transformer_block(
 
     for (h, q_h) in q_heads.iter().enumerate() {
         let kv_idx = h / heads_per_kv;
-        let k_h = &k_heads[kv_idx];    // [full_seq_len, head_dim]
-        let v_h = &v_heads[kv_idx];    // [full_seq_len, head_dim]
+        let k_h = &k_heads[kv_idx]; // [full_seq_len, head_dim]
+        let v_h = &v_heads[kv_idx]; // [full_seq_len, head_dim]
 
         // scores = Q · K^T / sqrt(head_dim)  →  [seq_len, full_seq_len]
-        let k_t = k_h.transpose().map_err(|e| format!("k transpose h{h}: {e}"))?;
+        let k_t = k_h
+            .transpose()
+            .map_err(|e| format!("k transpose h{h}: {e}"))?;
         let scores = q_h.matmul(&k_t).map_err(|e| format!("QK h{h}: {e}"))?;
-        let scores = scores.mul_scalar(scale).map_err(|e| format!("scale h{h}: {e}"))?;
+        let scores = scores
+            .mul_scalar(scale)
+            .map_err(|e| format!("scale h{h}: {e}"))?;
 
         // Causal mask (only needed during prefill when seq_len > 1)
         let scores = if seq_len > 1 {
@@ -525,8 +580,12 @@ fn apply_transformer_block(
             scores
         };
 
-        let weights = scores.softmax(-1).map_err(|e| format!("softmax h{h}: {e}"))?;
-        let out = weights.matmul(v_h).map_err(|e| format!("attn·V h{h}: {e}"))?;
+        let weights = scores
+            .softmax(-1)
+            .map_err(|e| format!("softmax h{h}: {e}"))?;
+        let out = weights
+            .matmul(v_h)
+            .map_err(|e| format!("attn·V h{h}: {e}"))?;
         attn_outputs.push(out);
     }
 
@@ -534,27 +593,61 @@ fn apply_transformer_block(
     let attn_concat = concat_heads(&attn_outputs, seq_len, n_heads, head_dim);
 
     // Output projection
-    let attn_projected = o_proj.forward(&attn_concat).map_err(|e| format!("o_proj: {e}"))?;
+    let attn_projected = o_proj
+        .forward(&attn_concat)
+        .map_err(|e| format!("o_proj: {e}"))?;
 
     // Residual connection
-    let hidden_post_attn = hidden.add(&attn_projected).map_err(|e| format!("attn residual: {e}"))?;
+    let hidden_post_attn = hidden
+        .add(&attn_projected)
+        .map_err(|e| format!("attn residual: {e}"))?;
 
     // ── Post-attention norm + SwiGLU MLP ──────────────────────
     let mlp_norm = build_rms_norm(weights, "post_attention_layernorm.weight", d, eps)?;
-    let normed_mlp = mlp_norm.forward(&hidden_post_attn).map_err(|e| format!("mlp norm: {e}"))?;
+    let normed_mlp = mlp_norm
+        .forward(&hidden_post_attn)
+        .map_err(|e| format!("mlp norm: {e}"))?;
 
-    let gate_proj = build_linear(weights, "mlp.gate_proj.weight", "mlp.gate_proj.bias", d, intermediate)?;
-    let up_proj = build_linear(weights, "mlp.up_proj.weight", "mlp.up_proj.bias", d, intermediate)?;
-    let down_proj = build_linear(weights, "mlp.down_proj.weight", "mlp.down_proj.bias", intermediate, d)?;
+    let gate_proj = build_linear(
+        weights,
+        "mlp.gate_proj.weight",
+        "mlp.gate_proj.bias",
+        d,
+        intermediate,
+    )?;
+    let up_proj = build_linear(
+        weights,
+        "mlp.up_proj.weight",
+        "mlp.up_proj.bias",
+        d,
+        intermediate,
+    )?;
+    let down_proj = build_linear(
+        weights,
+        "mlp.down_proj.weight",
+        "mlp.down_proj.bias",
+        intermediate,
+        d,
+    )?;
 
-    let gate = gate_proj.forward(&normed_mlp).map_err(|e| format!("gate: {e}"))?;
-    let up = up_proj.forward(&normed_mlp).map_err(|e| format!("up: {e}"))?;
+    let gate = gate_proj
+        .forward(&normed_mlp)
+        .map_err(|e| format!("gate: {e}"))?;
+    let up = up_proj
+        .forward(&normed_mlp)
+        .map_err(|e| format!("up: {e}"))?;
 
     let gate_activated = silu(&gate);
-    let mlp_inner = gate_activated.mul(&up).map_err(|e| format!("gate*up: {e}"))?;
-    let mlp_out = down_proj.forward(&mlp_inner).map_err(|e| format!("down: {e}"))?;
+    let mlp_inner = gate_activated
+        .mul(&up)
+        .map_err(|e| format!("gate*up: {e}"))?;
+    let mlp_out = down_proj
+        .forward(&mlp_inner)
+        .map_err(|e| format!("down: {e}"))?;
 
-    hidden_post_attn.add(&mlp_out).map_err(|e| format!("mlp residual: {e}"))
+    hidden_post_attn
+        .add(&mlp_out)
+        .map_err(|e| format!("mlp residual: {e}"))
 }
 
 // ============================================================================
@@ -566,14 +659,16 @@ fn apply_transformer_block(
 fn split_heads(tensor: &Tensor, n_heads: usize, head_dim: usize, seq_len: usize) -> Vec<Tensor> {
     let data = tensor.as_f32_slice().expect("split_heads: F32 required");
     let total_dim = n_heads * head_dim;
-    (0..n_heads).map(|h| {
-        let mut head_data = Vec::with_capacity(seq_len * head_dim);
-        for pos in 0..seq_len {
-            let start = pos * total_dim + h * head_dim;
-            head_data.extend_from_slice(&data[start..start + head_dim]);
-        }
-        Tensor::from_f32(&head_data, &[seq_len, head_dim])
-    }).collect()
+    (0..n_heads)
+        .map(|h| {
+            let mut head_data = Vec::with_capacity(seq_len * head_dim);
+            for pos in 0..seq_len {
+                let start = pos * total_dim + h * head_dim;
+                head_data.extend_from_slice(&data[start..start + head_dim]);
+            }
+            Tensor::from_f32(&head_data, &[seq_len, head_dim])
+        })
+        .collect()
 }
 
 /// Concatenate per-head tensors `[seq_len, head_dim]` back into
@@ -661,7 +756,10 @@ fn apply_rms_norm_from_weights(
     hidden: &Tensor,
     eps: f32,
 ) -> Result<Tensor, String> {
-    let d = hidden.shape().dims().last()
+    let d = hidden
+        .shape()
+        .dims()
+        .last()
         .copied()
         .ok_or("empty hidden shape")?;
     let norm = build_rms_norm(weights, "weight", d, eps)?;
@@ -669,14 +767,13 @@ fn apply_rms_norm_from_weights(
 }
 
 /// Apply lm_head linear projection from raw weight bytes.
-fn apply_lm_head(
-    weights: &LayerWeights,
-    hidden: &Tensor,
-) -> Result<Tensor, String> {
-    let w_data = find_weight(weights, "weight")
-        .ok_or("lm_head: missing 'weight' tensor")?;
+fn apply_lm_head(weights: &LayerWeights, hidden: &Tensor) -> Result<Tensor, String> {
+    let w_data = find_weight(weights, "weight").ok_or("lm_head: missing 'weight' tensor")?;
 
-    let d_model = hidden.shape().dims().last()
+    let d_model = hidden
+        .shape()
+        .dims()
+        .last()
         .copied()
         .ok_or("empty hidden shape for lm_head")?;
     let vocab_size = w_data.len() / (d_model * 4);
@@ -689,7 +786,9 @@ fn apply_lm_head(
     };
 
     let linear = Linear::from_weight(w, bias);
-    linear.forward(hidden).map_err(|e| format!("lm_head forward: {e}"))
+    linear
+        .forward(hidden)
+        .map_err(|e| format!("lm_head forward: {e}"))
 }
 
 // ============================================================================
@@ -702,8 +801,8 @@ fn build_rms_norm(
     dim: usize,
     eps: f32,
 ) -> Result<RMSNorm, String> {
-    let w_data = find_weight(weights, suffix)
-        .ok_or_else(|| format!("missing norm weight '{suffix}'"))?;
+    let w_data =
+        find_weight(weights, suffix).ok_or_else(|| format!("missing norm weight '{suffix}'"))?;
     let gamma = bytes_to_tensor_f32(w_data, &[dim])?;
     Ok(RMSNorm::from_weight(gamma, eps))
 }
@@ -728,7 +827,8 @@ fn build_linear(
 /// SiLU activation: x * sigmoid(x), numerically stable for large |x|.
 fn silu(x: &Tensor) -> Tensor {
     let data = x.as_f32_slice().expect("silu: input must be F32");
-    let result: Vec<f32> = data.iter()
+    let result: Vec<f32> = data
+        .iter()
         .map(|&v| {
             if v >= 0.0 {
                 v / (1.0 + (-v).exp())
@@ -750,7 +850,12 @@ mod tests {
     fn test_engine_rejects_missing_shard_dir() {
         let config = LayeredConfig::llama(
             PathBuf::from("/nonexistent/path"),
-            32, 4096, 32000, 32, 32, 11008,
+            32,
+            4096,
+            32000,
+            32,
+            32,
+            11008,
         );
         let result = LayeredEngine::new(config);
         assert!(result.is_err());
@@ -839,12 +944,29 @@ mod tests {
         // RoPE is a rotation, so it should preserve the L2 norm
         let inv_freq = precompute_rope_inv_freq(4, 10000.0);
         let x = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
-        let norm_before: f32 = x.as_f32_slice().unwrap().iter().map(|v| v * v).sum::<f32>().sqrt();
+        let norm_before: f32 = x
+            .as_f32_slice()
+            .unwrap()
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt();
 
         let rotated = apply_rope(&x, 42, 4, &inv_freq);
-        let norm_after: f32 = rotated.as_f32_slice().unwrap().iter().map(|v| v * v).sum::<f32>().sqrt();
+        let norm_after: f32 = rotated
+            .as_f32_slice()
+            .unwrap()
+            .iter()
+            .map(|v| v * v)
+            .sum::<f32>()
+            .sqrt();
 
-        assert!((norm_before - norm_after).abs() < 1e-4, "RoPE should preserve norm: {} vs {}", norm_before, norm_after);
+        assert!(
+            (norm_before - norm_after).abs() < 1e-4,
+            "RoPE should preserve norm: {} vs {}",
+            norm_before,
+            norm_after
+        );
     }
 
     #[test]
@@ -863,7 +985,7 @@ mod tests {
     fn test_precompute_rope_inv_freq() {
         let inv_freq = precompute_rope_inv_freq(8, 10000.0);
         assert_eq!(inv_freq.len(), 4); // head_dim/2
-        // First freq = 1 / 10000^0 = 1.0
+                                       // First freq = 1 / 10000^0 = 1.0
         assert!((inv_freq[0] - 1.0).abs() < 1e-6);
         // Each subsequent freq should be smaller
         for i in 1..inv_freq.len() {

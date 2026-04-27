@@ -10,10 +10,10 @@
 //! - Float → ternary/quaternary quantization
 
 pub mod encoder;
+pub mod memory;
 pub mod packing;
 pub mod quantize;
 pub mod vtalu;
-pub mod memory;
 
-pub use vtalu::TernaryWord64;
 pub use memory::TernaryFrame;
+pub use vtalu::TernaryWord64;

@@ -58,8 +58,12 @@ pub struct MulBackward {
 impl GradFn for MulBackward {
     fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // d/da (a*b) = b, d/db (a*b) = a
-        let grad_a = grad_output.mul(&self.rhs).expect("MulBackward grad_a failed");
-        let grad_b = grad_output.mul(&self.lhs).expect("MulBackward grad_b failed");
+        let grad_a = grad_output
+            .mul(&self.rhs)
+            .expect("MulBackward grad_a failed");
+        let grad_b = grad_output
+            .mul(&self.lhs)
+            .expect("MulBackward grad_b failed");
         vec![Some(grad_a), Some(grad_b)]
     }
 
@@ -77,11 +81,22 @@ pub struct MatmulBackward {
 
 impl GradFn for MatmulBackward {
     fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
-        let rhs_t = self.rhs.transpose().expect("MatmulBackward rhs transpose failed");
-        let lhs_t = self.lhs.transpose().expect("MatmulBackward lhs transpose failed");
+        let rhs_t = self
+            .rhs
+            .transpose()
+            .expect("MatmulBackward rhs transpose failed");
+        let lhs_t = self
+            .lhs
+            .transpose()
+            .expect("MatmulBackward lhs transpose failed");
 
-        let grad_a = grad_output.matmul(&rhs_t.contiguous()).expect("MatmulBackward grad_a failed");
-        let grad_b = lhs_t.contiguous().matmul(grad_output).expect("MatmulBackward grad_b failed");
+        let grad_a = grad_output
+            .matmul(&rhs_t.contiguous())
+            .expect("MatmulBackward grad_a failed");
+        let grad_b = lhs_t
+            .contiguous()
+            .matmul(grad_output)
+            .expect("MatmulBackward grad_b failed");
 
         vec![Some(grad_a), Some(grad_b)]
     }
@@ -99,7 +114,12 @@ pub struct ReluBackward {
 impl GradFn for ReluBackward {
     fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // grad * (input > 0)
-        let mask = self.input.gt(&Tensor::zeros(self.input.shape().dims(), self.input.dtype()))
+        let mask = self
+            .input
+            .gt(&Tensor::zeros(
+                self.input.shape().dims(),
+                self.input.dtype(),
+            ))
             .expect("ReluBackward mask failed");
         let grad = grad_output.mul(&mask).expect("ReluBackward mul failed");
         vec![Some(grad)]
@@ -157,7 +177,9 @@ pub struct ExpBackward {
 impl GradFn for ExpBackward {
     fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // d/dx exp(x) = exp(x)
-        let grad = grad_output.mul(&self.output).expect("ExpBackward mul failed");
+        let grad = grad_output
+            .mul(&self.output)
+            .expect("ExpBackward mul failed");
         vec![Some(grad)]
     }
 
@@ -174,7 +196,10 @@ pub struct LogBackward {
 impl GradFn for LogBackward {
     fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // d/dx ln(x) = 1/x
-        let recip = self.input.reciprocal().expect("LogBackward reciprocal failed");
+        let recip = self
+            .input
+            .reciprocal()
+            .expect("LogBackward reciprocal failed");
         let grad = grad_output.mul(&recip).expect("LogBackward mul failed");
         vec![Some(grad)]
     }
@@ -193,8 +218,14 @@ mod tests {
         let grad = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3]);
         let grads = AddBackward.apply(&grad);
         assert_eq!(grads.len(), 2);
-        assert_eq!(grads[0].as_ref().unwrap().as_f32_slice().unwrap(), &[1.0, 2.0, 3.0]);
-        assert_eq!(grads[1].as_ref().unwrap().as_f32_slice().unwrap(), &[1.0, 2.0, 3.0]);
+        assert_eq!(
+            grads[0].as_ref().unwrap().as_f32_slice().unwrap(),
+            &[1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            grads[1].as_ref().unwrap().as_f32_slice().unwrap(),
+            &[1.0, 2.0, 3.0]
+        );
     }
 
     #[test]
@@ -206,8 +237,14 @@ mod tests {
         let grad = Tensor::from_f32(&[1.0, 1.0], &[2]);
         let grads = bw.apply(&grad);
         // grad_a = grad * b = [4, 5], grad_b = grad * a = [2, 3]
-        assert_eq!(grads[0].as_ref().unwrap().as_f32_slice().unwrap(), &[4.0, 5.0]);
-        assert_eq!(grads[1].as_ref().unwrap().as_f32_slice().unwrap(), &[2.0, 3.0]);
+        assert_eq!(
+            grads[0].as_ref().unwrap().as_f32_slice().unwrap(),
+            &[4.0, 5.0]
+        );
+        assert_eq!(
+            grads[1].as_ref().unwrap().as_f32_slice().unwrap(),
+            &[2.0, 3.0]
+        );
     }
 
     #[test]
@@ -228,7 +265,9 @@ mod tests {
 
     #[test]
     fn test_sum_backward() {
-        let bw = SumBackward { input_shape: vec![2, 3] };
+        let bw = SumBackward {
+            input_shape: vec![2, 3],
+        };
         let grad = Tensor::scalar(1.0);
         let grads = bw.apply(&grad);
         let g = grads[0].as_ref().unwrap();

@@ -17,10 +17,10 @@
 //! - SSE streaming for token-by-token generation
 
 pub mod api;
-pub mod server;
 pub mod health;
-pub mod state;
 pub mod layered;
+pub mod server;
+pub mod state;
 
-pub use state::InferenceModel;
 pub use layered::LayeredEngine;
+pub use state::InferenceModel;

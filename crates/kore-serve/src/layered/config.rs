@@ -1,7 +1,7 @@
 //! Configuration for layered (sharded) inference.
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Configuration for layered inference.
 ///
@@ -61,8 +61,15 @@ pub struct LayeredConfig {
 
 impl LayeredConfig {
     /// Create a config for a LLaMA-style model.
-    pub fn llama(shard_dir: PathBuf, num_layers: usize, d_model: usize, vocab_size: usize,
-                 num_heads: usize, num_kv_heads: usize, intermediate_size: usize) -> Self {
+    pub fn llama(
+        shard_dir: PathBuf,
+        num_layers: usize,
+        d_model: usize,
+        vocab_size: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        intermediate_size: usize,
+    ) -> Self {
         Self {
             shard_dir,
             num_layers,
@@ -94,19 +101,24 @@ impl LayeredConfig {
         let d_model = json.get("hidden_size")?.as_u64()? as usize;
         let vocab_size = json.get("vocab_size")?.as_u64()? as usize;
         let num_heads = json.get("num_attention_heads")?.as_u64()? as usize;
-        let num_kv_heads = json.get("num_key_value_heads")
+        let num_kv_heads = json
+            .get("num_key_value_heads")
             .and_then(|v| v.as_u64())
             .unwrap_or(num_heads as u64) as usize;
-        let intermediate_size = json.get("intermediate_size")
+        let intermediate_size = json
+            .get("intermediate_size")
             .and_then(|v| v.as_u64())
             .unwrap_or(d_model as u64 * 4) as usize;
-        let max_seq_len = json.get("max_position_embeddings")
+        let max_seq_len = json
+            .get("max_position_embeddings")
             .and_then(|v| v.as_u64())
             .unwrap_or(2048) as usize;
-        let norm_eps = json.get("rms_norm_eps")
+        let norm_eps = json
+            .get("rms_norm_eps")
             .and_then(|v| v.as_f64())
             .unwrap_or(1e-5) as f32;
-        let rope_theta = json.get("rope_theta")
+        let rope_theta = json
+            .get("rope_theta")
             .and_then(|v| v.as_f64())
             .unwrap_or(10000.0) as f32;
 

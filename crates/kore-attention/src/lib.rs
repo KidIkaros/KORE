@@ -9,7 +9,7 @@
 //! - Causal and sliding window masks
 //! - Grouped-query attention (GQA/MQA)
 
-pub mod scaled_dot;
 pub mod flash;
 pub mod kv_cache;
 pub mod mask;
+pub mod scaled_dot;

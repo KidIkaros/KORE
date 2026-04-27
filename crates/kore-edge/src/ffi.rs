@@ -140,10 +140,14 @@ pub unsafe extern "C" fn kore_edge_free_output(output: *mut KoreOutput) {
     if !output.is_null() {
         let out = Box::from_raw(output);
         if !out.tokens.is_null() {
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(out.tokens, out.token_count) as *mut [u32]);
+            let _ = Box::from_raw(
+                std::slice::from_raw_parts_mut(out.tokens, out.token_count) as *mut [u32]
+            );
         }
         if !out.logits.is_null() {
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(out.logits, out.logit_count) as *mut [f32]);
+            let _ = Box::from_raw(
+                std::slice::from_raw_parts_mut(out.logits, out.logit_count) as *mut [f32]
+            );
         }
     }
 }

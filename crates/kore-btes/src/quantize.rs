@@ -1,6 +1,6 @@
 //! Float → ternary/quaternary quantization with per-row scaling.
 
-use crate::encoder::{Trit, Quat};
+use crate::encoder::{Quat, Trit};
 
 /// Quantize f32 weights to ternary {-1, 0, +1} with a threshold.
 ///
@@ -71,8 +71,8 @@ mod tests {
         let weights = vec![0.9, -0.8, 0.01, 0.5, -0.3];
         let (trits, scale) = quantize_ternary(&weights, 0.3);
 
-        assert_eq!(trits[0], Trit::Pos);  // 0.9/0.9 = 1.0 > 0.3
-        assert_eq!(trits[1], Trit::Neg);  // -0.8/0.9 ≈ -0.89 < -0.3
+        assert_eq!(trits[0], Trit::Pos); // 0.9/0.9 = 1.0 > 0.3
+        assert_eq!(trits[1], Trit::Neg); // -0.8/0.9 ≈ -0.89 < -0.3
         assert_eq!(trits[2], Trit::Zero); // 0.01/0.9 ≈ 0.01, within threshold
         assert!(scale > 0.0);
     }

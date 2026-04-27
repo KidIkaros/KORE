@@ -1,6 +1,6 @@
 //! Packing utilities for ternary and quaternary data.
 
-use crate::encoder::{Trit, Quat, encode_trits, decode_trits, pack_quats, unpack_quats};
+use crate::encoder::{decode_trits, encode_trits, pack_quats, unpack_quats, Quat, Trit};
 
 /// Pack a slice of trits into bytes using base-243 encoding.
 /// 5 trits per byte, ~95% storage efficiency.
@@ -75,8 +75,14 @@ mod tests {
     #[test]
     fn test_ternary_pack_roundtrip() {
         let trits = vec![
-            Trit::Pos, Trit::Neg, Trit::Zero, Trit::Pos, Trit::Neg,
-            Trit::Zero, Trit::Pos, Trit::Pos,
+            Trit::Pos,
+            Trit::Neg,
+            Trit::Zero,
+            Trit::Pos,
+            Trit::Neg,
+            Trit::Zero,
+            Trit::Pos,
+            Trit::Pos,
         ];
         let packed = pack_ternary(&trits);
         let unpacked = unpack_ternary(&packed, trits.len());
@@ -86,8 +92,12 @@ mod tests {
     #[test]
     fn test_quaternary_pack_roundtrip() {
         let quats = vec![
-            Quat::Neg3, Quat::Neg1, Quat::Pos1, Quat::Pos3,
-            Quat::Pos1, Quat::Neg3,
+            Quat::Neg3,
+            Quat::Neg1,
+            Quat::Pos1,
+            Quat::Pos3,
+            Quat::Pos1,
+            Quat::Neg3,
         ];
         let packed = pack_quaternary(&quats);
         let unpacked = unpack_quaternary(&packed, quats.len());

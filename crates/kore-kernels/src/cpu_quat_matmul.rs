@@ -28,9 +28,9 @@ pub fn quat_matmul(
     k: usize,
 ) -> Result<Tensor, KoreError> {
     let b_cont = b.contiguous();
-    let b_data = b_cont.as_f32_slice().ok_or_else(|| {
-        KoreError::UnsupportedDType(b.dtype())
-    })?;
+    let b_data = b_cont
+        .as_f32_slice()
+        .ok_or_else(|| KoreError::UnsupportedDType(b.dtype()))?;
 
     let k_packed = k.div_ceil(4);
 
@@ -221,8 +221,8 @@ mod tests {
     fn test_pack_unpack_identity() {
         // Weights that map cleanly to quaternary values
         let weights = vec![
-            -3.0, -1.0, 1.0, 3.0,  // row 0
-            3.0, 1.0, -1.0, -3.0,  // row 1
+            -3.0, -1.0, 1.0, 3.0, // row 0
+            3.0, 1.0, -1.0, -3.0, // row 1
         ];
         let (packed, scales) = pack_weights_quaternary(&weights, 2, 4);
 

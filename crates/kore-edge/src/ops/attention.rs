@@ -102,8 +102,8 @@ pub fn multi_head_attention(
             for j in 0..seq_k {
                 let mut dot = 0.0f32;
                 for p in 0..head_dim {
-                    dot += q[i * q_stride + h * head_dim + p]
-                        * k[j * k_stride + kv_h * head_dim + p];
+                    dot +=
+                        q[i * q_stride + h * head_dim + p] * k[j * k_stride + kv_h * head_dim + p];
                 }
                 score_slice[i * seq_k + j] = dot * scale;
             }
@@ -126,8 +126,7 @@ pub fn multi_head_attention(
             for p in 0..head_dim {
                 let mut acc = 0.0f32;
                 for j in 0..seq_k {
-                    acc += score_slice[i * seq_k + j]
-                        * v[j * k_stride + kv_h * head_dim + p];
+                    acc += score_slice[i * seq_k + j] * v[j * k_stride + kv_h * head_dim + p];
                 }
                 output[i * q_stride + h * head_dim + p] = acc;
             }
@@ -189,8 +188,17 @@ mod tests {
         let mut scores = vec![0.0f32; n_heads * seq * seq];
 
         multi_head_attention(
-            &q, &k, &v, &mut output, &mut scores,
-            seq, seq, n_heads, n_kv_heads, head_dim, false,
+            &q,
+            &k,
+            &v,
+            &mut output,
+            &mut scores,
+            seq,
+            seq,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            false,
         );
 
         for &v in &output {

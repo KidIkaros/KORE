@@ -17,8 +17,8 @@
 
 use std::sync::Arc;
 
-use kore_core::Tensor;
 use kore_core::autograd::{GradFn, GradNode};
+use kore_core::Tensor;
 
 /// A recomputable function: takes a slice of input tensors, returns output tensors.
 ///
@@ -58,11 +58,15 @@ struct CheckpointBackward {
 impl GradFn for CheckpointBackward {
     fn apply(&self, grad_output: &Tensor) -> Vec<Option<Tensor>> {
         // Re-enable grad tracking for the recomputation
-        let inputs_with_grad: Vec<Tensor> = self.saved_inputs.iter().map(|t| {
-            let mut t = t.clone();
-            t.set_requires_grad(true);
-            t
-        }).collect();
+        let inputs_with_grad: Vec<Tensor> = self
+            .saved_inputs
+            .iter()
+            .map(|t| {
+                let mut t = t.clone();
+                t.set_requires_grad(true);
+                t
+            })
+            .collect();
 
         // Recompute forward
         let outputs = self.func.forward(&inputs_with_grad);
@@ -76,9 +80,10 @@ impl GradFn for CheckpointBackward {
         }
 
         // Collect gradients from the recomputed inputs
-        inputs_with_grad.iter().map(|t| {
-            t.grad_node().and_then(|n| n.get_grad())
-        }).collect()
+        inputs_with_grad
+            .iter()
+            .map(|t| t.grad_node().and_then(|n| n.get_grad()))
+            .collect()
     }
 
     fn name(&self) -> &str {
@@ -110,12 +115,16 @@ where
     let func = Arc::new(func);
 
     // Save detached copies of inputs (no grad graph references)
-    let saved_inputs: Vec<Tensor> = inputs.iter().map(|t| {
-        let data = t.contiguous();
-        let slice = data.as_f32_slice()
-            .expect("checkpoint: input tensor must be F32");
-        Tensor::from_f32(slice, data.shape().dims())
-    }).collect();
+    let saved_inputs: Vec<Tensor> = inputs
+        .iter()
+        .map(|t| {
+            let data = t.contiguous();
+            let slice = data
+                .as_f32_slice()
+                .expect("checkpoint: input tensor must be F32");
+            Tensor::from_f32(slice, data.shape().dims())
+        })
+        .collect();
 
     // Run forward without grad tracking to avoid building intermediate graph
     let outputs = {
@@ -132,7 +141,8 @@ where
     });
 
     // Collect input grad nodes for the graph edge
-    let input_nodes: Vec<Arc<GradNode>> = inputs.iter()
+    let input_nodes: Vec<Arc<GradNode>> = inputs
+        .iter()
         .filter_map(|t| t.grad_node().cloned())
         .collect();
 
@@ -143,9 +153,10 @@ where
     let checkpoint_node = GradNode::with_grad_fn(grad_fn, input_nodes);
 
     // Wrap outputs with the checkpoint node
-    outputs.into_iter().map(|t| {
-        t.with_grad_node(checkpoint_node.clone())
-    }).collect()
+    outputs
+        .into_iter()
+        .map(|t| t.with_grad_node(checkpoint_node.clone()))
+        .collect()
 }
 
 /// Convenience: checkpoint a single-input, single-output function.
@@ -153,11 +164,10 @@ pub fn checkpoint_fn<F>(func: F, input: Tensor) -> Tensor
 where
     F: Fn(&Tensor) -> Tensor + Send + Sync + 'static,
 {
-    let results = checkpoint(
-        move |inputs: &[Tensor]| vec![func(&inputs[0])],
-        vec![input],
-    );
-    results.into_iter().next()
+    let results = checkpoint(move |inputs: &[Tensor]| vec![func(&inputs[0])], vec![input]);
+    results
+        .into_iter()
+        .next()
         .expect("checkpoint_fn: function must produce at least one output")
 }
 
@@ -175,24 +185,29 @@ mod tests {
             squared.sum().unwrap()
         };
 
-        let checkpointed = checkpoint_fn(|x| {
-            let squared = x.mul(x).unwrap();
-            squared.sum().unwrap()
-        }, input.clone());
+        let checkpointed = checkpoint_fn(
+            |x| {
+                let squared = x.mul(x).unwrap();
+                squared.sum().unwrap()
+            },
+            input.clone(),
+        );
 
         let d_data = direct.as_f32_slice().unwrap();
         let c_data = checkpointed.as_f32_slice().unwrap();
-        assert!((d_data[0] - c_data[0]).abs() < 1e-6,
-            "direct={}, checkpointed={}", d_data[0], c_data[0]);
+        assert!(
+            (d_data[0] - c_data[0]).abs() < 1e-6,
+            "direct={}, checkpointed={}",
+            d_data[0],
+            c_data[0]
+        );
     }
 
     #[test]
     fn test_checkpoint_shape_preserved() {
         let input = Tensor::from_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
 
-        let output = checkpoint_fn(|x| {
-            x.mul(x).unwrap()
-        }, input);
+        let output = checkpoint_fn(|x| x.mul(x).unwrap(), input);
 
         assert_eq!(output.shape().dims(), &[2, 3]);
     }
@@ -221,9 +236,7 @@ mod tests {
         // When inputs don't require grad, checkpoint should still work
         let input = Tensor::from_f32(&[1.0, 2.0, 3.0], &[3]);
 
-        let output = checkpoint_fn(|x| {
-            x.add(x).unwrap()
-        }, input);
+        let output = checkpoint_fn(|x| x.add(x).unwrap(), input);
 
         let data = output.as_f32_slice().unwrap();
         assert!((data[0] - 2.0).abs() < 1e-6);

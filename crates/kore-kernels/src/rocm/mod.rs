@@ -10,8 +10,8 @@
 //! - hiprtc kernel compilation with caching
 //! - Mamba-3 scan forward/backward dispatch
 
-pub mod ffi;
 pub mod context;
-pub mod memory;
+pub mod ffi;
 pub mod launch;
+pub mod memory;
 pub mod ops;

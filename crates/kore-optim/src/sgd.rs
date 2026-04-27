@@ -21,13 +21,19 @@ impl SGD {
     }
 
     /// Learning rate.
-    pub fn lr(&self) -> f32 { self.lr }
+    pub fn lr(&self) -> f32 {
+        self.lr
+    }
 
     /// Momentum coefficient.
-    pub fn momentum(&self) -> f32 { self.momentum }
+    pub fn momentum(&self) -> f32 {
+        self.momentum
+    }
 
     /// Weight decay coefficient.
-    pub fn weight_decay(&self) -> f32 { self.weight_decay }
+    pub fn weight_decay(&self) -> f32 {
+        self.weight_decay
+    }
 
     /// Perform one optimization step.
     ///
@@ -46,7 +52,9 @@ impl SGD {
 
             // Weight decay: g = g + wd * param
             if self.weight_decay > 0.0 {
-                let decay = param.mul_scalar(self.weight_decay).expect("SGD weight decay failed");
+                let decay = param
+                    .mul_scalar(self.weight_decay)
+                    .expect("SGD weight decay failed");
                 g = g.add(&decay).expect("SGD weight decay add failed");
             }
 

@@ -7,6 +7,6 @@
 //! - Optimized CUDA kernels (GEMM, element-wise, reductions, etc.)
 
 pub mod context;
-pub mod memory;
 pub mod launch;
+pub mod memory;
 pub mod ops;

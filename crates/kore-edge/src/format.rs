@@ -340,9 +340,8 @@ impl KorefBuilder {
 
     /// Add an f32 tensor.
     pub fn add_f32(&mut self, name: &str, shape: &[usize], data: &[f32]) {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         self.add_tensor(name, EdgeDType::F32, shape, bytes);
     }
 
@@ -382,7 +381,14 @@ mod tests {
 
     #[test]
     fn test_edge_dtype_roundtrip() {
-        for dt in &[EdgeDType::F32, EdgeDType::F16, EdgeDType::Ternary, EdgeDType::Quaternary, EdgeDType::I8, EdgeDType::U8] {
+        for dt in &[
+            EdgeDType::F32,
+            EdgeDType::F16,
+            EdgeDType::Ternary,
+            EdgeDType::Quaternary,
+            EdgeDType::I8,
+            EdgeDType::U8,
+        ] {
             assert_eq!(EdgeDType::from_str(dt.as_str()), Some(*dt));
         }
     }
@@ -412,13 +418,19 @@ mod tests {
     #[test]
     fn test_bad_magic() {
         let data = b"BADXxxxxxxxx";
-        assert!(matches!(KorefModel::from_bytes(data), Err(FormatError::BadMagic)));
+        assert!(matches!(
+            KorefModel::from_bytes(data),
+            Err(FormatError::BadMagic)
+        ));
     }
 
     #[cfg(feature = "serde")]
     #[test]
     fn test_too_small() {
         let data = b"KORF";
-        assert!(matches!(KorefModel::from_bytes(data), Err(FormatError::TooSmall)));
+        assert!(matches!(
+            KorefModel::from_bytes(data),
+            Err(FormatError::TooSmall)
+        ));
     }
 }

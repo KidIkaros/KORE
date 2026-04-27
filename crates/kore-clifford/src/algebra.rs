@@ -82,7 +82,16 @@ impl CliffordAlgebra {
         let grades: Vec<usize> = (0..dim).map(|i| (i as u32).count_ones() as usize).collect();
 
         // Build Cayley table
-        let mut cayley = vec![vec![CayleyEntry { blade: 0, sign: Sign::Zero }; dim]; dim];
+        let mut cayley = vec![
+            vec![
+                CayleyEntry {
+                    blade: 0,
+                    sign: Sign::Zero
+                };
+                dim
+            ];
+            dim
+        ];
 
         for (i, c_row) in cayley.iter_mut().enumerate() {
             for (j, entry) in c_row.iter_mut().enumerate() {
@@ -90,7 +99,14 @@ impl CliffordAlgebra {
             }
         }
 
-        Self { p, q, n, dim, cayley, grades }
+        Self {
+            p,
+            q,
+            n,
+            dim,
+            cayley,
+            grades,
+        }
     }
 
     /// Multiply two basis blades represented as bitmasks.
@@ -137,7 +153,10 @@ impl CliffordAlgebra {
             }
         }
 
-        CayleyEntry { blade: result_blade, sign }
+        CayleyEntry {
+            blade: result_blade,
+            sign,
+        }
     }
 
     /// Get the grade of a basis blade.
@@ -147,9 +166,7 @@ impl CliffordAlgebra {
 
     /// Get all blade indices of a specific grade.
     pub fn blades_of_grade(&self, grade: usize) -> Vec<usize> {
-        (0..self.dim)
-            .filter(|&i| self.grades[i] == grade)
-            .collect()
+        (0..self.dim).filter(|&i| self.grades[i] == grade).collect()
     }
 
     /// Name of a basis blade (for display).

@@ -4,7 +4,7 @@
 //! packed ternary data with random access and bulk word conversion.
 //! Rust `Drop` replaces manual `btes_frame_free`.
 
-use crate::encoder::{Trit, encode_trits, decode_trits};
+use crate::encoder::{decode_trits, encode_trits, Trit};
 use crate::vtalu::TernaryWord64;
 
 /// Packing mode for ternary storage.
@@ -177,7 +177,13 @@ impl TernaryFrame {
     }
 
     /// Copy trits from another frame.
-    pub fn copy_from(&mut self, dst_start: usize, src: &TernaryFrame, src_start: usize, count: usize) -> usize {
+    pub fn copy_from(
+        &mut self,
+        dst_start: usize,
+        src: &TernaryFrame,
+        src_start: usize,
+        count: usize,
+    ) -> usize {
         let mut copied = 0;
         for i in 0..count {
             if src_start + i >= src.trit_count || dst_start + i >= self.trit_count {
@@ -246,7 +252,9 @@ impl std::fmt::Display for TernaryFrame {
         let max_display = 16;
         write!(f, "[")?;
         for i in 0..self.trit_count.min(max_display) {
-            if i > 0 { write!(f, ", ")?; }
+            if i > 0 {
+                write!(f, ", ")?;
+            }
             match self.get_trit(i) {
                 Trit::Neg => write!(f, "-1")?,
                 Trit::Zero => write!(f, " 0")?,
@@ -256,7 +264,12 @@ impl std::fmt::Display for TernaryFrame {
         if self.trit_count > max_display {
             write!(f, ", ... ({} more)", self.trit_count - max_display)?;
         }
-        write!(f, "] ({} trits, {} bytes)", self.trit_count, self.data.len())
+        write!(
+            f,
+            "] ({} trits, {} bytes)",
+            self.trit_count,
+            self.data.len()
+        )
     }
 }
 

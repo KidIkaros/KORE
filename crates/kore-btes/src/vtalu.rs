@@ -27,7 +27,10 @@ pub struct TernaryWord64 {
 
 impl TernaryWord64 {
     /// All 64 trits set to zero.
-    pub const ZERO: Self = Self { plane_a: 0, plane_b: 0 };
+    pub const ZERO: Self = Self {
+        plane_a: 0,
+        plane_b: 0,
+    };
 
     /// Create a word with all trits set to zero.
     #[inline]
@@ -39,8 +42,14 @@ impl TernaryWord64 {
     #[inline]
     pub fn fill(trit: i8) -> Self {
         match trit {
-            1 => Self { plane_a: 0, plane_b: u64::MAX },
-            -1 => Self { plane_a: u64::MAX, plane_b: 0 },
+            1 => Self {
+                plane_a: 0,
+                plane_b: u64::MAX,
+            },
+            -1 => Self {
+                plane_a: u64::MAX,
+                plane_b: 0,
+            },
             _ => Self::ZERO,
         }
     }
@@ -162,7 +171,10 @@ impl TernaryWord64 {
         let sum_neg = (a_neg & b_zero) | (a_zero & b_neg) | (a_pos & b_pos);
         let sum_pos = (a_pos & b_zero) | (a_zero & b_pos) | (a_neg & b_neg);
 
-        let sum = Self { plane_a: sum_neg, plane_b: sum_pos };
+        let sum = Self {
+            plane_a: sum_neg,
+            plane_b: sum_pos,
+        };
 
         // Carry: -1 when (a=-1,b=-1), +1 when (a=+1,b=+1)
         let carry = Self {
@@ -181,9 +193,15 @@ impl TernaryWord64 {
         // Add initial carry_in at LSB
         if carry_in != 0 {
             let carry_word = if carry_in > 0 {
-                Self { plane_a: 0, plane_b: 1 }
+                Self {
+                    plane_a: 0,
+                    plane_b: 1,
+                }
             } else {
-                Self { plane_a: 1, plane_b: 0 }
+                Self {
+                    plane_a: 1,
+                    plane_b: 0,
+                }
             };
             let (s2, c2) = sum.add_no_carry(carry_word);
             sum = s2;
@@ -249,7 +267,10 @@ impl TernaryWord64 {
     #[inline]
     pub fn eq_trit(self, other: Self) -> Self {
         let equal = !(self.plane_a ^ other.plane_a) & !(self.plane_b ^ other.plane_b);
-        Self { plane_a: 0, plane_b: equal }
+        Self {
+            plane_a: 0,
+            plane_b: equal,
+        }
     }
 
     /// Element-wise comparison: sign of (a - b) per position.
@@ -268,7 +289,9 @@ impl TernaryWord64 {
     /// Get a single trit at the given index (0-63, LSB first).
     #[inline]
     pub fn get_trit(self, index: usize) -> i8 {
-        if index >= 64 { return 0; }
+        if index >= 64 {
+            return 0;
+        }
         let mask = 1u64 << index;
         let a = (self.plane_a & mask) != 0;
         let b = (self.plane_b & mask) != 0;
@@ -283,7 +306,9 @@ impl TernaryWord64 {
     /// Set a single trit at the given index.
     #[inline]
     pub fn set_trit(&mut self, index: usize, trit: i8) {
-        if index >= 64 { return; }
+        if index >= 64 {
+            return;
+        }
         let mask = 1u64 << index;
         let clear = !mask;
         self.plane_a &= clear;
@@ -331,17 +356,23 @@ impl TernaryWord64 {
 impl std::ops::Neg for TernaryWord64 {
     type Output = Self;
     #[inline]
-    fn neg(self) -> Self { self.negate() }
+    fn neg(self) -> Self {
+        self.negate()
+    }
 }
 
 impl std::ops::BitAnd for TernaryWord64 {
     type Output = Self;
     #[inline]
-    fn bitand(self, rhs: Self) -> Self { self.mul_elementwise(rhs) }
+    fn bitand(self, rhs: Self) -> Self {
+        self.mul_elementwise(rhs)
+    }
 }
 
 impl Default for TernaryWord64 {
-    fn default() -> Self { Self::ZERO }
+    fn default() -> Self {
+        Self::ZERO
+    }
 }
 
 #[cfg(test)]
@@ -425,11 +456,11 @@ mod tests {
         let c = a.mul_elementwise(b);
         let trits = c.to_trits();
 
-        assert_eq!(trits[0], 1);   // (-1)*(-1)
-        assert_eq!(trits[1], -1);  // (-1)*(+1)
-        assert_eq!(trits[2], 1);   // (+1)*(+1)
-        assert_eq!(trits[3], 0);   // (0)*(+1)
-        assert_eq!(trits[4], 0);   // (+1)*(0)
+        assert_eq!(trits[0], 1); // (-1)*(-1)
+        assert_eq!(trits[1], -1); // (-1)*(+1)
+        assert_eq!(trits[2], 1); // (+1)*(+1)
+        assert_eq!(trits[3], 0); // (0)*(+1)
+        assert_eq!(trits[4], 0); // (+1)*(0)
     }
 
     #[test]
@@ -449,7 +480,7 @@ mod tests {
         let b = TernaryWord64::from_trits(&[1]);
         let (sum, _) = a.add(b, 0);
         assert_eq!(sum.get_trit(0), -1); // LSB
-        assert_eq!(sum.get_trit(1), 1);  // carry propagated
+        assert_eq!(sum.get_trit(1), 1); // carry propagated
     }
 
     #[test]
@@ -468,10 +499,10 @@ mod tests {
         let b = TernaryWord64::from_trits(&[1, 0, 0, -1]);
         let eq = a.eq_trit(b);
 
-        assert_eq!(eq.get_trit(0), 1);  // both +1
-        assert_eq!(eq.get_trit(1), 0);  // -1 vs 0
-        assert_eq!(eq.get_trit(2), 1);  // both 0
-        assert_eq!(eq.get_trit(3), 0);  // +1 vs -1
+        assert_eq!(eq.get_trit(0), 1); // both +1
+        assert_eq!(eq.get_trit(1), 0); // -1 vs 0
+        assert_eq!(eq.get_trit(2), 1); // both 0
+        assert_eq!(eq.get_trit(3), 0); // +1 vs -1
     }
 
     #[test]
@@ -514,15 +545,18 @@ mod tests {
         let b = TernaryWord64::from_trits(&[1, 0, 0, 1]);
         let c = a.consensus(b);
 
-        assert_eq!(c.get_trit(0), 1);  // agree
-        assert_eq!(c.get_trit(1), 0);  // disagree
-        assert_eq!(c.get_trit(2), 0);  // agree (both 0)
-        assert_eq!(c.get_trit(3), 1);  // agree
+        assert_eq!(c.get_trit(0), 1); // agree
+        assert_eq!(c.get_trit(1), 0); // disagree
+        assert_eq!(c.get_trit(2), 0); // agree (both 0)
+        assert_eq!(c.get_trit(3), 1); // agree
     }
 
     #[test]
     fn test_sanitize() {
-        let invalid = TernaryWord64 { plane_a: 0b11, plane_b: 0b11 };
+        let invalid = TernaryWord64 {
+            plane_a: 0b11,
+            plane_b: 0b11,
+        };
         assert_eq!(invalid.count_invalid(), 2);
         let clean = invalid.sanitize();
         assert!(clean.is_valid());

@@ -28,8 +28,13 @@ pub fn matmul_f32(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: us
 
 /// Ternary matmul: C[M,N] = A_ternary[M,K] @ B_f32[K,N] * scales[M]
 pub fn matmul_ternary(
-    a_packed: &[u8], a_scales: &[f32], b: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
+    a_packed: &[u8],
+    a_scales: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) {
     #[cfg(target_arch = "aarch64")]
     {
@@ -51,8 +56,13 @@ pub fn matmul_ternary(
 
 /// Quaternary matmul: C[M,N] = A_quat[M,K] @ B_f32[K,N] * scales[M]
 pub fn matmul_quaternary(
-    a_packed: &[u8], a_scales: &[f32], b: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
+    a_packed: &[u8],
+    a_scales: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
 ) {
     #[cfg(target_arch = "aarch64")]
     {
@@ -103,11 +113,17 @@ pub fn softmax(data: &mut [f32], dim: usize) {
 /// Returns the name of the active SIMD backend.
 pub fn backend_name() -> &'static str {
     #[cfg(target_arch = "aarch64")]
-    { return "NEON"; }
+    {
+        return "NEON";
+    }
 
     #[cfg(target_arch = "wasm32")]
-    { return "WASM-SIMD128"; }
+    {
+        return "WASM-SIMD128";
+    }
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
-    { "scalar" }
+    {
+        "scalar"
+    }
 }
