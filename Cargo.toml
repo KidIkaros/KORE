@@ -6,6 +6,7 @@ members = [
     "crates/kore-optim",
     "crates/kore-btes",
     "crates/kore-kernels",
+    "crates/kore-vulkan",
     "crates/kore-clifford",
     "crates/kore-attention",
     "crates/kore-serve",
@@ -82,6 +83,7 @@ kore-nn = { path = "crates/kore-nn" }
 kore-optim = { path = "crates/kore-optim" }
 kore-btes = { path = "crates/kore-btes" }
 kore-kernels = { path = "crates/kore-kernels" }
+kore-vulkan = { path = "crates/kore-vulkan" }
 kore-clifford = { path = "crates/kore-clifford" }
 kore-attention = { path = "crates/kore-attention" }
 kore-serve = { path = "crates/kore-serve" }
