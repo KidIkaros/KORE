@@ -98,3 +98,17 @@ strip = true
 [profile.bench]
 opt-level = 3
 lto = "thin"
+
+# Examples configuration
+[[example]]
+name = "basic_tensor_ops"
+path = "examples/basic_tensor_ops.rs"
+
+[[example]]
+name = "vulkan_matmul"
+path = "examples/vulkan_matmul.rs"
+required-features = ["kore-vulkan/ash"]
+
+[[example]]
+name = "quantized_ops"
+path = "examples/quantized_ops.rs"
