@@ -10,6 +10,32 @@
 
 ---
 
+## Step 0 — Paradigm & Goal Gate (mandatory, first)
+
+> Per the systems-design skill: state the paradigm (Level 2) and the P0 goal
+> (Level 3) *before* any component, format, or kernel is named. A single concrete
+> model/format name may appear ONLY as a throwaway validation rig, never as a goal.
+
+**Level 2 — Paradigm (who is this for / what is it actually FOR?):**
+KORE is *the operator's sovereign ML research instrument* — a complete pure-Rust
+framework for discovering what architectures work (SSM, world models,
+tokenless/V-JEPA), using LLMs as a *teacher input*, not as the destination. The
+inference engine is a **subsystem** added so candidate architectures and an LLM
+teacher run in the *same* runtime, making "does my architecture capture
+intelligence?" a measurable question. Tokens are a dead end; we are not building a
+PyTorch/TensorFlow competitor and not an LLM-serving product.
+
+**Level 3 — P0 purpose (one line, names no model/format/vendor):**
+> *One pure-Rust runtime where the operator trains and evaluates novel
+> (non-token) architectures beside LLM teachers, owning the whole stack — so
+> architecture research is fast, comparable, and vendor-free.*
+
+Everything else in this doc (speed, a specific architecture, safetensors, `.kwe`,
+Vulkan, ternary) is a **means** to that P0 goal or a **Level-12 parameter**. The
+gate holds: P0 is stated without naming any model, format, or vendor.
+
+---
+
 ## §0 Frame: what KORE is, and why the inference engine exists
 
 - **KORE = a complete ML framework**, not an inference engine. Training,
@@ -178,6 +204,21 @@ the format is unambiguous. The one delay we must keep *short* is VRAM rebalance
 - correctness (P1) > compression (P1): ternary diverges past tolerance → Q8 fallback.
 - universality (P1) > one-model perfection (P2): registry over any single model.
 
+### Goal Verification Tests (each goal → decidable assertion)
+| Goal | Verification assertion (must hold to claim the goal is met) |
+|---|---|
+| **P0** research enablement | A candidate *novel* architecture trains **and** an LLM teacher runs in the **same** KORE runtime; both consume the same tensor/autograd/backend primitives (no forked path). |
+| **P0** non-token native | A non-autoregressive / SSM / world-model arch is expressible as a `Model` module without patching core; a token-only path is not required to compile. |
+| **P0** sovereignty (pure Rust) | `cargo build` of the runtime path succeeds with **zero** C/C++ deps; no `cc`/`vcpkg`/FFI to llama.cpp in the dep tree. |
+| **P1** operator sovereignty | An HF teacher model loads from safetensors (no vendor container) and produces output within tolerance on the operator's own GPU/CPU. |
+| **P1** universality | Adding a new architecture = adding one module + one registry entry; zero edits to existing arch modules or core. |
+| **P1** fit-the-hardware quant | A 27B-class teacher quantizes to ternary and fits 16 GB VRAM with KV budget remaining. |
+| **P2** throughput / long ctx | Quantized KV (Q4/Q8) sustains a 4K context within the VRAM budget; streaming emits tokens. |
+| **P3** serving | `kore-serve` exposes an API + streaming for the teacher path. |
+
+*(Assertions are decidable, not vanity metrics. Correctness/tolerance checks gate
+any throughput claim — Meadows #5.)*
+
 ---
 
 ## §4 Leverage Points for Evolution (Step 4)
@@ -228,9 +269,11 @@ reframe dissolved the tunnel vision (Bonsai-only, Qwen3-default, GGUF-forensics)
   mixed-quant linear → norm → attention → sampler); use it to prove the
   pipeline; never optimize it.
 
-**Direction-check:** does this deepen "an operator runs any model on their own
-hardware, locally, in pure Rust, no vendor lock-in" while preserving sovereignty?
-Yes → push. No → stop.
+**Direction-check:** does this deepen **R0 (research acceleration)** — training a
+candidate architecture *and* running the LLM teacher in one pure-Rust runtime — while
+preserving **P0 (sovereignty: operator owns the whole stack)**? Yes → push. No → stop.
+If a proposal serves only "run a model faster" without feeding the architecture-research
+loop, it is Level-12 tuning — defer it.
 
 ---
 
@@ -290,14 +333,40 @@ re-create the lock-in or purity traps (GGUF, C++ core, FFI wrappers, agent
 
 - **Resilience ≠ stability:** KORE should *recover* from a bad quant (fall back to
   Q8) and from OOM (drop KV dtype), not resist change until it breaks.
-- **Limits (self-imposed architectural constraints):**
-  - No C/C++ dependency in the runtime path (purity boundary).
-  - Weights enter only via safetensors or `.kwe` (container boundary).
-  - VRAM ceiling = operator's device; KV cache yields first.
+- **Limits (self-imposed architectural constraints — table):**
+
+  | Resource / boundary | Value | Why self-imposed (architectural, not policy) |
+  |---|---|---|
+  | Runtime dependencies | No C/C++ in the runtime path | Purity/sovereignty floor (P0); refuses the lock-in trap |
+  | Weight ingress | safetensors or `.kwe` only | Vendor-neutral; proprietary containers refused by construction |
+  | VRAM ceiling | operator's device; KV cache yields first | Hardware reality; B2 loop governs rebalance |
+  | Core tensor abstraction | immutable by modules | Jazz stage; modules improvise on it, can't restructure it |
+
 - **Self-organization boundary:** new *architectures* and *backends* can emerge as
   modules (the registry and trait invite this). The *core tensor abstraction*
   cannot be restructured by a module — it is the fixed jazz stage; modules improvise
   on it.
+
+---
+
+## §5b Monitor & Iterate (Step 7)
+
+Track signals *aligned to goals*, not vanity metrics. Per Meadows #5, do not
+metric the unquantifiable (research insight, architecture quality) — reflect,
+don't optimize.
+
+| Signal | Tied to | Watch how | Cadence |
+|---|---|---|---|
+| New-arch idea → apples-to-apples eval vs teacher (latency) | **R0** research acceleration | time from idea to running eval in one runtime | per project |
+| Cargo dep-tree has C/FFI to llama.cpp? | **P0** sovereignty | CI guard fails build on violation | every build |
+| Arch-module count vs test coverage | **B1** registry homeostasis | coverage must rise with modules | every PR |
+| VRAM at steady state (KV dtype chosen) | **B2** memory | within budget; no OOM, no thrash | per run |
+| Quant divergence vs HF reference | **B3** accuracy | within tolerance; else Q8 fallback | per quant change |
+| Zoo breadth (distinct arch modules) | **R1** flywheel | growth, not monoculture | quarterly |
+
+*Direction-check on monitoring itself:* if a metric starts driving decisions that
+hurt R0/P0 (e.g. optimizing tok/s over eval fidelity), drop it. Metrics serve the
+goal; the goal is not the metric.
 
 ---
 
