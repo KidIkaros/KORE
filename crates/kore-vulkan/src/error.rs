@@ -42,8 +42,8 @@ pub enum VulkanError {
     NotInitialized,
 }
 
-impl From<vulkan_kernels::VulkanKernelError> for VulkanError {
-    fn from(e: vulkan_kernels::VulkanKernelError) -> Self {
+impl From<vulkan_kernels::runtime::VulkanKernelError> for VulkanError {
+    fn from(e: vulkan_kernels::runtime::VulkanKernelError) -> VulkanError {
         VulkanError::Kernel(e.to_string())
     }
 }

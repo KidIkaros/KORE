@@ -41,7 +41,7 @@ impl VulkanBackend {
             .map_err(|e| VulkanError::Initialization(e.to_string()))?;
 
         Ok(Self {
-            context,
+            context: context.into(),
             device_index,
         })
     }

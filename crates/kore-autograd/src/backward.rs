@@ -31,7 +31,7 @@ pub fn backward(root: &Arc<GradNode>, grad_output: Tensor) {
 
             let input_grads = grad_fn.apply(&node_grad);
 
-            for (weak_input, maybe_grad) in node.inputs.iter().zip(input_grads.into_iter()) {
+            for (weak_input, maybe_grad) in node.inputs.iter().zip(input_grads) {
                 if let (Some(input_node), Some(grad)) = (weak_input.upgrade(), maybe_grad) {
                     input_node.accumulate_grad(&grad);
                 }

@@ -12,8 +12,12 @@
 pub mod cpu_fused;
 pub mod cpu_fused_backward;
 pub mod cpu_matmul;
+pub mod cpu_matmul_f16;
 pub mod cpu_quat_matmul;
+pub mod cpu_ternary_dequant;
 pub mod cpu_ternary_matmul;
+pub mod cpu_binary_dequant;
+pub mod cpu_binary_matmul;
 pub mod simd;
 
 #[cfg(feature = "cuda")]

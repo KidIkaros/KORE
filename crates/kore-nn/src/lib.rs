@@ -3,6 +3,7 @@
 //! Neural network layers and modules for Kore.
 
 pub mod activations;
+pub mod binary_linear;
 pub mod bit_linear;
 pub mod conv;
 pub mod dropout;
@@ -20,8 +21,10 @@ pub mod rms_norm;
 pub mod sampler;
 pub mod serialization;
 pub mod squeezenet;
+pub mod transformer;
 
 pub use bit_linear::BitLinear;
+pub use binary_linear::BinaryLinear;
 pub use conv::{Conv1d, Conv2d};
 pub use dropout::Dropout;
 pub use embedding::Embedding;
@@ -33,5 +36,7 @@ pub use module::Module;
 pub use pool::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d};
 pub use quat_linear::QuatLinear;
 pub use rms_norm::RMSNorm;
+pub use sampler::SamplerConfig;
 pub use serialization::{load_module_state, load_state_dict, save_module, save_state_dict};
 pub use squeezenet::{Fire, SqueezeNet};
+pub use transformer::Transformer;

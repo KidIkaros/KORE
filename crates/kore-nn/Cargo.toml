@@ -16,6 +16,7 @@ thiserror.workspace = true
 rand.workspace = true
 safetensors.workspace = true
 half.workspace = true
+kore-attention.workspace = true
 
 [dependencies.cudarc]
 workspace = true
