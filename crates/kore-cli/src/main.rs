@@ -51,6 +51,19 @@ enum Commands {
         #[arg(long, default_value = "f32")]
         quantize: String,
     },
+    /// Run a forward pass (load a model, print logits) — the research-loop smoke test
+    Infer {
+        /// Path to a .safetensors model file (torchvision SqueezeNet keys). If
+        /// omitted, runs a random-init SqueezeNet v1.1 (no download needed).
+        #[arg(long)]
+        model: Option<String>,
+        /// Number of classes
+        #[arg(long, default_value = "1000")]
+        classes: usize,
+        /// Input image size (square)
+        #[arg(long, default_value = "224")]
+        size: usize,
+    },
     /// Train a model (demo with synthetic data)
     Train {
         /// Number of training steps
@@ -86,6 +99,11 @@ fn main() {
             output,
             quantize,
         } => cmd_export(&model, &output, &quantize),
+        Commands::Infer {
+            model,
+            classes,
+            size,
+        } => cmd_infer(model, classes, size),
     }
 }
 
@@ -505,4 +523,44 @@ fn cmd_export(model_path: &str, output_path: &str, quantize: &str) {
     // Print estimated edge memory
     let plan = kore_edge::plan::ExecutionPlan::from_header(&model.header);
     println!("  Est. runtime memory: {:.1} MB", plan.peak_memory_mb());
+}
+
+// ponytail: P0 smoke test for the research loop (R0). Loads safetensors -> forward
+// -> logits, CPU only. Vulkan (Tensor::vulkan) is P3; deferred until the device-move
+// plumbing exists. SqueezeNet is a *validation rig*, not a committed architecture.
+fn cmd_infer(model: Option<String>, classes: usize, size: usize) {
+    use kore_core::Tensor;
+    use kore_nn::SqueezeNet;
+    use kore_nn::Module;
+    use std::path::Path;
+
+    println!("=== Kore Infer (research-loop smoke test) ===");
+
+    let model = match model {
+        Some(path) => {
+            println!("Loading:   {}", path);
+            SqueezeNet::load_safetensors(Path::new(&path), classes)
+                .expect("failed to load safetensors model")
+        }
+        None => {
+            println!("No --model given; using random-init SqueezeNet v1.1 (no download)");
+            SqueezeNet::v1_1(classes)
+        }
+    };
+    println!("  {}", model.info());
+
+    // Dummy input: [1, 3, size, size]
+    let input = Tensor::randn(&[1, 3, size, size]);
+    println!("  input:  {:?}", input.shape().dims());
+
+    let t0 = std::time::Instant::now();
+    let logits = model.forward(&input).expect("forward pass failed");
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    let dims = logits.shape().dims().to_vec();
+    let data = logits.as_f32_slice().expect("logits not f32").to_vec();
+    let head: Vec<String> = data.iter().take(10).map(|x| format!("{x:.4}")).collect();
+
+    println!("  output: {:?}  ({:.1} ms)", dims, ms);
+    println!("  logits[..10]: [{}]", head.join(", "));
 }

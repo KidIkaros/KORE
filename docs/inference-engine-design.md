@@ -480,6 +480,11 @@ runtime" — not "Bonsai runs" and not "tokens per second." The reference arch i
 swapped freely; the novel-arch path is the real deliverable.
 
 ## §9 Verification (no "green tests = done")
+0. **P0 implemented:** `kore infer` (in `kore-cli`) loads safetensors directly via
+   `kore-nn::SqueezeNet::load_safetensors` (or random-init if no `--model`) and
+   runs `forward` on CPU, printing logits. Verified: runs on the operator's
+   machine, `[1,3,224,224] → [1,1000]`, ~34 s/forward on CPU → **confirms Vulkan
+   (P3) is the measured lever, not a nice-to-have.**
 1. A small **HF model (chosen for layer-coverage, not fame)** → loaded **directly
    from safetensors** → KORE **CPU** → token-for-token match vs the source
    framework on a fixed prompt.
