@@ -107,6 +107,13 @@ training the next architecture**, for whom the LLM is one input among many.
   CI fails → quant re-tuned. *Delay:* test latency.
 
 ### Reinforcing loops
+- **R0 (Virtuous — research acceleration, the actual purpose):** KORE trains a
+  candidate architecture *and* runs the LLM teacher in the *same* runtime → the
+  operator measures "does my architecture capture intelligence?" cheaply →
+  iterates faster → discovers what works → builds the next candidate in KORE.
+  This is the loop the whole framework exists to tighten. *Monitor:* time from
+  "new arch idea" → "apples-to-apples eval vs teacher." *Risk if too weak:*
+  research stalls back into manual glue-code and the token dead-end.
 - **R1 (Virtuous — zoo flywheel):** more arch support → more models runnable →
   more users → more contributions → more arch support.
 - **R2 (Vicious — vendor lock-in drift):** adopt one vendor's container → depend
@@ -127,6 +134,13 @@ training the next architecture**, for whom the LLM is one input among many.
 | convert→load | seconds | none | stale weights in RAM |
 | quant tolerance check | CI run | false-pass | slow iteration |
 | VRAM rebalance | 1 alloc | thrash | OOM |
+
+*Delay rule (Meadows "estimate the delay, multiply by three"):* the dangerous
+delays here are the **quant-tolerance check** and the **convert→load** path. We
+err toward *too slow*: a CI accuracy gate that lags a day still beats a false-pass
+that ships a broken quant; a weight-ingest that takes seconds is fine if it means
+the format is unambiguous. The one delay we must keep *short* is VRAM rebalance
+(oscillation risk), bounded by a single-alloc hysteresis.
 
 ---
 
@@ -236,6 +250,42 @@ Yes → push. No → stop.
 - **NOT vulnerable:** tragedy of commons, escalation, rule-beating — this is a
   single-operator local engine, not a multi-actor contested system.
 
+### Borrow vs Refuse (trap-mitigation research)
+
+The skill directs us to research real systems that solve the same traps
+structurally, then apply the borrow-vs-refuse test. KORE's applicable traps are
+*Shifting the Burden* (vendor-container crutch) and *Drift to Low Performance*
+(silent quant loss). Sources surveyed and the verdict:
+
+- **llama.cpp (vendor-neutrality via GGUF + backend trait):** *Borrow* the
+  structural insight — a single loadable container + a backend trait so CPU/Metal/
+  CUDA/Vulkan are interchangeable modules. *Refuse* GGUF itself and the C++ core:
+  KORE owns a vendor-neutral **safetensors** ingress + a pure-Rust `.kwe`, and
+  its backend trait is Rust-only (CPU/Vulkan). The insight is kept; the container
+  and the language are refused because they conflict with P0 (sovereignty/purity).
+- **llama-cpp-rs (Rust binding to llama.cpp):** *Refuse.* It is an FFI wrapper —
+  it still chains KORE to llama.cpp's container and kernels, i.e. it *re-introduces*
+  the lock-in trap (R2) we escaped. Useful only as an API-shape reference, not as
+  a dependency.
+- **mue-x / Hermes-curator / Mercury "soul files" (drift defense):** *Borrow the
+  shape, not the mechanism.* These systems fight *behavioral drift* in self-modifying
+  agents via pinned invariants, curators, and declared-identity anchors. KORE's
+  drift risk is narrower — *accuracy* drift under quantization, not goal drift.
+  So we borrow the *principle* (pin an absolute floor + a check that enforces it)
+  and apply it as **B3 (accuracy loop) + the "purity is an absolute floor" rule
+  (§6.7)**: no "temporary" C dependency, no silent tolerance breach. We refuse the
+  agent-governance machinery (curators, soul files) — that's for multi-actor
+  autonomous systems, not a single-operator ML framework.
+- **RotorQuant / llama.cpp KV-quant (Q4/Q8 KV):** *Borrow* the technique — quantized
+  KV cache is a pure memory win on constrained VRAM (the B2 loop). Refuse nothing
+  here; it serves P0 directly and is format-agnostic.
+
+**Borrow-vs-refuse summary:** keep *structural insights* (vendor-neutral ingress,
+backend trait, accuracy floor, quantized KV); refuse *concrete artifacts* that
+re-create the lock-in or purity traps (GGUF, C++ core, FFI wrappers, agent
+  governance). The test applied throughout: does this deepen R0 (research
+  acceleration) while preserving P0 (sovereignty)? Borrow if yes, refuse if no.
+
 ## §5 Resilience, Limits, Self-Organization (Step 5)
 
 - **Resilience ≠ stability:** KORE should *recover* from a bad quant (fall back to
@@ -253,21 +303,39 @@ Yes → push. No → stop.
 
 ## §6 Design Principles from Systems Wisdom (Step 6)
 
-Applied as structural requirements, not aspirations:
+Meadows' 14 guidelines applied as *structural requirements* (not aspirations).
+Each: guideline → concrete meaning for KORE → implementation note.
 
-1. **Get the beat (§1):** first release *observes* (loads a tiny model, prints
-   token-for-token match vs HF) before optimizing speed.
-2. **Honor information (§2):** weight metadata (shape, quant type) travels with the
-   tensor; no out-of-band assumptions.
-3. **Value the unquantifiable:** correctness and purity are absolute standards;
-   tok/s is a vanity metric until correctness is proven.
-4. **Feedback policies (B1–B3):** KV dtype and quant tolerance are *adaptive*
-   (driven by VRAM/accuracy loops), not static config flags.
-5. **Good of the whole:** the registry optimizes for zoo breadth, not one model.
-6. **Expand time horizons:** design for the 1B-parameter Xura student + the 27B
-   teacher in the *same* engine; don't optimize for today's file.
-7. **Don't erode goodness:** purity (P0) is an absolute floor — no "temporary" C
-   dependency "just to make Bonsai run."
+1. **#1 Get the beat** — first cycle *observes*, doesn't act. → The first
+   inference release loads a tiny model and prints token-for-token match vs the
+   source framework *before* any speed work. → CI gate: correctness check runs
+   before the throughput benchmark exists.
+2. **#3 Honor information** — no distortion/delay/withholding. → Weight metadata
+   (shape, quant type, arch) travels *with* the tensor; no out-of-band
+   assumptions about layout. → `.kwe` header carries dtype+shape; loader refuses
+   tensors whose metadata is missing.
+3. **#5 Value the unquantifiable** — reflect on quality, don't optimize metrics. →
+   Correctness and purity are absolute standards; tok/s is a vanity metric until
+   correctness is proven. → No perf PR merges without a green accuracy test.
+4. **#6 Feedback policies** — adaptive parameters, not static config. → KV dtype
+   and quant tolerance are *driven by loops* (B2 memory, B3 accuracy), not flags
+   the operator must hand-tune. → auto-select KV dtype on VRAM pressure; auto-fallback
+   Q8 on divergence.
+5. **#7 Good of the whole** — optimize the system, not one actor. → The registry
+   optimizes for zoo breadth, not one model's speed. → Every arch is a module; no
+   arch gets a fast-path exception in core.
+6. **#12 Expand time horizons** — think in years, not sessions. → Design for the
+   1B-parameter Xura student *and* the 27B teacher in the *same* engine; don't
+   optimize for today's file. → Tensor/autograd abstraction is stable; only
+   modules evolve.
+7. **Don't erode goodness** (bonus) — absolute standards, no drift. → Purity (P0)
+   is an absolute floor: no "temporary" C dependency "just to make a model run."
+   → The purity boundary is enforced in the build (no C in runtime path) and in
+   review (PR checklist item).
+
+*(Guidelines not enumerated here — #2, #4, #8–#11 — are either N/A to a
+single-operator local framework or already covered by the goal/leverage/trap
+sections above; we do not pad the doc with inapplicable principles.)*
 
 ---
 
