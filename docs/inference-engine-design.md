@@ -432,9 +432,15 @@ teacher apples-to-apples. The moat is the *purpose*: KORE is the operator's
 sovereign instrument for discovering what architectures work — tokens optional,
 research first. The inference subsystem is one part of that instrument.
 
+*Inventory note (post-ponytail):* KORE **already** reads/writes safetensors
+natively (`kore-nn/serialization.rs`, `kore-edge/loader.rs`) and **already** has
+`kore-serve` (layered safetensors sharding + prefetch). The build plan therefore
+loads safetensors directly and reuses `kore-serve` rather than adding a `.kwe`
+format or a new server.
+
 ---
 
-## §8 Phased Build (leverage-ordered)
+## §8 Phased Build (leverage-ordered, post-ponytail)
 
 The inference subsystem is built *to serve research*, not as a product. Each phase
 is sequenced by leverage (§4), and the whole thing exists so the operator can
@@ -442,19 +448,30 @@ train-and-evaluate novel architectures (Xura/SSM/world-model) next to LLM teache
 in one runtime. KORE already has the training side (`xura-*` crates: autograd,
 optimizers, V-JEPA teacher); this plan adds the inference/evaluation half.
 
-- **P0 (Level 6):** `.kwe` spec + `kore-convert` (safetensors → `.kwe`, ternary option).
-- **P1 (Level 8):** `kore-models` registry (`Model` trait) + **one reference
-  architecture chosen only for layer-coverage** (embedding → mixed-quant linear →
-  norm → attention → sampler). Treated as a *validation rig* for the teacher
-  path, not a committed target. Xura/SSM/world-model slot in later as ordinary
-  modules — and those are the point.
+> **Ponytail pass — what we are NOT building.** KORE *already* reads and writes
+> safetensors natively (`kore-nn/serialization.rs`, `kore-edge/loader.rs`), and
+> `kore-serve` (layered safetensors sharding + prefetch) *already exists*. So:
+> **no `.kwe` format, no `kore-convert`, no new server.** Load safetensors
+> directly; reuse `kore-serve` if/when serving is needed. A second weight format
+> would be a bridge between KORE and itself — the anti-pattern. The registry's
+> "module-per-arch" generality and quantized KV are deferred until a *second*
+> architecture or a VRAM limit actually forces them.
+
+- **P0 (Level 6):** Load safetensors **directly** (no `.kwe`, no converter) into
+  `kore-nn` tensors. One `kore-cli` subcommand runs a forward pass on CPU or
+  Vulkan (`kore-vulkan`) and prints logits — used for *both* the LLM teacher and
+  the Xura candidate. This *is* the research loop (R0).
+- **P1 (Level 4):** One reference architecture (layer-coverage only: embedding →
+  mixed-quant linear → norm → attention → sampler) as a `Model` impl, to prove the
+  teacher-eval path. Treated as a *validation rig*, not a committed target.
 - **P2 (Level 4):** CPU matmul f16/f32 + ternary/binary dequant (`kore-btes`).
 - **P3 (Level 4):** Vulkan matmul (`kore-vulkan`) on operator GPU.
-- **P4 (Level 9):** Quantized KV cache (Q4/Q8) for long context on constrained VRAM.
-- **P5 (Level 4):** Zoo + novel-arch expansion — new arch = new module (MoE,
-  SSM/linear-attn, world-model, drafter). Each is additive; registry stays the
-  balancing loop. **This is where Xura lives.**
-- **P6 (Level 6):** `kore-serve` API + streaming (for the teacher/serving side).
+- **DEFERRED — P4 quantized KV:** only if a measured context length blows VRAM.
+- **DEFERRED — P5 registry generality / novel-arch modules:** build the registry
+  *when a second architecture shows up*; don't pre-abstract. Xura/SSM/world-model
+  are the point, but they force the registry — they don't precede it.
+- **REUSE — `kore-serve`** (already exists): only wire serving if a real
+  serving need appears; not part of the research loop.
 
 **Validation rule (anti-tunnel-vision):** every phase is verified against the
 *operator's* success criterion — "point KORE at a teacher model, get correct
@@ -463,11 +480,14 @@ runtime" — not "Bonsai runs" and not "tokens per second." The reference arch i
 swapped freely; the novel-arch path is the real deliverable.
 
 ## §9 Verification (no "green tests = done")
-1. A small **HF model (chosen for layer-coverage, not fame)** → `.kwe` → KORE
-   **CPU** → token-for-token match vs the source framework on a fixed prompt.
-2. Ternary-quantize → KORE CPU → within tolerance.
+1. A small **HF model (chosen for layer-coverage, not fame)** → loaded **directly
+   from safetensors** → KORE **CPU** → token-for-token match vs the source
+   framework on a fixed prompt.
+2. Ternary dequant path → KORE CPU → within tolerance (dequant in-memory via
+   `kore-btes`; on-disk packing deferred).
 3. Same on **Vulkan / operator GPU** → identical output, faster.
-4. A 27B-class model → KORE quantizes to ternary → fits 16 GB → runs.
+4. A 27B-class model → loads from safetensors, ternary dequant in-memory → fits
+   16 GB → runs (packed-on-disk only if VRAM proves it's needed).
 5. **Sovereignty check:** swap the validation model for a *different*
    architecture → it loads as a new module with no core change.
 6. **Research-enablement check (the real P0):** a candidate *novel* architecture
