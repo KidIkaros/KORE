@@ -27,15 +27,29 @@
   VRAM pressure → drives KV dtype selection (Q4 vs Q8).
 
 ### Operational purpose (deduced from structure, not the tagline)
-The system optimizes for **"any model, any quant, one Rust engine, on the
-operator's own GPU — with no vendor lock-in."** Not "run Bonsai." Not "beat
-llama.cpp's speed." Those are downstream effects of the purpose, not the purpose.
+**Who is this for? The operator** — someone with their own hardware (laptop,
+16 GB GPU, phone, Pi) and a model file they did *not* write, who wants to run
+it **locally, privately, on their own metal, without asking NVIDIA, a cloud, or
+the model's vendor for permission.** That is exactly who llama.cpp is for, and
+it is KORE's reason to exist. llama.cpp's goal was never "run Llama well" — it
+is **"run whatever they ship next, on whatever you have, with no code change."**
+KORE inherits that purpose and restates it without the C++ and without the
+proprietary-container dependency.
+
+Therefore KORE optimizes for: **an operator points KORE at any HuggingFace
+model and runs it on their own GPU/CPU, locally, in pure Rust, with
+quantizations that fit their hardware.** Not "run Bonsai." Not "run Qwen3."
+Not "beat llama.cpp's speed." Those are downstream effects, not the purpose.
+The model is a *stranger's* output; KORE is the universal local runtime between
+the operator and the zoo.
 
 ### Boundary
 - **Controllable**: weight format, quant kernels, arch registry, backend.
 - **Observable-only**: upstream model releases, HF format changes, the
-  operator's GPU driver. We read these via `kore-convert`, never by forking
-  upstream.
+  operator's GPU driver. We read these via `kore-convert` (vendor-neutral
+  safetensors), never by forking upstream or parsing a vendor's proprietary
+  container. The next architecture the operator tries is *unknown by design* —
+  the registry exists so it is a module, not a rewrite.
 
 ### Hierarchy (bottom-up)
 `kore-core` (tensor/device/autograd) → `kore-btes` (quant primitives) →
@@ -97,59 +111,107 @@ llama.cpp's speed." Those are downstream effects of the purpose, not the purpose
 
 ## §3 Goal Hierarchy (Step 3)
 
-- **P0 (Non-negotiable):**
-  - **Pure Rust, zero llama.cpp/GGUF dependency.**
-  - Runs on operator's 9060 XT (Vulkan) and CPU.
-  - Correct: output within tolerance of HF reference for a fixed prompt.
-- **P1 (Primary value):**
-  - Whole model zoo (dense, GQA, MoE, SSM/linear-attn hybrid, drafters).
-  - Native **ternary/binary** inference (the moat; `kore-btes` already exists).
-  - Quantize-any-HF-model-on-load (no vendor file needed).
+- **P0 (Non-negotiable) — operator sovereignty:**
+  - **The operator runs any HF model on their own hardware, locally, in pure
+    Rust, with no vendor container, no cloud, no C++.**
+  - Pure Rust, zero llama.cpp/GGUF dependency (this is *how* sovereignty is
+    enforced, not a separate goal).
+  - Runs on the operator's Vulkan GPU and CPU.
+  - Correct: output within tolerance of the source framework for a fixed prompt.
+- **P1 (Primary value — means to P0):**
+  - **Universality:** the next architecture the operator tries is a module, not a
+    rewrite (registry). Whole zoo: dense, GQA, MoE, SSM/linear-attn hybrid,
+    drafters.
+  - **Fit-the-hardware quantization:** native ternary/binary (sub-2-bit) so
+    bigger models run on operator hardware — a *buffer* (Level 11) serving P0,
+    not the goal itself.
+  - Quantize-any-HF-model-on-load (safetensors, vendor-neutral).
 - **P2 (Secondary):** throughput, long context (quantized KV), streaming API.
 - **P3 (Nice-to-have):** speculative decoding, multi-GPU, serving at scale.
 
+**Explicitly NOT a goal (anti-tunnel-vision):**
+- "Support Bonsai" / "support Qwen3" / "support model X" is **not** a P0/P1
+  goal. It is a Level-12 parameter — which test rig validates the harness. The
+  engine must not encode any specific model as special. Picking a reference
+  architecture is a *validation vehicle*, chosen for layer-coverage, discarded
+  after it proves the pipeline.
+
 **Conflict matrix:**
-- Purity (P0) > speed (P2): if a fast path requires a C dep, refuse it.
-- Correctness (P0) > compression (P1): if ternary diverges past tolerance, fall
-  back to Q8 automatically.
-- Zoo breadth (P1) > one-model perfection (P2): registry over Bonsai-only.
+- sovereignty (P0) > speed (P2): if a fast path requires a C dep or a vendor
+  container, refuse it.
+- correctness (P0) > compression (P1): if ternary diverges past tolerance, fall
+  back to Q8 automatically (B3 loop enforces).
+- universality (P1) > one-model perfection (P2): registry over any single model.
 
 ---
 
 ## §4 Leverage Points for Evolution (Step 4)
 
 Mapped to Meadows' 12-point ladder. **We spent 4 hours at Level 12; the fix is
-Levels 3–8.**
+Levels 2–8.** The deepest correction was **Level 2 (paradigm):** we kept
+asking "which model?" when the real question is **"who is this for?"** — the
+*operator*, running a stranger's model on their own hardware. That single
+reframe dissolved the tunnel vision (Bonsai-only, Qwen3-default, GGUF-forensics).
 
 | Axis | Meadows level | Leverage | Why |
 |---|---|---|---|
-| Own the weight format (`.kwe`/safetensors) | **3 (Goals)** + **6 (Info flows)** | High | Decides what is loadable at all |
-| Architecture registry as balancing loop | **8 (Balancing loops)** | High | Prevents monoculture/lock-in |
+| **Paradigm: "who is it for?"** (operator sovereignty over unknown zoo) | **2 (Paradigm)** | Highest | Dissolves model-specific tunnel vision |
+| Goal: operator runs any HF model locally, pure Rust | **3 (Goals)** | High | Decides what the system is *for* |
+| Own the weight format (`.kwe`/safetensors) | **6 (Info flows)** | High | Decides what is loadable at all |
+| Architecture registry as balancing loop | **8 (Balancing loops)** | High | Next model = module, not rewrite |
 | Backend trait (CPU/Vulkan parity) | **4 (Self-org)** | Med-High | New backends = new module |
 | Quant tolerance as a rule | **5 (Rules)** | Med | Bounds accuracy drift |
 | KV dtype auto-selection | **9 (Delays)** | Med | Memory homeostasis |
+| **Which reference architecture to validate with** | **12 (Parameters)** | LOW | Test rig only; discard after pipeline works |
 | Kernel micro-opts, block sizes | **12 (Parameters)** | LOW | What we were grinding |
 
 ### Per-point wrong-direction analysis (high-leverage points)
-- **Weight format (Level 3/6):** *Temptation:* "just parse PrismML's GGUF to get
+- **Paradigm / who is it for (Level 2/3):** *Temptation:* "let's get Bonsai or
+  Qwen3 running, that's the point." *Wrong direction:* re-centers a specific
+  model as the purpose; the next model breaks the design. *Right direction:*
+  build for the *operator + the unknown next model*. Bonsai/Xura are just two
+  possible inputs, not the reason KORE exists.
+- **Weight format (Level 6):** *Temptation:* "just parse PrismML's GGUF to get
   Bonsai working fast." *Wrong direction:* re-integrates the exact problem we fled
   (proprietary, unparseable container) and locks us to one vendor. *Right
-  direction:* safetensors (vendor-neutral) + KORE-owned `.kwe`. Lose the one model
-  today, gain the whole zoo forever.
-- **Registry (Level 8):** *Temptation:* special-case Bonsai with a giant switch.
-  *Wrong:* monoculture, fork-wide edits on every model. *Right:* one module per
-  arch, registry-driven. Adding a model is additive, not invasive.
+  direction:* safetensors (vendor-neutral) + KORE-owned `.kwe`. Lose the one
+  model today, gain the whole zoo forever.
+- **Registry (Level 8):** *Temptation:* special-case one model with a giant
+  switch. *Wrong:* monoculture, fork-wide edits on every new model. *Right:* one
+  module per arch, registry-driven. Adding a model is additive, not invasive.
 - **Backend trait (Level 4):** *Temptation:* hardcode Vulkan-only. *Wrong:* loses
   CPU fallback and portability. *Right:* trait with CPU+Vulkan; parity tests keep
   them honest.
 - **Quant rule (Level 5):** *Temptation:* push ternary everywhere for max
   compression. *Wrong:* silent accuracy collapse. *Right:* ternary by default,
   auto-fallback to Q8 when divergence exceeds tolerance (B3 loop enforces).
+- **Reference architecture (Level 12):** *Temptation:* agonize over which model
+  to support first. *Wrong:* treats a validation rig as a design commitment.
+  *Right:* pick the *simplest* model that exercises every layer (embedding →
+  mixed-quant linear → norm → attention → sampler); use it to prove the
+  pipeline; never optimize it.
 
-**Direction-check:** does this deepen "any model, any quant, one Rust engine,
-operator's GPU, no lock-in" while preserving purity? Yes → push. No → stop.
+**Direction-check:** does this deepen "an operator runs any model on their own
+hardware, locally, in pure Rust, no vendor lock-in" while preserving sovereignty?
+Yes → push. No → stop.
 
 ---
+
+## §4b System Traps
+
+- **Shifting the Burden (B→R):** *How it manifests:* lean on a vendor's container
+  (PrismML GGUF) as a crutch to "get a model running fast," atrophying KORE's own
+  weight pipeline. *Structural cause:* missing B-loop that would force
+  vendor-neutrality. *Defense:* the safetensors-only rule (Level 5/6) — KORE
+  ingests only the universal format; proprietary containers are refused by
+  construction.
+- **Success to the Successful / monoculture (R):** *How:* over-invest in one
+  model (Bonsai) → it becomes the only tested path → others rot. *Defense:* the
+  registry balancing loop (B1) + the "no model is special" rule (§3).
+- **Drift to Low Performance (R+B):** *How:* accept silent ternary accuracy loss
+  to hit a size target. *Defense:* B3 accuracy loop + auto-fallback to Q8.
+- **NOT vulnerable:** tragedy of commons, escalation, rule-beating — this is a
+  single-operator local engine, not a multi-actor contested system.
 
 ## §5 Resilience, Limits, Self-Organization (Step 5)
 
@@ -188,38 +250,52 @@ Applied as structural requirements, not aspirations:
 
 ## §7 llama.cpp's Base Principles, Reintegrated (the brief)
 
-We keep llama.cpp's *structural insights* (the parts that are true regardless of
-implementation), reimplemented in Rust:
+llama.cpp is **for the operator**: run a stranger's model on your own hardware,
+locally, no permission asked. We keep its *structural insights* (true regardless
+of implementation), reimplemented in Rust:
 
 | llama.cpp principle | KORE reimplementation |
 |---|---|
+| Built for the operator, not the model | P0 goal: operator sovereignty over unknown zoo (§1/§3) |
 | Decomposed tensor core | `kore-core` Tensor/Device/autograd |
-| Quant layer abstraction | `kore-btes` (ternary/binary/Q4/Q8) |
+| Quant layer abstraction (fit any hardware) | `kore-btes` (ternary/binary/Q4/Q8) — a *buffer* serving P0 |
 | KV cache, quantizable | `kore-models` KvCache, dtype-configurable |
 | `LLM_ARCH_*` registry | `kore-models` `Model` trait + module per arch |
 | Backend abstraction (CPU/Metal/CUDA) | `Backend` trait (CPU/Vulkan) |
 | GGUF container | **Replaced** by safetensors + `.kwe` (vendor-neutral) |
 | C/C++ kernels | **Replaced** by Rust + `kore-vulkan` (pure Rust) |
 
-**Innovation (the moat):** native sub-2-bit as a first-class dtype;
-quantize-any-HF-model-on-load; and one engine for *both* Xura training and
-inference (same tensor/autograd/backend).
+**Sub-2-bit / one-engine-for-train-and-infer are means, not the moat.** They
+serve P0 (run bigger models on operator hardware; one sovereign runtime for the
+operator's teacher *and* student). The moat is the *purpose*: an operator can
+point KORE at any model and own the run. Native ternary is just the sharpest
+expression of "fit the operator's hardware."
 
 ---
 
 ## §8 Phased Build (leverage-ordered)
 
-- **P0 (Level 3/6):** `.kwe` spec + `kore-convert` (safetensors → `.kwe`, ternary option).
-- **P1 (Level 8):** `kore-models` registry + Qwen3/Llama reference arch.
+- **P0 (Level 6):** `.kwe` spec + `kore-convert` (safetensors → `.kwe`, ternary option).
+- **P1 (Level 8):** `kore-models` registry (`Model` trait) + **one reference
+  architecture chosen only for layer-coverage** (embedding → mixed-quant linear →
+  norm → attention → sampler). Treated as a *validation rig*, not a committed
+  target. Bonsai/Xura slot in later as ordinary modules.
 - **P2 (Level 4):** CPU matmul f16/f32 + ternary/binary dequant (`kore-btes`).
-- **P3 (Level 4):** Vulkan matmul (`kore-vulkan`) on 9060 XT.
-- **P4 (Level 9):** Quantized KV cache (Q4/Q8) for long context.
-- **P5 (Level 4):** Zoo expansion (MoE, SSM/linear-attn, drafter).
+- **P3 (Level 4):** Vulkan matmul (`kore-vulkan`) on operator GPU.
+- **P4 (Level 9):** Quantized KV cache (Q4/Q8) for long context on constrained VRAM.
+- **P5 (Level 4):** Zoo expansion — new arch = new module (MoE, SSM/linear-attn,
+  drafter). Each is additive; registry stays the balancing loop.
 - **P6 (Level 6):** `kore-serve` API + streaming.
 
+**Validation rule (anti-tunnel-vision):** every phase is verified against the
+*operator's* success criterion — "point KORE at a model file, get correct output
+on my hardware" — not "Bonsai runs." The reference arch is swapped freely.
+
 ## §9 Verification (no "green tests = done")
-1. Tiny Qwen3-0.6B safetensors → `.kwe` → KORE **CPU** → token-for-token match vs
-   HF `transformers` on a fixed prompt.
+1. A small **HF model (chosen for layer-coverage, not fame)** → `.kwe` → KORE
+   **CPU** → token-for-token match vs the source framework on a fixed prompt.
 2. Ternary-quantize → KORE CPU → within tolerance.
-3. Same on **Vulkan / 9060 XT** → identical output, faster.
-4. 27B-class model → KORE quantizes to ternary → fits 16 GB → runs.
+3. Same on **Vulkan / operator GPU** → identical output, faster.
+4. A 27B-class model → KORE quantizes to ternary → fits 16 GB → runs.
+5. **Sovereignty check:** swap the validation model for a *different*
+   architecture → it loads as a new module with no core change.
