@@ -1,9 +1,33 @@
-# KORE Inference Engine — Systems Design
+# KORE — Inference Subsystem Design (within the KORE ML Framework)
 
-> Applied systems thinking (Meadows, *Thinking in Systems*) to the design of a
-> pure-Rust LLM/MoE/hybrid inference engine. Reimplements llama.cpp's *proven
-> structural decomposition* as native Rust — **without importing llama.cpp or
-> its container formats.** The whole model zoo is in scope.
+> Applied systems thinking (Meadows, *Thinking in Systems*) to the design of
+> KORE's **inference subsystem** — one part of a larger whole. **KORE is a
+> complete pure-Rust ML framework** (tensor core, autograd, optimizers, training,
+> serving). The inference engine is being *added now*; it is a subsystem, not the
+> product. We are **not** building a PyTorch/TensorFlow competitor — we are
+> building the toolchain that fits *this operator's research*: figuring out what
+> architectures work best, beyond the token dead-end.
+
+---
+
+## §0 Frame: what KORE is, and why the inference engine exists
+
+- **KORE = a complete ML framework**, not an inference engine. Training,
+  autograd, optimizers, and inference all live in one pure-Rust runtime.
+- **The operator's thesis:** tokens are a dead end. The budding future is
+  **alternative architectures — SSM, world models, tokenless / V-JEPA-style.**
+  LLMs are a *resource to learn from* (teacher/distillation source), not the
+  destination.
+- **KORE exists to build new architectures** (e.g. **Xura**: V-JEPA / Mamba3
+  lineage). The inference engine's real job is to be the **evaluation harness**:
+  run a candidate architecture and an LLM teacher through the *same* KORE runtime
+  so you can measure whether the new architecture actually captures intelligence.
+  "One engine for train and infer" matters because the comparison must be
+  apples-to-apples in one framework — not as a feature, but as the research method.
+- **Therefore the inference subsystem is scoped as:** load/run models (including
+  LLM teachers) on the operator's hardware, in pure Rust, vendor-neutral — *so
+  that* the operator can train and evaluate novel architectures alongside them.
+  llama.cpp's lessons inform the *inference* piece; they do not define KORE.
 
 ---
 
@@ -27,21 +51,18 @@
   VRAM pressure → drives KV dtype selection (Q4 vs Q8).
 
 ### Operational purpose (deduced from structure, not the tagline)
-**Who is this for? The operator** — someone with their own hardware (laptop,
-16 GB GPU, phone, Pi) and a model file they did *not* write, who wants to run
-it **locally, privately, on their own metal, without asking NVIDIA, a cloud, or
-the model's vendor for permission.** That is exactly who llama.cpp is for, and
-it is KORE's reason to exist. llama.cpp's goal was never "run Llama well" — it
-is **"run whatever they ship next, on whatever you have, with no code change."**
-KORE inherits that purpose and restates it without the C++ and without the
-proprietary-container dependency.
+**KORE's purpose is architectural research**, not model-serving. The operator is
+building novel (non-token, SSM / world-model / V-JEPA-style) architectures such as
+**Xura**, and using LLMs as a *teacher* to bootstrap them. The inference
+subsystem exists so a candidate architecture and an LLM teacher run in the *same*
+pure-Rust runtime — making "does my architecture capture intelligence?" a
+measurable question.
 
-Therefore KORE optimizes for: **an operator points KORE at any HuggingFace
-model and runs it on their own GPU/CPU, locally, in pure Rust, with
-quantizations that fit their hardware.** Not "run Bonsai." Not "run Qwen3."
-Not "beat llama.cpp's speed." Those are downstream effects, not the purpose.
-The model is a *stranger's* output; KORE is the universal local runtime between
-the operator and the zoo.
+Within that, the inference piece inherits llama.cpp's operator-sovereignty goal
+(run any model on your own hardware, locally, vendor-neutral, pure Rust) — but
+that is a *means* to the research end, not KORE's reason to exist. The operator is
+not "the user who wants to chat with Llama"; the operator is **the researcher
+training the next architecture**, for whom the LLM is one input among many.
 
 ### Boundary
 - **Controllable**: weight format, quant kernels, arch registry, backend.
@@ -111,36 +132,36 @@ the operator and the zoo.
 
 ## §3 Goal Hierarchy (Step 3)
 
-- **P0 (Non-negotiable) — operator sovereignty:**
-  - **The operator runs any HF model on their own hardware, locally, in pure
-    Rust, with no vendor container, no cloud, no C++.**
-  - Pure Rust, zero llama.cpp/GGUF dependency (this is *how* sovereignty is
-    enforced, not a separate goal).
-  - Runs on the operator's Vulkan GPU and CPU.
-  - Correct: output within tolerance of the source framework for a fixed prompt.
-- **P1 (Primary value — means to P0):**
-  - **Universality:** the next architecture the operator tries is a module, not a
-    rewrite (registry). Whole zoo: dense, GQA, MoE, SSM/linear-attn hybrid,
-    drafters.
-  - **Fit-the-hardware quantization:** native ternary/binary (sub-2-bit) so
-    bigger models run on operator hardware — a *buffer* (Level 11) serving P0,
-    not the goal itself.
+- **P0 (Non-negotiable) — enable architectural research:**
+  - **One pure-Rust runtime for train *and* infer**, so candidate architectures
+    (Xura/SSM/world-model) and LLM teachers are compared apples-to-apples.
+  - Tokens are not the ceiling: the framework must express **non-autoregressive /
+    non-token / SSM / world-model** architectures natively, not as a bolt-on.
+  - The operator owns the whole stack — pure Rust, no hidden C++/vendor runtime.
+- **P1 (Primary value — the inference subsystem, a means to P0):**
+  - **Operator sovereignty:** run any HF model (the teacher) on the operator's
+    own hardware, locally, vendor-neutral, pure Rust.
+  - **Universality:** the next architecture is a module, not a rewrite (registry).
+  - **Fit-the-hardware quantization:** native ternary/binary so bigger teachers
+    (and bigger students) run on operator hardware — a *buffer* (Level 11) serving P0.
   - Quantize-any-HF-model-on-load (safetensors, vendor-neutral).
-- **P2 (Secondary):** throughput, long context (quantized KV), streaming API.
+- **P2 (Secondary):** inference throughput, long context (quantized KV), streaming.
 - **P3 (Nice-to-have):** speculative decoding, multi-GPU, serving at scale.
 
 **Explicitly NOT a goal (anti-tunnel-vision):**
-- "Support Bonsai" / "support Qwen3" / "support model X" is **not** a P0/P1
-  goal. It is a Level-12 parameter — which test rig validates the harness. The
-  engine must not encode any specific model as special. Picking a reference
-  architecture is a *validation vehicle*, chosen for layer-coverage, discarded
-  after it proves the pipeline.
+- "Beat PyTorch/TensorFlow" is **not** the goal. KORE is a research tool for *this*
+  operator, not a general-purpose framework competitor.
+- "Support Bonsai" / "support Qwen3" / "support model X" is **not** a P0/P1 goal.
+  It is a Level-12 parameter — which teacher validates the harness. The framework
+  must not encode any specific model as special.
+- "Serve tokens fast" is a *subordinate* concern; tokens are the dead-end the
+  research is moving beyond.
 
 **Conflict matrix:**
-- sovereignty (P0) > speed (P2): if a fast path requires a C dep or a vendor
-  container, refuse it.
-- correctness (P0) > compression (P1): if ternary diverges past tolerance, fall
-  back to Q8 automatically (B3 loop enforces).
+- research enablement (P0) > inference speed (P2): a fast path that can't train
+  novel archs is worthless here.
+- sovereignty (P0) > speed (P2): refuse a C dep or vendor container.
+- correctness (P1) > compression (P1): ternary diverges past tolerance → Q8 fallback.
 - universality (P1) > one-model perfection (P2): registry over any single model.
 
 ---
@@ -155,22 +176,24 @@ reframe dissolved the tunnel vision (Bonsai-only, Qwen3-default, GGUF-forensics)
 
 | Axis | Meadows level | Leverage | Why |
 |---|---|---|---|
-| **Paradigm: "who is it for?"** (operator sovereignty over unknown zoo) | **2 (Paradigm)** | Highest | Dissolves model-specific tunnel vision |
-| Goal: operator runs any HF model locally, pure Rust | **3 (Goals)** | High | Decides what the system is *for* |
+| **Paradigm: "what is KORE for?"** (architectural research, not model-serving) | **2 (Paradigm)** | Highest | Dissolves both token-tunnel-vision AND model-specific tunnel vision |
+| Goal: one pure-Rust train+infer runtime for novel archs + LLM teachers | **3 (Goals)** | High | Decides what the framework *is* |
 | Own the weight format (`.kwe`/safetensors) | **6 (Info flows)** | High | Decides what is loadable at all |
-| Architecture registry as balancing loop | **8 (Balancing loops)** | High | Next model = module, not rewrite |
+| Architecture registry as balancing loop | **8 (Balancing loops)** | High | Next arch = module, not rewrite; student AND teacher coexist |
 | Backend trait (CPU/Vulkan parity) | **4 (Self-org)** | Med-High | New backends = new module |
 | Quant tolerance as a rule | **5 (Rules)** | Med | Bounds accuracy drift |
 | KV dtype auto-selection | **9 (Delays)** | Med | Memory homeostasis |
-| **Which reference architecture to validate with** | **12 (Parameters)** | LOW | Test rig only; discard after pipeline works |
+| **Which teacher model to validate with** | **12 (Parameters)** | LOW | Test rig only; discard after pipeline works |
 | Kernel micro-opts, block sizes | **12 (Parameters)** | LOW | What we were grinding |
 
 ### Per-point wrong-direction analysis (high-leverage points)
-- **Paradigm / who is it for (Level 2/3):** *Temptation:* "let's get Bonsai or
-  Qwen3 running, that's the point." *Wrong direction:* re-centers a specific
-  model as the purpose; the next model breaks the design. *Right direction:*
-  build for the *operator + the unknown next model*. Bonsai/Xura are just two
-  possible inputs, not the reason KORE exists.
+- **Paradigm / what is KORE for (Level 2/3):** *Temptation:* "let's get an LLM
+  running, that's the point" — or "let's beat PyTorch." *Wrong direction:* both
+  re-center KORE on *serving tokens* (the dead end) or on *competing with
+  general frameworks* (not our game). *Right direction:* KORE is the operator's
+  research instrument for **novel architectures** (SSM/world-model/V-JEPA/Xura).
+  The LLM is a *teacher input*, the inference engine a *subsystem* for comparing
+  candidate vs teacher in one runtime. Build for the researcher, not the chatbot.
 - **Weight format (Level 6):** *Temptation:* "just parse PrismML's GGUF to get
   Bonsai working fast." *Wrong direction:* re-integrates the exact problem we fled
   (proprietary, unparseable container) and locks us to one vendor. *Right
@@ -266,30 +289,41 @@ of implementation), reimplemented in Rust:
 | C/C++ kernels | **Replaced** by Rust + `kore-vulkan` (pure Rust) |
 
 **Sub-2-bit / one-engine-for-train-and-infer are means, not the moat.** They
-serve P0 (run bigger models on operator hardware; one sovereign runtime for the
-operator's teacher *and* student). The moat is the *purpose*: an operator can
-point KORE at any model and own the run. Native ternary is just the sharpest
-expression of "fit the operator's hardware."
+serve P0: native ternary fits bigger teachers *and* bigger students on operator
+hardware, and one runtime lets you compare a candidate architecture against an LLM
+teacher apples-to-apples. The moat is the *purpose*: KORE is the operator's
+sovereign instrument for discovering what architectures work — tokens optional,
+research first. The inference subsystem is one part of that instrument.
 
 ---
 
 ## §8 Phased Build (leverage-ordered)
 
+The inference subsystem is built *to serve research*, not as a product. Each phase
+is sequenced by leverage (§4), and the whole thing exists so the operator can
+train-and-evaluate novel architectures (Xura/SSM/world-model) next to LLM teachers
+in one runtime. KORE already has the training side (`xura-*` crates: autograd,
+optimizers, V-JEPA teacher); this plan adds the inference/evaluation half.
+
 - **P0 (Level 6):** `.kwe` spec + `kore-convert` (safetensors → `.kwe`, ternary option).
 - **P1 (Level 8):** `kore-models` registry (`Model` trait) + **one reference
   architecture chosen only for layer-coverage** (embedding → mixed-quant linear →
-  norm → attention → sampler). Treated as a *validation rig*, not a committed
-  target. Bonsai/Xura slot in later as ordinary modules.
+  norm → attention → sampler). Treated as a *validation rig* for the teacher
+  path, not a committed target. Xura/SSM/world-model slot in later as ordinary
+  modules — and those are the point.
 - **P2 (Level 4):** CPU matmul f16/f32 + ternary/binary dequant (`kore-btes`).
 - **P3 (Level 4):** Vulkan matmul (`kore-vulkan`) on operator GPU.
 - **P4 (Level 9):** Quantized KV cache (Q4/Q8) for long context on constrained VRAM.
-- **P5 (Level 4):** Zoo expansion — new arch = new module (MoE, SSM/linear-attn,
-  drafter). Each is additive; registry stays the balancing loop.
-- **P6 (Level 6):** `kore-serve` API + streaming.
+- **P5 (Level 4):** Zoo + novel-arch expansion — new arch = new module (MoE,
+  SSM/linear-attn, world-model, drafter). Each is additive; registry stays the
+  balancing loop. **This is where Xura lives.**
+- **P6 (Level 6):** `kore-serve` API + streaming (for the teacher/serving side).
 
 **Validation rule (anti-tunnel-vision):** every phase is verified against the
-*operator's* success criterion — "point KORE at a model file, get correct output
-on my hardware" — not "Bonsai runs." The reference arch is swapped freely.
+*operator's* success criterion — "point KORE at a teacher model, get correct
+output on my hardware, and run a candidate architecture through the same
+runtime" — not "Bonsai runs" and not "tokens per second." The reference arch is
+swapped freely; the novel-arch path is the real deliverable.
 
 ## §9 Verification (no "green tests = done")
 1. A small **HF model (chosen for layer-coverage, not fame)** → `.kwe` → KORE
@@ -299,3 +333,7 @@ on my hardware" — not "Bonsai runs." The reference arch is swapped freely.
 4. A 27B-class model → KORE quantizes to ternary → fits 16 GB → runs.
 5. **Sovereignty check:** swap the validation model for a *different*
    architecture → it loads as a new module with no core change.
+6. **Research-enablement check (the real P0):** a candidate *novel* architecture
+   (e.g. an Xura/SSM/world-model variant) trains and runs in the **same** KORE
+   runtime as the LLM teacher, so the two are comparable apples-to-apples. This is
+   the criterion that distinguishes KORE from "an inference engine."
