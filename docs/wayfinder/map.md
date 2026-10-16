@@ -39,7 +39,9 @@ body-file, never inline `--body`.
   CUDA/ROCm/Vulkan kernels, fusion, thread-block clusters; pin invariants.
 
 - **KV-cache + paged KV + KV quantization** (wayfinder:task) - larger batches and
-  longer context without OOM; cut memory-bound stalls.
+  longer context without OOM; cut memory-bound stalls. Pinned finding (2026-10-16):
+  the bottleneck is the attention/KV memory path (KC/VC re-read as F32 per decode
+  step), not matmul. Design: `docs/research/kv-attention-design.md`.
 
 - **Speculative decoding (MTP)** (wayfinder:task) - raise effective tokens/sec with a
   cheap draft head; lossless.
