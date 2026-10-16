@@ -20,6 +20,7 @@ kore-attention.workspace = true
 oxillama-gguf.workspace = true
 oxillama-quant.workspace = true
 rayon.workspace = true
+memmap2.workspace = true
 
 [dependencies.cudarc]
 workspace = true
