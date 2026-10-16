@@ -41,9 +41,3 @@ pub enum VulkanError {
     #[error("Backend not initialized")]
     NotInitialized,
 }
-
-impl From<vulkan_kernels::runtime::VulkanKernelError> for VulkanError {
-    fn from(e: vulkan_kernels::runtime::VulkanKernelError) -> VulkanError {
-        VulkanError::Kernel(e.to_string())
-    }
-}

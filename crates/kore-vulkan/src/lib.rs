@@ -34,17 +34,16 @@ pub mod buffer;
 pub mod error;
 pub mod ops;
 
-pub use backend::VulkanBackend;
+pub use backend::{register_vulkan_backend, VulkanBackend};
 pub use buffer::{KoreVulkanBuffer, ToVulkanBuffer};
 pub use error::{Result, VulkanError};
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::VulkanBackend;
 
     #[test]
-    fn test_backend_imports() {
-        // Just test that the types are available
-        let _ = std::sync::Arc::new(1);
+    fn test_backend_type_exists() {
+        let _ = std::mem::size_of::<VulkanBackend>();
     }
 }

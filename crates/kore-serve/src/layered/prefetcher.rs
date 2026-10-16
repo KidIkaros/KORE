@@ -105,9 +105,10 @@ impl LayerPrefetcher {
         };
 
         let weights = match pending {
-            Some(PendingLayer::Loading(rx)) => rx
-                .await
-                .map_err(|_| "prefetch channel closed".to_string())??,
+            Some(PendingLayer::Loading(rx)) => match rx.await {
+                Ok(Ok(w)) => w,
+                _ => load_layer_from_disk(&self.shard_dir, layer_name)?,
+            },
             None => {
                 // Not prefetched — load synchronously
                 load_layer_from_disk(&self.shard_dir, layer_name)?
@@ -192,18 +193,17 @@ impl LayerPrefetcher {
             return;
         }
 
-        let (tx, rx) = oneshot::channel();
-        pending_map.insert(idx, PendingLayer::Loading(rx));
-
         // Verify a Tokio runtime is available before spawning.
-        // If not, send an error immediately so callers never hang.
         let handle = match tokio::runtime::Handle::try_current() {
             Ok(h) => h,
             Err(_) => {
-                let _ = tx.send(Err("no async runtime available for prefetch".into()));
+                // No async runtime available — get_layer will load synchronously.
                 return;
             }
         };
+
+        let (tx, rx) = oneshot::channel();
+        pending_map.insert(idx, PendingLayer::Loading(rx));
 
         let shard_dir = self.shard_dir.clone();
         let profiling = self.profiling;
@@ -262,6 +262,10 @@ impl std::fmt::Display for PrefetcherStats {
 ///
 /// Expects the file at `<shard_dir>/<layer_name>.safetensors`.
 pub fn load_layer_from_disk(shard_dir: &Path, layer_name: &str) -> Result<LayerWeights, String> {
+    if shard_dir.is_file() {
+        return super::gguf_loader::load_layer_from_gguf(shard_dir, layer_name);
+    }
+
     let safe_name = sanitize_layer_name(layer_name);
     let path = shard_dir.join(format!("{safe_name}.safetensors"));
 

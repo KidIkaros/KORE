@@ -22,3 +22,6 @@ tokio-stream.workspace = true
 async-stream.workspace = true
 safetensors.workspace = true
 sysinfo = "0.31"
+oxillama-gguf = "0.1.4"
+oxillama-quant = "0.1.4"
+bytemuck.workspace = true

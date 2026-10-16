@@ -22,6 +22,20 @@ pub struct CudaBuffer {
     pub(crate) nbytes: usize,
 }
 
+impl kore_core::storage::DeviceStorage for CudaBuffer {
+    fn nbytes(&self) -> usize {
+        self.nbytes
+    }
+
+    fn device(&self) -> kore_core::Device {
+        kore_core::Device::Cuda(self.device_idx)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 impl CudaBuffer {
     /// Allocate zeroed GPU memory.
     pub fn zeros(device_idx: usize, nbytes: usize) -> Result<Self, CudaError> {

@@ -17,6 +17,9 @@ rand.workspace = true
 safetensors.workspace = true
 half.workspace = true
 kore-attention.workspace = true
+oxillama-gguf.workspace = true
+oxillama-quant.workspace = true
+rayon.workspace = true
 
 [dependencies.cudarc]
 workspace = true
@@ -24,4 +27,7 @@ optional = true
 
 [features]
 default = []
-cuda = ["dep:cudarc", "kore-kernels/cuda", "kore-core/cuda"]
+cuda = ["dep:cudarc", "kore-kernels/cuda"]
+
+[dev-dependencies]
+kore-vulkan.workspace = true

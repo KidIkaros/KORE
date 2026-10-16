@@ -33,6 +33,15 @@ pub fn gelu(input: &Tensor) -> kore_core::Result<Tensor> {
 
 /// SiLU (Swish) activation: x * sigmoid(x)
 pub fn silu(input: &Tensor) -> kore_core::Result<Tensor> {
+    if !input.device().is_cpu() {
+        let backend = kore_core::device::get_backend(input.device()).ok_or_else(|| {
+            KoreError::StorageError(format!(
+                "No registered backend for device {}",
+                input.device()
+            ))
+        })?;
+        return backend.silu(input);
+    }
     if input.dtype() != DType::F32 {
         return Err(KoreError::UnsupportedDType(input.dtype()));
     }
@@ -42,6 +51,21 @@ pub fn silu(input: &Tensor) -> kore_core::Result<Tensor> {
         .ok_or_else(|| KoreError::UnsupportedDType(input.dtype()))?;
     let result: Vec<f32> = slice.iter().map(|&x| x / (1.0 + (-x).exp())).collect();
     Ok(Tensor::from_f32(&result, input.shape().dims()))
+}
+
+/// Fused SwiGLU: silu(gate) * up
+pub fn swiglu(gate: &Tensor, up: &Tensor) -> kore_core::Result<Tensor> {
+    if !gate.device().is_cpu() {
+        let backend = kore_core::device::get_backend(gate.device()).ok_or_else(|| {
+            KoreError::StorageError(format!(
+                "No registered backend for device {}",
+                gate.device()
+            ))
+        })?;
+        return backend.swiglu(gate, up);
+    }
+    let s = silu(gate)?;
+    s.mul(up)
 }
 
 /// Sigmoid activation: 1 / (1 + exp(-x))

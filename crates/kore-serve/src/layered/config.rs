@@ -142,6 +142,11 @@ impl LayeredConfig {
         })
     }
 
+    /// Try to load config from a GGUF file.
+    pub fn from_gguf(gguf_path: &std::path::Path) -> Option<Self> {
+        super::gguf_loader::config_from_gguf(gguf_path).ok()
+    }
+
     /// Build a list of all layer names in forward-pass order.
     pub fn layer_names(&self) -> Vec<String> {
         let mut names = Vec::with_capacity(self.num_layers + 3);

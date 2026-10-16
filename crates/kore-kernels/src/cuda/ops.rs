@@ -3,14 +3,32 @@
 //! Each function loads the relevant PTX module (compiled from .cu source at runtime),
 //! allocates output GPU memory, launches the kernel, and returns the result buffer.
 
+#![allow(
+    clippy::too_many_arguments,
+    clippy::manual_div_ceil,
+    clippy::type_complexity
+)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use cudarc::driver::{CudaDevice, CudaSlice, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaSlice, DeviceRepr, LaunchAsync, LaunchConfig};
 use parking_lot::Mutex;
 
 use super::context::CudaError;
 use super::launch::{get_or_load_func, grid_1d};
+
+macro_rules! launch_params {
+    ($func:expr, $cfg:expr, [ $($arg:expr),* $(,)? ]) => {{
+        #[allow(unused_mut)]
+        let mut params = [
+            $(
+                DeviceRepr::as_kernel_param(&$arg),
+            )*
+        ];
+        $func.launch($cfg, &mut params[..])
+    }};
+}
 
 // ============================================================================
 // Cached dummy buffer for optional kernel parameters
@@ -77,6 +95,33 @@ fn binary_op(
     Ok(out)
 }
 
+fn binary_op_broadcast(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    a: &CudaSlice<u8>,
+    b: &CudaSlice<u8>,
+    n: usize,
+    a_n: usize,
+    b_n: usize,
+    func_name: &str,
+    bcast_func_name: &str,
+) -> Result<CudaSlice<u8>, CudaError> {
+    if a_n == n && b_n == n {
+        binary_op(dev, dev_idx, a, b, n, func_name)
+    } else {
+        let f = get_or_load_func(dev, dev_idx, "elementwise", bcast_func_name, ELEMENTWISE_CU)?;
+        let out = dev
+            .alloc_zeros::<u8>(n * 4)
+            .map_err(|e| CudaError::MemoryError(e.to_string()))?;
+        let cfg = grid_1d(n, BLOCK_SIZE);
+        unsafe {
+            f.launch(cfg, (a, b, &out, n as u32, a_n as u32, b_n as u32))
+                .map_err(|e| CudaError::LaunchError(e.to_string()))?;
+        }
+        Ok(out)
+    }
+}
+
 pub fn cuda_add_f32(
     dev: &Arc<CudaDevice>,
     dev_idx: usize,
@@ -85,6 +130,28 @@ pub fn cuda_add_f32(
     n: usize,
 ) -> Result<CudaSlice<u8>, CudaError> {
     binary_op(dev, dev_idx, a, b, n, "add_f32")
+}
+
+pub fn cuda_add_broadcast_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    a: &CudaSlice<u8>,
+    b: &CudaSlice<u8>,
+    n: usize,
+    a_n: usize,
+    b_n: usize,
+) -> Result<CudaSlice<u8>, CudaError> {
+    binary_op_broadcast(
+        dev,
+        dev_idx,
+        a,
+        b,
+        n,
+        a_n,
+        b_n,
+        "add_f32",
+        "add_broadcast_f32",
+    )
 }
 
 pub fn cuda_sub_f32(
@@ -97,6 +164,28 @@ pub fn cuda_sub_f32(
     binary_op(dev, dev_idx, a, b, n, "sub_f32")
 }
 
+pub fn cuda_sub_broadcast_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    a: &CudaSlice<u8>,
+    b: &CudaSlice<u8>,
+    n: usize,
+    a_n: usize,
+    b_n: usize,
+) -> Result<CudaSlice<u8>, CudaError> {
+    binary_op_broadcast(
+        dev,
+        dev_idx,
+        a,
+        b,
+        n,
+        a_n,
+        b_n,
+        "sub_f32",
+        "sub_broadcast_f32",
+    )
+}
+
 pub fn cuda_mul_f32(
     dev: &Arc<CudaDevice>,
     dev_idx: usize,
@@ -107,6 +196,28 @@ pub fn cuda_mul_f32(
     binary_op(dev, dev_idx, a, b, n, "mul_f32")
 }
 
+pub fn cuda_mul_broadcast_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    a: &CudaSlice<u8>,
+    b: &CudaSlice<u8>,
+    n: usize,
+    a_n: usize,
+    b_n: usize,
+) -> Result<CudaSlice<u8>, CudaError> {
+    binary_op_broadcast(
+        dev,
+        dev_idx,
+        a,
+        b,
+        n,
+        a_n,
+        b_n,
+        "mul_f32",
+        "mul_broadcast_f32",
+    )
+}
+
 pub fn cuda_div_f32(
     dev: &Arc<CudaDevice>,
     dev_idx: usize,
@@ -115,6 +226,28 @@ pub fn cuda_div_f32(
     n: usize,
 ) -> Result<CudaSlice<u8>, CudaError> {
     binary_op(dev, dev_idx, a, b, n, "div_f32")
+}
+
+pub fn cuda_div_broadcast_f32(
+    dev: &Arc<CudaDevice>,
+    dev_idx: usize,
+    a: &CudaSlice<u8>,
+    b: &CudaSlice<u8>,
+    n: usize,
+    a_n: usize,
+    b_n: usize,
+) -> Result<CudaSlice<u8>, CudaError> {
+    binary_op_broadcast(
+        dev,
+        dev_idx,
+        a,
+        b,
+        n,
+        a_n,
+        b_n,
+        "div_f32",
+        "div_broadcast_f32",
+    )
 }
 
 // ============================================================================
@@ -1014,9 +1147,10 @@ pub fn cuda_mamba3_scan_f32(
         shared_mem_bytes: 0,
     };
     unsafe {
-        f1.launch(
+        launch_params!(
+            f1,
             cfg1,
-            (
+            [
                 x,
                 dt,
                 a_real,
@@ -1045,7 +1179,7 @@ pub fn cuda_mamba3_scan_f32(
                 alpha,
                 dt_softplus as u32,
                 use_rope as u32,
-            ),
+            ]
         )
         .map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }
@@ -1066,9 +1200,10 @@ pub fn cuda_mamba3_scan_f32(
             shared_mem_bytes: 0,
         };
         unsafe {
-            f2.launch(
+            launch_params!(
+                f2,
                 cfg2,
-                (
+                [
                     &chunk_last_h,
                     &chunk_last_bx,
                     a_real,
@@ -1082,7 +1217,7 @@ pub fn cuda_mamba3_scan_f32(
                     num_chunks as u32,
                     alpha,
                     dt_softplus as u32,
-                ),
+                ]
             )
             .map_err(|e| CudaError::LaunchError(e.to_string()))?;
         }
@@ -1199,9 +1334,10 @@ pub fn cuda_mamba3_scan_backward_f32(
         shared_mem_bytes: 0,
     };
     unsafe {
-        f.launch(
+        launch_params!(
+            f,
             cfg,
-            (
+            [
                 grad_output,
                 x,
                 dt,
@@ -1231,7 +1367,7 @@ pub fn cuda_mamba3_scan_backward_f32(
                 alpha,
                 dt_softplus as u32,
                 use_rope as u32,
-            ),
+            ]
         )
         .map_err(|e| CudaError::LaunchError(e.to_string()))?;
     }

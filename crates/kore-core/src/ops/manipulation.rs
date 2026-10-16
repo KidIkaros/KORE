@@ -299,6 +299,12 @@ impl Tensor {
             )));
         }
 
+        if !self.device().is_cpu() && axis == ndim - 1 {
+            if let Some(backend) = crate::device::get_backend(self.device()) {
+                return backend.softmax(self);
+            }
+        }
+
         let data = self.contiguous();
         let src = data.as_f32_slice().unwrap();
         let mut result = src.to_vec();

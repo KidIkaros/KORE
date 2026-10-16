@@ -13,3 +13,5 @@ pub mod flash;
 pub mod kv_cache;
 pub mod mask;
 pub mod scaled_dot;
+
+pub use kv_cache::{KvCache, KvCacheQuantMode};

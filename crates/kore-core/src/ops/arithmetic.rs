@@ -38,10 +38,22 @@ fn with_grad(result: Tensor, grad_fn: Box<dyn GradFn>, inputs: Vec<Arc<GradNode>
 impl Tensor {
     /// Element-wise addition: self + other.
     pub fn add(&self, other: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_binary_op(self, other, "add_f32");
+        if !self.device().is_cpu() {
+            if self.device() != other.device() {
+                return Err(KoreError::DeviceMismatch {
+                    expected: self.device(),
+                    got: other.device(),
+                });
+            }
+            let backend = crate::device::get_backend(self.device()).ok_or_else(|| {
+                KoreError::StorageError(format!(
+                    "No registered backend for device {}",
+                    self.device()
+                ))
+            })?;
+            return backend.add(self, other);
         }
+
         let result = binary_op(self, other, |a, b| a + b)?;
         if any_tracks_grad(&[self, other]) {
             Ok(with_grad(
@@ -56,10 +68,22 @@ impl Tensor {
 
     /// Element-wise subtraction: self - other.
     pub fn sub(&self, other: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_binary_op(self, other, "sub_f32");
+        if !self.device().is_cpu() {
+            if self.device() != other.device() {
+                return Err(KoreError::DeviceMismatch {
+                    expected: self.device(),
+                    got: other.device(),
+                });
+            }
+            let backend = crate::device::get_backend(self.device()).ok_or_else(|| {
+                KoreError::StorageError(format!(
+                    "No registered backend for device {}",
+                    self.device()
+                ))
+            })?;
+            return backend.sub(self, other);
         }
+
         let result = binary_op(self, other, |a, b| a - b)?;
         if any_tracks_grad(&[self, other]) {
             Ok(with_grad(
@@ -74,10 +98,22 @@ impl Tensor {
 
     /// Element-wise multiplication: self * other.
     pub fn mul(&self, other: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_binary_op(self, other, "mul_f32");
+        if !self.device().is_cpu() {
+            if self.device() != other.device() {
+                return Err(KoreError::DeviceMismatch {
+                    expected: self.device(),
+                    got: other.device(),
+                });
+            }
+            let backend = crate::device::get_backend(self.device()).ok_or_else(|| {
+                KoreError::StorageError(format!(
+                    "No registered backend for device {}",
+                    self.device()
+                ))
+            })?;
+            return backend.mul(self, other);
         }
+
         let result = binary_op(self, other, |a, b| a * b)?;
         if any_tracks_grad(&[self, other]) {
             Ok(with_grad(
@@ -95,10 +131,22 @@ impl Tensor {
 
     /// Element-wise division: self / other.
     pub fn div(&self, other: &Tensor) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_binary_op(self, other, "div_f32");
+        if !self.device().is_cpu() {
+            if self.device() != other.device() {
+                return Err(KoreError::DeviceMismatch {
+                    expected: self.device(),
+                    got: other.device(),
+                });
+            }
+            let backend = crate::device::get_backend(self.device()).ok_or_else(|| {
+                KoreError::StorageError(format!(
+                    "No registered backend for device {}",
+                    self.device()
+                ))
+            })?;
+            return backend.div(self, other);
         }
+
         let result = binary_op(self, other, |a, b| a / b)?;
         if any_tracks_grad(&[self, other]) {
             Ok(with_grad(
@@ -116,10 +164,6 @@ impl Tensor {
 
     /// Element-wise negation: -self.
     pub fn neg(&self) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_unary_op(self, "neg_f32");
-        }
         let result = unary_op(self, |a| -a)?;
         if any_tracks_grad(&[self]) {
             Ok(with_grad(
@@ -134,10 +178,6 @@ impl Tensor {
 
     /// Element-wise absolute value.
     pub fn abs(&self) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_unary_op(self, "abs_f32");
-        }
         let result = unary_op(self, |a| a.abs())?;
         if any_tracks_grad(&[self]) {
             Ok(with_grad(
@@ -154,10 +194,6 @@ impl Tensor {
 
     /// Element-wise square root.
     pub fn sqrt(&self) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_unary_op(self, "sqrt_f32");
-        }
         let result = unary_op(self, |a| a.sqrt())?;
         if any_tracks_grad(&[self]) {
             let bw = Box::new(autograd::SqrtBackward {
@@ -176,10 +212,6 @@ impl Tensor {
 
     /// Element-wise exponential: e^self.
     pub fn exp(&self) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_unary_op(self, "exp_f32");
-        }
         let result = unary_op(self, |a| a.exp())?;
         if any_tracks_grad(&[self]) {
             let bw = Box::new(autograd::ExpBackward {
@@ -193,10 +225,6 @@ impl Tensor {
 
     /// Element-wise natural logarithm.
     pub fn log(&self) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_unary_op(self, "log_f32");
-        }
         let result = unary_op(self, |a| a.ln())?;
         if any_tracks_grad(&[self]) {
             Ok(with_grad(
@@ -213,10 +241,6 @@ impl Tensor {
 
     /// Element-wise power: self^exponent.
     pub fn pow_scalar(&self, exponent: f32) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_scalar_op(self, exponent, "pow_scalar_f32");
-        }
         let result = unary_op(self, |a| a.powf(exponent))?;
         if any_tracks_grad(&[self]) {
             Ok(with_grad(
@@ -234,10 +258,16 @@ impl Tensor {
 
     /// Scalar addition: self + scalar.
     pub fn add_scalar(&self, scalar: f32) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_scalar_op(self, scalar, "add_scalar_f32");
+        if !self.device().is_cpu() {
+            let backend = crate::device::get_backend(self.device()).ok_or_else(|| {
+                KoreError::StorageError(format!(
+                    "No registered backend for device {}",
+                    self.device()
+                ))
+            })?;
+            return backend.add_scalar(self, scalar);
         }
+
         let result = unary_op(self, |a| a + scalar)?;
         if any_tracks_grad(&[self]) {
             Ok(with_grad(
@@ -252,10 +282,16 @@ impl Tensor {
 
     /// Scalar multiplication: self * scalar.
     pub fn mul_scalar(&self, scalar: f32) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_scalar_op(self, scalar, "mul_scalar_f32");
+        if !self.device().is_cpu() {
+            let backend = crate::device::get_backend(self.device()).ok_or_else(|| {
+                KoreError::StorageError(format!(
+                    "No registered backend for device {}",
+                    self.device()
+                ))
+            })?;
+            return backend.mul_scalar(self, scalar);
         }
+
         let result = unary_op(self, |a| a * scalar)?;
         if any_tracks_grad(&[self]) {
             Ok(with_grad(
@@ -274,6 +310,22 @@ impl Tensor {
     /// - [M, K] @ [K, N] → [M, N]
     /// - [B, M, K] @ [B, K, N] → [B, M, N] (batched)
     pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
+        if !self.device().is_cpu() {
+            if self.device() != other.device() {
+                return Err(KoreError::DeviceMismatch {
+                    expected: self.device(),
+                    got: other.device(),
+                });
+            }
+            let backend = crate::device::get_backend(self.device()).ok_or_else(|| {
+                KoreError::StorageError(format!(
+                    "No registered backend for device {}",
+                    self.device()
+                ))
+            })?;
+            return backend.matmul(self, other);
+        }
+
         let a = self.contiguous();
         let b = other.contiguous();
 
@@ -285,13 +337,7 @@ impl Tensor {
         }
 
         let result = match (a_dims.len(), b_dims.len()) {
-            (2, 2) => {
-                #[cfg(feature = "cuda")]
-                if a.is_cuda() {
-                    return crate::ops::cuda_ops::cuda_matmul_2d(&a, &b);
-                }
-                matmul_2d(&a, &b)?
-            }
+            (2, 2) => matmul_2d(&a, &b)?,
             (3, 3) => matmul_batched(&a, &b)?,
             (2, 1) => matvec(&a, &b)?,
             _ => {
@@ -318,10 +364,6 @@ impl Tensor {
 
     /// Clamp all elements to [min, max].
     pub fn clamp(&self, min: f32, max: f32) -> Result<Tensor> {
-        #[cfg(feature = "cuda")]
-        if self.is_cuda() {
-            return crate::ops::cuda_ops::cuda_clamp(self, min, max);
-        }
         let result = unary_op(self, |a| a.clamp(min, max))?;
         if any_tracks_grad(&[self]) {
             Ok(with_grad(

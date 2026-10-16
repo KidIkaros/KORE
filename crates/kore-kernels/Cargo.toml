@@ -13,17 +13,14 @@ rayon.workspace = true
 half = "2.3"
 thiserror.workspace = true
 parking_lot.workspace = true
+oxillama-quant = "0.1.4"
+oxillama-gguf = "0.1.4"
 
 [features]
 default = []
-cuda = ["dep:cudarc", "kore-core/cuda"]
-rocm = ["dep:libloading"]
+cuda = ["dep:cudarc"]
 
 [dependencies.cudarc]
-workspace = true
-optional = true
-
-[dependencies.libloading]
 workspace = true
 optional = true
 

@@ -429,72 +429,63 @@ impl Tensor {
         self.storage.is_vulkan()
     }
 
-    /// Move tensor to the specified device. No-op if already there.
-    #[cfg(feature = "cuda")]
+    /// Move tensor to the specified device. No-op if already on that device.
     pub fn to(&self, device: Device) -> Result<Tensor> {
-        match device {
-            Device::Cpu => {
-                if self.device().is_cpu() {
-                    return Ok(self.clone());
-                }
-                let cpu_storage = self.storage.to_cpu()?;
-                Ok(Tensor {
-                    storage: cpu_storage,
-                    shape: self.shape.clone(),
-                    strides: self.strides.clone(),
-                    offset: self.offset,
-                    requires_grad: self.requires_grad,
-                    grad_node: self.grad_node.clone(),
-                })
-            }
-            Device::Cuda(idx) => {
-                if let Device::Cuda(cur) = self.device() {
-                    if cur == idx {
-                        return Ok(self.clone());
-                    }
-                }
-                // Must be contiguous before transfer
-                let cont = self.contiguous();
-                let cuda_storage = cont.storage.to_cuda(idx)?;
-                Ok(Tensor {
-                    storage: cuda_storage,
-                    shape: cont.shape.clone(),
-                    strides: cont.strides.clone(),
-                    offset: 0,
-                    requires_grad: cont.requires_grad,
-                    grad_node: cont.grad_node.clone(),
-                })
-            }
-            Device::Vulkan(_) => {
-                // Vulkan device transfer requires kore-vulkan crate
-                // Use kore_vulkan::VulkanBackend for explicit transfer
-                Err(KoreError::StorageError(
-                    "Vulkan device transfer requires kore-vulkan crate. Use VulkanBackend::transfer() instead.".to_string()
-                ))
-            }
+        if self.device() == device {
+            return Ok(self.clone());
         }
+
+        if device == Device::Cpu {
+            if self.device().is_cpu() {
+                return Ok(self.clone());
+            }
+            let backend = crate::device::get_backend(self.device()).ok_or_else(|| {
+                KoreError::StorageError(format!(
+                    "No registered backend found to transfer tensor from device '{}' to CPU",
+                    self.device()
+                ))
+            })?;
+            let cpu_storage = backend.copy_to_cpu(&self.storage)?;
+            return Ok(Tensor {
+                storage: cpu_storage,
+                shape: self.shape.clone(),
+                strides: self.strides.clone(),
+                offset: self.offset,
+                requires_grad: self.requires_grad,
+                grad_node: self.grad_node.clone(),
+            });
+        }
+
+        let backend = crate::device::get_backend(device).ok_or_else(|| {
+            KoreError::StorageError(format!(
+                "Device backend for '{}' is not registered. Ensure the corresponding backend crate (e.g. kore-vulkan or kore-kernels) is linked and initialized.",
+                device
+            ))
+        })?;
+
+        let cont = self.contiguous();
+        let dev_storage = backend.copy_to_device(&cont.storage, device)?;
+        Ok(Tensor {
+            storage: dev_storage,
+            shape: cont.shape.clone(),
+            strides: cont.strides.clone(),
+            offset: 0,
+            requires_grad: cont.requires_grad,
+            grad_node: cont.grad_node.clone(),
+        })
     }
 
-    /// Move tensor to CUDA device (convenience for `.to(Device::Cuda(idx))`).
-    #[cfg(feature = "cuda")]
+    /// Move tensor to CUDA device (convenience for `.to(Device::Cuda(device_idx))`).
     pub fn cuda(&self, device_idx: usize) -> Result<Tensor> {
         self.to(Device::Cuda(device_idx))
     }
 
-    /// Move tensor to Vulkan device (convenience for `.to(Device::Vulkan(idx))`).
-    ///
-    /// Note: This requires the kore-vulkan crate for actual transfer.
-    /// The tensor will be marked as Vulkan device but operations require VulkanBackend.
-    pub fn vulkan(&self, _device_idx: usize) -> Result<Tensor> {
-        // Vulkan device transfer requires kore-vulkan crate
-        // Use kore_vulkan::VulkanBackend::transfer() for actual GPU transfer
-        Err(KoreError::StorageError(
-            "Vulkan device transfer requires kore-vulkan crate. Use VulkanBackend::transfer() instead.".to_string()
-        ))
+    /// Move tensor to Vulkan device (convenience for `.to(Device::Vulkan(device_idx))`).
+    pub fn vulkan(&self, device_idx: usize) -> Result<Tensor> {
+        self.to(Device::Vulkan(device_idx))
     }
 
     /// Move tensor to CPU (convenience for `.to(Device::Cpu)`).
-    #[cfg(feature = "cuda")]
     pub fn cpu(&self) -> Result<Tensor> {
         self.to(Device::Cpu)
     }
@@ -503,6 +494,21 @@ impl Tensor {
     pub fn contiguous(&self) -> Tensor {
         if self.is_contiguous() {
             return self.clone();
+        }
+
+        let dev = self.device();
+        if !dev.is_cpu() {
+            if let Some(backend) = crate::device::get_backend(dev) {
+                if let Ok(dev_tensor) = backend.contiguous(self) {
+                    return dev_tensor;
+                }
+            }
+            if let Ok(cpu_tensor) = self.cpu() {
+                let cont_cpu = cpu_tensor.contiguous();
+                if let Ok(dev_tensor) = cont_cpu.to(dev) {
+                    return dev_tensor;
+                }
+            }
         }
 
         // For now, only support F32 contiguous copy
@@ -522,6 +528,152 @@ impl Tensor {
             // Fallback: clone (already contiguous for fresh tensors)
             self.clone()
         }
+    }
+
+    /// Slice contiguous rows `[start_row .. start_row + num_rows, :]` from a 2D tensor.
+    pub fn slice_rows(&self, start_row: usize, num_rows: usize) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dims.len() != 2 {
+            return Err(KoreError::ShapeMismatch {
+                expected: vec![0, 0],
+                got: dims.to_vec(),
+            });
+        }
+        let rows = dims[0];
+        let cols = dims[1];
+        if start_row + num_rows > rows {
+            return Err(KoreError::IndexOutOfBounds {
+                axis: 0,
+                index: start_row + num_rows,
+                size: rows,
+            });
+        }
+        if start_row == 0 && num_rows == rows && self.is_contiguous() {
+            return Ok(self.clone());
+        }
+
+        let dev = self.device();
+        if !dev.is_cpu() {
+            if let Some(backend) = crate::device::get_backend(dev) {
+                if let Ok(sliced) = backend.slice_rows(self, start_row, num_rows) {
+                    return Ok(sliced);
+                }
+            }
+            let cpu_t = self.cpu()?;
+            let sliced_cpu = cpu_t.slice_rows(start_row, num_rows)?;
+            return sliced_cpu.to(dev);
+        }
+
+        let cont = self.contiguous();
+        let data = cont
+            .as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(self.dtype()))?;
+        let slice = &data[start_row * cols..(start_row + num_rows) * cols];
+        Ok(Tensor::from_f32(slice, &[num_rows, cols]))
+    }
+
+    /// Apply a self-inverse normalized Fast Walsh-Hadamard Transform (`fwht`) along the last dimension.
+    ///
+    /// Uses a block size of `min(1 << cols.trailing_zeros(), 256)` so both power-of-2 dimensions
+    /// and composite hidden dimensions (e.g. `384 = 3 * 128`, `1536 = 6 * 256`) are orthogonal
+    /// and self-inverse (`t.hadamard()?.hadamard()? == t`).
+    pub fn hadamard(&self) -> Result<Tensor> {
+        let dims = self.shape.dims();
+        if dims.is_empty() {
+            return Ok(self.clone());
+        }
+        let cols = *dims.last().unwrap();
+        if cols == 0 {
+            return Ok(self.clone());
+        }
+
+        let dev = self.device();
+        if !dev.is_cpu() {
+            if let Some(backend) = crate::device::get_backend(dev) {
+                if let Ok(res) = backend.hadamard_transform(self) {
+                    return Ok(res);
+                }
+            }
+            let cpu_t = self.cpu()?;
+            let rot = cpu_t.hadamard()?;
+            return rot.to(dev);
+        }
+
+        let cont = self.contiguous();
+        let data = cont
+            .as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(self.dtype()))?;
+        let mut out = data.to_vec();
+        let block_size = (1usize << cols.trailing_zeros()).min(256);
+        if block_size > 1 {
+            let scale = 1.0f32 / (block_size as f32).sqrt();
+            for block in out.chunks_exact_mut(block_size) {
+                let mut h = 1usize;
+                while h < block_size {
+                    for i in (0..block_size).step_by(h * 2) {
+                        for j in i..(i + h) {
+                            let x = block[j];
+                            let y = block[j + h];
+                            block[j] = x + y;
+                            block[j + h] = x - y;
+                        }
+                    }
+                    h *= 2;
+                }
+                for v in block.iter_mut() {
+                    *v *= scale;
+                }
+            }
+        }
+        Ok(Tensor::from_f32(&out, dims))
+    }
+
+    /// Compute the argmax index along the last dimension for each row.
+    ///
+    /// On GPU backends supporting `argmax_last_dim`, this executes a parallel reduction on
+    /// the device and transfers only 4 bytes (`u32`) per row back to the host.
+    pub fn argmax_tokens(&self) -> Result<Vec<u32>> {
+        let dims = self.shape.dims();
+        if dims.is_empty() {
+            return Ok(vec![0]);
+        }
+        let cols = *dims.last().unwrap();
+        if cols == 0 {
+            return Err(KoreError::ShapeMismatch {
+                expected: vec![1, 1],
+                got: dims.to_vec(),
+            });
+        }
+        let rows = self.numel() / cols;
+
+        let dev = self.device();
+        if !dev.is_cpu() {
+            if let Some(backend) = crate::device::get_backend(dev) {
+                if let Ok(indices) = backend.argmax_last_dim(self) {
+                    return Ok(indices);
+                }
+            }
+            let cpu_t = self.cpu()?;
+            return cpu_t.argmax_tokens();
+        }
+
+        let cont = self.contiguous();
+        let data = cont
+            .as_f32_slice()
+            .ok_or_else(|| KoreError::UnsupportedDType(self.dtype()))?;
+        let mut out = Vec::with_capacity(rows);
+        for row in data.chunks_exact(cols) {
+            let mut best_idx = 0u32;
+            let mut best_val = f32::NEG_INFINITY;
+            for (i, &val) in row.iter().enumerate() {
+                if val > best_val {
+                    best_val = val;
+                    best_idx = i as u32;
+                }
+            }
+            out.push(best_idx);
+        }
+        Ok(out)
     }
 }
 

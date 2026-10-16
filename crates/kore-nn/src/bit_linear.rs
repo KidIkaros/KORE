@@ -27,6 +27,10 @@ pub struct BitLinear {
     packed_weights: Vec<u8>,
     /// Per-row scale factors: [out_features]
     scales: Vec<f32>,
+    /// Optional device-resident packed weights tensor: [out_features, in_features] (DType::Ternary)
+    gpu_weights: Option<Tensor>,
+    /// Optional device-resident scale factors tensor: [out_features] (DType::F32)
+    gpu_scales: Option<Tensor>,
     /// Optional bias: [out_features]
     bias: Option<Tensor>,
     /// Logical dimensions
@@ -34,6 +38,8 @@ pub struct BitLinear {
     out_features: usize,
     /// Quantization threshold (trits with |normalized_value| < threshold become 0)
     threshold: f32,
+    /// Whether weights were quantized in the Fast Walsh-Hadamard rotated basis
+    hadamard_rotated: bool,
     training: bool,
 }
 
@@ -46,6 +52,23 @@ impl BitLinear {
     /// * `threshold` - quantization threshold (default: 0.3). Values with
     ///   |normalized_weight| < threshold are mapped to 0.
     pub fn new(weight: &Tensor, bias: Option<&Tensor>, threshold: f32) -> Self {
+        Self::build(weight, bias, threshold, false)
+    }
+
+    /// Create a BitLinear layer in the Fast Walsh-Hadamard rotated basis (`QuIP#` / `SpinQuant` style).
+    ///
+    /// Rotates each row of `weight` via normalized FWHT before ternary quantization to spread
+    /// weight and activation outliers across the feature dimension.
+    pub fn new_with_hadamard(weight: &Tensor, bias: Option<&Tensor>, threshold: f32) -> Self {
+        Self::build(weight, bias, threshold, true)
+    }
+
+    fn build(
+        weight: &Tensor,
+        bias: Option<&Tensor>,
+        threshold: f32,
+        hadamard_rotated: bool,
+    ) -> Self {
         let dims = weight.shape().dims();
         assert!(
             dims.len() == 2,
@@ -55,8 +78,16 @@ impl BitLinear {
         let out_features = dims[0];
         let in_features = dims[1];
 
-        let w_data = weight.contiguous();
-        let w_slice = w_data
+        let w_prepared = if hadamard_rotated {
+            weight
+                .cpu()
+                .unwrap_or_else(|_| weight.clone())
+                .hadamard()
+                .expect("BitLinear Hadamard rotation failed")
+        } else {
+            weight.cpu().unwrap_or_else(|_| weight.clone()).contiguous()
+        };
+        let w_slice = w_prepared
             .as_f32_slice()
             .expect("BitLinear requires f32 weights");
 
@@ -68,10 +99,13 @@ impl BitLinear {
         Self {
             packed_weights,
             scales,
+            gpu_weights: None,
+            gpu_scales: None,
             bias: bias_tensor,
             in_features,
             out_features,
             threshold,
+            hadamard_rotated,
             training: false,
         }
     }
@@ -81,6 +115,57 @@ impl BitLinear {
     /// Quantizes the Linear's weights to ternary format.
     pub fn from_linear(linear: &crate::Linear, threshold: f32) -> Self {
         Self::new(linear.weight(), linear.bias(), threshold)
+    }
+
+    /// Create a Hadamard-rotated BitLinear from an existing f32 Linear layer.
+    pub fn from_linear_with_hadamard(linear: &crate::Linear, threshold: f32) -> Self {
+        Self::new_with_hadamard(linear.weight(), linear.bias(), threshold)
+    }
+
+    /// Move packed ternary weights, per-row scales, and optional bias to the target device.
+    pub fn to(&self, device: kore_core::Device) -> kore_core::Result<Self> {
+        if device.is_cpu() {
+            return Ok(Self {
+                packed_weights: self.packed_weights.clone(),
+                scales: self.scales.clone(),
+                gpu_weights: None,
+                gpu_scales: None,
+                bias: self.bias.as_ref().map(|b| b.to(device)).transpose()?,
+                in_features: self.in_features,
+                out_features: self.out_features,
+                threshold: self.threshold,
+                hadamard_rotated: self.hadamard_rotated,
+                training: self.training,
+            });
+        }
+
+        let w_storage = kore_core::Storage::from_packed_bytes(
+            DType::Ternary,
+            self.out_features * self.in_features,
+            self.packed_weights.clone(),
+        );
+        let gpu_weights =
+            Tensor::from_storage(w_storage, &[self.out_features, self.in_features]).to(device)?;
+        let gpu_scales = Tensor::from_f32(&self.scales, &[self.out_features]).to(device)?;
+        let bias = self.bias.as_ref().map(|b| b.to(device)).transpose()?;
+
+        Ok(Self {
+            packed_weights: self.packed_weights.clone(),
+            scales: self.scales.clone(),
+            gpu_weights: Some(gpu_weights),
+            gpu_scales: Some(gpu_scales),
+            bias,
+            in_features: self.in_features,
+            out_features: self.out_features,
+            threshold: self.threshold,
+            hadamard_rotated: self.hadamard_rotated,
+            training: self.training,
+        })
+    }
+
+    /// Whether weights are stored in the Hadamard-rotated basis.
+    pub fn is_hadamard_rotated(&self) -> bool {
+        self.hadamard_rotated
     }
 
     /// Create a BitLinear with random ternary weights (for testing).
@@ -163,7 +248,12 @@ impl BitLinear {
             }
         }
 
-        Tensor::from_f32(&result, &[self.out_features, self.in_features])
+        let t = Tensor::from_f32(&result, &[self.out_features, self.in_features]);
+        if self.hadamard_rotated {
+            t.hadamard().unwrap_or(t)
+        } else {
+            t
+        }
     }
 }
 
@@ -190,7 +280,7 @@ impl Module for BitLinear {
             1
         };
 
-        let input_2d = if ndim == 1 {
+        let mut input_2d = if ndim == 1 {
             input.reshape(&[1, self.in_features as isize])?
         } else if ndim > 2 {
             input.reshape(&[batch_size as isize, self.in_features as isize])?
@@ -198,29 +288,76 @@ impl Module for BitLinear {
             input.clone()
         };
 
-        // Ternary matmul: W_packed[out, in] @ x^T → [out, batch]
-        // But ternary_matmul expects: a_packed[M,K] @ b[K,N] → [M,N]
-        // We need: output[batch, out] = input[batch, in] @ W^T[in, out]
-        // Which is: output^T[out, batch] = W[out, in] @ input^T[in, batch]
-        // So: M=out_features, K=in_features, N=batch_size, b=input^T
+        if self.hadamard_rotated {
+            input_2d = input_2d.hadamard()?;
+        }
 
-        let input_t = input_2d.transpose()?.contiguous();
+        // GPU fast path via DeviceBackend::quantized_matmul
+        let target_dev = if !input_2d.device().is_cpu() {
+            Some(input_2d.device())
+        } else {
+            self.gpu_weights.as_ref().map(|w| w.device())
+        };
 
-        let mut output = ternary_matmul(
-            &self.packed_weights,
-            &self.scales,
-            &input_t,
-            self.out_features,
-            batch_size,
-            self.in_features,
-        )?;
-
-        // output is [out_features, batch_size], transpose to [batch_size, out_features]
-        output = output.transpose()?.contiguous();
+        let mut output = if let Some(dev) = target_dev {
+            if let Some(backend) = kore_core::device::get_backend(dev) {
+                let x_dev = if input_2d.device() != dev {
+                    input_2d.to(dev)?
+                } else {
+                    input_2d.clone()
+                };
+                let w_dev = match &self.gpu_weights {
+                    Some(w) if w.device() == dev => w.clone(),
+                    _ => {
+                        let w_storage = kore_core::Storage::from_packed_bytes(
+                            DType::Ternary,
+                            self.out_features * self.in_features,
+                            self.packed_weights.clone(),
+                        );
+                        Tensor::from_storage(w_storage, &[self.out_features, self.in_features])
+                            .to(dev)?
+                    }
+                };
+                let s_dev = match &self.gpu_scales {
+                    Some(s) if s.device() == dev => s.clone(),
+                    _ => Tensor::from_f32(&self.scales, &[self.out_features]).to(dev)?,
+                };
+                backend.quantized_matmul(&x_dev, &w_dev, &s_dev, 2)?
+            } else {
+                let input_t = input_2d.cpu()?.transpose()?.contiguous();
+                ternary_matmul(
+                    &self.packed_weights,
+                    &self.scales,
+                    &input_t,
+                    self.out_features,
+                    batch_size,
+                    self.in_features,
+                )?
+                .transpose()?
+                .contiguous()
+                .to(dev)?
+            }
+        } else {
+            let input_t = input_2d.transpose()?.contiguous();
+            let out_t = ternary_matmul(
+                &self.packed_weights,
+                &self.scales,
+                &input_t,
+                self.out_features,
+                batch_size,
+                self.in_features,
+            )?;
+            out_t.transpose()?.contiguous()
+        };
 
         // Add bias
         if let Some(ref bias) = self.bias {
-            output = output.add(bias)?;
+            let b_dev = if bias.device() != output.device() {
+                bias.to(output.device())?
+            } else {
+                bias.clone()
+            };
+            output = output.add(&b_dev)?;
         }
 
         // Reshape back to original batch dims
@@ -405,5 +542,49 @@ mod tests {
         // Output should include bias offset
         assert!(y_data[0] > 5.0, "bias not applied: got {}", y_data[0]);
         assert!(y_data[1] > 15.0, "bias not applied: got {}", y_data[1]);
+    }
+
+    #[test]
+    fn test_bit_linear_hadamard_rotation() {
+        let k = 64;
+        let m = 8;
+        let w_data: Vec<f32> = (0..(m * k))
+            .map(|i| {
+                ((i as f32 * 1.37 + (i * i) as f32 * 0.19).sin() * 2.5)
+                    + if i % k == 3 { 12.0 } else { 0.0 }
+            })
+            .collect();
+        let x_data: Vec<f32> = (0..(2 * k)).map(|i| (i as f32 * 0.31).cos()).collect();
+        let w = Tensor::from_f32(&w_data, &[m, k]);
+        let x = Tensor::from_f32(&x_data, &[2, k]);
+
+        // Reference FP32: x @ w^T
+        let wt = w.transpose().unwrap().contiguous();
+        let ref_out = x.matmul(&wt).unwrap();
+        let ref_slice = ref_out.as_f32_slice().unwrap();
+
+        let bl_unrot = BitLinear::new(&w, None, 0.3);
+        let bl_rot = BitLinear::new_with_hadamard(&w, None, 0.3);
+        assert!(bl_rot.is_hadamard_rotated());
+
+        let y_unrot = bl_unrot.forward(&x).unwrap();
+        let y_rot = bl_rot.forward(&x).unwrap();
+
+        let mse_unrot: f32 = ref_slice
+            .iter()
+            .zip(y_unrot.as_f32_slice().unwrap())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        let mse_rot: f32 = ref_slice
+            .iter()
+            .zip(y_rot.as_f32_slice().unwrap())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+
+        // With a 12.0 channel outlier, unrotated ternary quantization zeroes out all non-outlier weights!
+        assert!(
+            mse_rot < mse_unrot * 0.5,
+            "Hadamard rotation should improve BitLinear accuracy on outlier weights: rot={mse_rot} vs unrot={mse_unrot}"
+        );
     }
 }

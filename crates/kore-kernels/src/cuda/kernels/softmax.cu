@@ -1,9 +1,12 @@
 // Fused numerically-stable softmax kernel for Kore.
 // Single kernel: max-subtract, exp, sum, normalize.
 // One block per row, warp-shuffle for reductions.
-// Handles rows up to 32K elements.
+#ifndef INFINITY
+#define INFINITY (__int_as_float(0x7f800000))
+#endif
 
 extern "C" {
+
 
 __device__ float warp_reduce_sum_sm(float val) {
     #pragma unroll

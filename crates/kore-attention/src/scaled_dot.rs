@@ -68,6 +68,42 @@ pub fn scaled_dot_product_attention(
 
     let scale_factor = scale.unwrap_or(1.0 / (d_k as f32).sqrt());
 
+    if !q.device().is_cpu() {
+        let dev = q.device();
+        let k = if k.device() != dev {
+            k.to(dev)?
+        } else {
+            k.clone()
+        };
+        let v = if v.device() != dev {
+            v.to(dev)?
+        } else {
+            v.clone()
+        };
+        if q_dims.len() == 2 && seq_q <= 4 && mask.is_none() && d_k == d_v && d_k <= 256 {
+            if let Some(backend) = kore_core::device::get_backend(dev) {
+                if let Ok(fused_out) = backend.fused_attention_decode(&q, &k, &v, scale_factor) {
+                    return Ok(fused_out);
+                }
+            }
+        }
+        let k_t = k.transpose()?.contiguous();
+        let scores = q.matmul(&k_t)?;
+        let scaled_scores = scores.mul_scalar(scale_factor)?;
+        let masked_scores = if let Some(m) = mask {
+            let m_dev = if m.device() != dev {
+                m.to(dev)?
+            } else {
+                m.clone()
+            };
+            scaled_scores.add(&m_dev)?
+        } else {
+            scaled_scores
+        };
+        let weights = masked_scores.softmax(-1)?;
+        return weights.matmul(&v);
+    }
+
     let q_data = q.as_f32_slice().unwrap();
     let k_data = k.as_f32_slice().unwrap();
     let v_data = v.as_f32_slice().unwrap();

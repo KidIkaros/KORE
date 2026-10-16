@@ -12,9 +12,9 @@
 //!
 //! This is the IN-MEMORY dequant path. On-disk packed format is deferred.
 
+use crate::cpu_matmul::matmul_f32;
 use kore_btes::{dequantize_ternary, quantize_ternary, Trit};
 use kore_core::{KoreError, Tensor};
-use crate::cpu_matmul::matmul_f32;
 
 /// Dequantize ternary trits to f32 in-memory and run matmul.
 pub fn ternary_dequant_matmul_f32(
@@ -22,7 +22,7 @@ pub fn ternary_dequant_matmul_f32(
     a_scale: f32,
     b: &Tensor,
     m: usize,
-    n: usize,
+    _n: usize,
     k: usize,
 ) -> Result<Tensor, KoreError> {
     if a_trits.len() != m * k {
@@ -104,8 +104,15 @@ mod tests {
         let n = 2;
         let k = 3;
 
-        let result = ternary_quant_matmul_f32(&a_weights, 0.3,
-            &Tensor::from_f32(&b_data, &[k, n]), m, n, k).unwrap();
+        let result = ternary_quant_matmul_f32(
+            &a_weights,
+            0.3,
+            &Tensor::from_f32(&b_data, &[k, n]),
+            m,
+            n,
+            k,
+        )
+        .unwrap();
         let data = result.as_f32_slice().unwrap();
 
         assert!((data[0] - 2.0).abs() < 1.0, "got {}", data[0]);
@@ -124,8 +131,18 @@ mod tests {
         let (quant, ref_data) = ternary_matmul_roundtrip(&a_weights[..], &b_data[..], m, k, 0.3);
 
         for i in 0..quant.len() {
-            assert!(quant[i].is_finite(), "quant[{}] not finite: {}", i, quant[i]);
-            assert!(ref_data[i].is_finite(), "ref[{}] not finite: {}", i, ref_data[i]);
+            assert!(
+                quant[i].is_finite(),
+                "quant[{}] not finite: {}",
+                i,
+                quant[i]
+            );
+            assert!(
+                ref_data[i].is_finite(),
+                "ref[{}] not finite: {}",
+                i,
+                ref_data[i]
+            );
         }
     }
 
@@ -136,8 +153,15 @@ mod tests {
         let m = 2;
         let k = 3;
 
-        let result = ternary_quant_matmul_f32(&a_weights, 0.3,
-            &Tensor::from_f32(&b_data, &[k, m]), m, m, k).unwrap();
+        let result = ternary_quant_matmul_f32(
+            &a_weights,
+            0.3,
+            &Tensor::from_f32(&b_data, &[k, m]),
+            m,
+            m,
+            k,
+        )
+        .unwrap();
         let data = result.as_f32_slice().unwrap();
 
         assert!((data[0] - 5.0).abs() < 0.5, "got {}", data[0]);
@@ -155,8 +179,15 @@ mod tests {
         let a_weights: Vec<f32> = (0..m * k).map(|i| ((i % 5) as f32 - 2.0) * 0.3).collect();
         let b_data: Vec<f32> = (0..k * n).map(|i| (i % 7) as f32 * 0.1).collect();
 
-        let result = ternary_quant_matmul_f32(&a_weights, 0.3,
-            &Tensor::from_f32(&b_data, &[k, n]), m, n, k).unwrap();
+        let result = ternary_quant_matmul_f32(
+            &a_weights,
+            0.3,
+            &Tensor::from_f32(&b_data, &[k, n]),
+            m,
+            n,
+            k,
+        )
+        .unwrap();
         let data = result.as_f32_slice().unwrap();
 
         assert_eq!(data.len(), m * n);

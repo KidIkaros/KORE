@@ -1,6 +1,6 @@
 [package]
 name = "kore-vulkan"
-description = "Vulkan compute backend for KORE using vulkan-kernels"
+description = "Vulkan / GPU compute backend for KORE using wgpu"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,19 +9,16 @@ license.workspace = true
 [dependencies]
 kore-core.workspace = true
 kore-kernels.workspace = true
-vulkan-kernels = { path = "../../../vulkan-kernels" }
 
-ash = { version = "0.38", optional = true }
+wgpu = "30"
+pollster = "0.3"
+bytemuck = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-
-[features]
-default = ["ash"]
-ash = ["dep:ash", "vulkan-kernels/ash"]
 
 [[bench]]
 name = "matmul_benchmark"

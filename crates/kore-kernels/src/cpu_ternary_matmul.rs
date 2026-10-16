@@ -11,7 +11,7 @@
 
 use rayon::prelude::*;
 
-use kore_btes::encoder::{decode_trits, encode_trits, Trit};
+use kore_btes::encoder::{decode_trits, encode_trits, Trit, TERNARY_DECODE_LUT};
 use kore_btes::vtalu::TernaryWord64;
 use kore_core::{KoreError, Tensor};
 
@@ -56,68 +56,97 @@ pub fn ternary_matmul(
         )));
     }
 
-    // Pre-unpack all rows into i8 trits (avoids repeated decode in inner loop)
-    let all_trits: Vec<Vec<i8>> = (0..m)
-        .map(|row| unpack_row_trits(&a_packed[row * k_packed..(row + 1) * k_packed], k))
-        .collect();
-
     let mut c_data = vec![0.0f32; m * n];
 
     if m >= PAR_ROW_THRESHOLD {
-        // Parallel: each row computed independently
+        // Zero-allocation parallel row decode using TERNARY_DECODE_LUT
         c_data
             .par_chunks_mut(n)
             .enumerate()
             .for_each(|(row, c_row)| {
                 let scale = a_scales[row];
-                let trits = &all_trits[row];
-                compute_row(trits, b_data, c_row, scale, n, k);
+                let packed_row = &a_packed[row * k_packed..(row + 1) * k_packed];
+                compute_row_packed(packed_row, b_data, c_row, scale, n, k);
             });
     } else {
-        // Sequential for small M
         for row in 0..m {
             let scale = a_scales[row];
-            let trits = &all_trits[row];
+            let packed_row = &a_packed[row * k_packed..(row + 1) * k_packed];
             let c_row = &mut c_data[row * n..(row + 1) * n];
-            compute_row(trits, b_data, c_row, scale, n, k);
+            compute_row_packed(packed_row, b_data, c_row, scale, n, k);
         }
     }
 
     Ok(Tensor::from_f32(&c_data, &[m, n]))
 }
 
-/// Unpack a packed ternary row into i8 trits.
+/// Compute one output row directly from packed base-243 bytes with zero heap allocation.
 #[inline]
-fn unpack_row_trits(packed_row: &[u8], k: usize) -> Vec<i8> {
-    let mut trits = Vec::with_capacity(k + 4);
-    for &byte in packed_row {
-        let decoded = decode_trits(byte);
-        for &t in &decoded {
-            trits.push(t as i8);
+fn compute_row_packed(
+    packed_row: &[u8],
+    b_data: &[f32],
+    c_row: &mut [f32],
+    scale: f32,
+    n: usize,
+    k: usize,
+) {
+    let full_bytes = k / 5;
+    if n == 1 {
+        let mut sum = 0.0f32;
+        for (bi, &byte) in packed_row[..full_bytes].iter().enumerate() {
+            let trits = TERNARY_DECODE_LUT[byte as usize];
+            let k_base = bi * 5;
+            sum += (trits[0] as i8 as f32) * b_data[k_base]
+                + (trits[1] as i8 as f32) * b_data[k_base + 1]
+                + (trits[2] as i8 as f32) * b_data[k_base + 2]
+                + (trits[3] as i8 as f32) * b_data[k_base + 3]
+                + (trits[4] as i8 as f32) * b_data[k_base + 4];
         }
+        let rem_start = full_bytes * 5;
+        if rem_start < k {
+            let trits = TERNARY_DECODE_LUT[packed_row[full_bytes] as usize];
+            for (ti, ki) in (rem_start..k).enumerate() {
+                sum += (trits[ti] as i8 as f32) * b_data[ki];
+            }
+        }
+        c_row[0] = sum * scale;
+        return;
     }
-    trits.truncate(k);
-    trits
-}
 
-/// Compute one output row: c_row[col] = scale * sum(trits[ki] * b[ki, col])
-#[inline]
-fn compute_row(trits: &[i8], b_data: &[f32], c_row: &mut [f32], scale: f32, n: usize, k: usize) {
-    // Accumulate: for each trit position, scatter trit*activation into output columns.
-    // This is "A-stationary": iterate over K dimension, accumulate into N outputs.
-    // Better cache behavior when N is small (typical for decode: N=1 or small batch).
-    for ki in 0..k {
-        let t = trits[ki];
-        if t == 0 {
+    for (bi, &byte) in packed_row[..full_bytes].iter().enumerate() {
+        if byte == 121 {
+            // 121 = [0, 0, 0, 0, 0] in base-243
             continue;
         }
-        let t_f32 = t as f32;
-        let b_row = &b_data[ki * n..ki * n + n];
-        for (c_val, &b_val) in c_row.iter_mut().zip(b_row.iter()) {
-            *c_val += t_f32 * b_val;
+        let trits = TERNARY_DECODE_LUT[byte as usize];
+        let k_base = bi * 5;
+        for (ti, &t) in trits.iter().enumerate() {
+            if t == Trit::Zero {
+                continue;
+            }
+            let t_f32 = t as i8 as f32;
+            let ki = k_base + ti;
+            let b_row = &b_data[ki * n..(ki + 1) * n];
+            for (c_val, &b_val) in c_row.iter_mut().zip(b_row.iter()) {
+                *c_val += t_f32 * b_val;
+            }
         }
     }
-    // Apply scale
+    let rem_start = full_bytes * 5;
+    if rem_start < k {
+        let trits = TERNARY_DECODE_LUT[packed_row[full_bytes] as usize];
+        for (ti, ki) in (rem_start..k).enumerate() {
+            let t = trits[ti];
+            if t == Trit::Zero {
+                continue;
+            }
+            let t_f32 = t as i8 as f32;
+            let b_row = &b_data[ki * n..(ki + 1) * n];
+            for (c_val, &b_val) in c_row.iter_mut().zip(b_row.iter()) {
+                *c_val += t_f32 * b_val;
+            }
+        }
+    }
     for c_val in c_row.iter_mut() {
         *c_val *= scale;
     }
@@ -209,22 +238,32 @@ pub fn pack_weights_ternary(
         let row_data = &weights[row * k..(row + 1) * k];
 
         let abs_max = row_data.iter().map(|w| w.abs()).fold(0.0f32, f32::max);
-        let scale = if abs_max < 1e-8 { 1.0 } else { abs_max };
-        scales[row] = scale;
+        let norm_base = if abs_max < 1e-8 { 1.0 } else { abs_max };
 
-        // Quantize to trits
+        // Quantize to trits and compute L2-optimal scale = mean(|w_i|) over non-zero trits
         let mut trits = Vec::with_capacity(k);
+        let mut active_sum = 0.0f32;
+        let mut active_count = 0usize;
         for &w in row_data {
-            let normalized = w / scale;
+            let normalized = w / norm_base;
             let trit = if normalized > threshold {
+                active_sum += w.abs();
+                active_count += 1;
                 Trit::Pos
             } else if normalized < -threshold {
+                active_sum += w.abs();
+                active_count += 1;
                 Trit::Neg
             } else {
                 Trit::Zero
             };
             trits.push(trit);
         }
+        scales[row] = if active_count > 0 {
+            active_sum / active_count as f32
+        } else {
+            1.0
+        };
 
         // Pack into base-243 bytes
         for (kp, chunk) in trits.chunks(5).enumerate() {

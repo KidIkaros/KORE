@@ -56,6 +56,11 @@ impl RMSNorm {
         }
     }
 
+    /// Learnable scale (gamma) tensor.
+    pub fn gamma(&self) -> &Tensor {
+        &self.gamma
+    }
+
     /// Dimension being normalized.
     pub fn dim(&self) -> usize {
         self.dim
@@ -64,6 +69,12 @@ impl RMSNorm {
     /// Epsilon value.
     pub fn eps(&self) -> f32 {
         self.eps
+    }
+
+    /// Move RMSNorm parameters to the target device.
+    pub fn to(&mut self, device: kore_core::Device) -> kore_core::Result<()> {
+        self.gamma = self.gamma.to(device)?;
+        Ok(())
     }
 }
 
@@ -93,6 +104,21 @@ impl Module for RMSNorm {
                 expected: vec![1],
                 got: vec![0],
             });
+        }
+
+        if !input.device().is_cpu() {
+            let backend = kore_core::device::get_backend(input.device()).ok_or_else(|| {
+                KoreError::StorageError(format!(
+                    "No registered backend for device {}",
+                    input.device()
+                ))
+            })?;
+            let gamma = if self.gamma.device() != input.device() {
+                self.gamma.to(input.device())?
+            } else {
+                self.gamma.clone()
+            };
+            return backend.rms_norm(input, &gamma, self.eps);
         }
 
         // Use fused kernel for forward pass

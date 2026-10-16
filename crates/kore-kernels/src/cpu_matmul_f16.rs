@@ -2,9 +2,9 @@
 //!
 //! Converts f16 inputs to f32, runs tiled matmul, optionally converts back to f16.
 
+use crate::cpu_matmul::matmul_f32;
 use half::f16;
 use kore_core::{KoreError, Tensor};
-use crate::cpu_matmul::matmul_f32;
 
 /// 2D matrix multiplication: C = A @ B, where A and B are f16 tensors.
 /// Returns f32 result by default. Use `output_f16=true` to get f16 back.
@@ -61,8 +61,7 @@ pub fn matmul_f16(a: &Tensor, b: &Tensor, output_f16: bool) -> Result<Tensor, Ko
         let c_data = c_f32.as_f32_slice().unwrap();
         let c_f16: Vec<u8> = c_data
             .iter()
-            .map(|&v| f16::from_f32(v).to_le_bytes())
-            .flatten()
+            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
             .collect();
 
         let storage = kore_core::Storage::from_bytes(kore_core::DType::F16, m * n, c_f16)
@@ -102,8 +101,7 @@ pub fn matmul_f16_raw(
         let c_data = c_f32.as_f32_slice().unwrap();
         let c_f16: Vec<u8> = c_data
             .iter()
-            .map(|&v| f16::from_f32(v).to_le_bytes())
-            .flatten()
+            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
             .collect();
 
         let storage = kore_core::Storage::from_bytes(kore_core::DType::F16, m * n, c_f16)
@@ -135,13 +133,11 @@ mod tests {
             .collect();
 
         let a = Tensor::from_storage(
-            kore_core::Storage::from_bytes(kore_core::DType::F16, 4, a_f16)
-                .expect("storage"),
+            kore_core::Storage::from_bytes(kore_core::DType::F16, 4, a_f16).expect("storage"),
             &[2, 2],
         );
         let b = Tensor::from_storage(
-            kore_core::Storage::from_bytes(kore_core::DType::F16, 4, b_f16)
-                .expect("storage"),
+            kore_core::Storage::from_bytes(kore_core::DType::F16, 4, b_f16).expect("storage"),
             &[2, 2],
         );
 
@@ -170,13 +166,11 @@ mod tests {
             .collect();
 
         let a = Tensor::from_storage(
-            kore_core::Storage::from_bytes(kore_core::DType::F16, 4, a_f16)
-                .expect("storage"),
+            kore_core::Storage::from_bytes(kore_core::DType::F16, 4, a_f16).expect("storage"),
             &[2, 2],
         );
         let b = Tensor::from_storage(
-            kore_core::Storage::from_bytes(kore_core::DType::F16, 4, b_f16)
-                .expect("storage"),
+            kore_core::Storage::from_bytes(kore_core::DType::F16, 4, b_f16).expect("storage"),
             &[2, 2],
         );
 

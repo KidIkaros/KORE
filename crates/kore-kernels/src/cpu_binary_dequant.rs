@@ -12,9 +12,9 @@
 //!
 //! This is the IN-MEMORY dequant path. On-disk packed format (Q1_0_g128) is deferred.
 
+use crate::cpu_matmul::matmul_f32;
 use kore_btes::{dequantize_binary, quantize_binary};
 use kore_core::{KoreError, Tensor};
-use crate::cpu_matmul::matmul_f32;
 
 /// Dequantize binary packed bits to f32 in-memory and run matmul.
 ///
@@ -30,14 +30,16 @@ pub fn binary_dequant_matmul_f32(
     a_scale: f32,
     b: &Tensor,
     m: usize,
-    n: usize,
+    _n: usize,
     k: usize,
 ) -> Result<Tensor, KoreError> {
     let expected_packed = k.div_ceil(8);
     if a_packed.len() != expected_packed {
         return Err(KoreError::StorageError(format!(
             "a_packed length mismatch: expected {} bytes for k={}, got {}",
-            expected_packed, k, a_packed.len()
+            expected_packed,
+            k,
+            a_packed.len()
         )));
     }
 
@@ -55,7 +57,8 @@ pub fn binary_dequant_matmul_f32(
     if a_deq.len() != k {
         return Err(KoreError::StorageError(format!(
             "dequantized length mismatch: expected {}, got {}",
-            k, a_deq.len()
+            k,
+            a_deq.len()
         )));
     }
 
@@ -78,7 +81,8 @@ pub fn binary_quant_matmul_f32(
     if a_weights.len() != k {
         return Err(KoreError::StorageError(format!(
             "a_weights length mismatch: expected {}, got {}",
-            k, a_weights.len()
+            k,
+            a_weights.len()
         )));
     }
 
@@ -100,13 +104,14 @@ pub fn binary_quant_matmul_f32_per_row(
     a_weights: &[f32],
     b: &Tensor,
     m: usize,
-    n: usize,
+    _n: usize,
     k: usize,
 ) -> Result<Tensor, KoreError> {
     if a_weights.len() != m * k {
         return Err(KoreError::StorageError(format!(
             "a_weights length mismatch: expected {}, got {}",
-            m * k, a_weights.len()
+            m * k,
+            a_weights.len()
         )));
     }
 
@@ -120,7 +125,10 @@ pub fn binary_quant_matmul_f32_per_row(
         let row_start = row * k;
         let row_data = &a_weights[row_start..row_start + k];
         let (packed, scale) = quantize_binary(row_data);
-        let deq: Vec<f32> = dequantize_binary(&packed, scale).into_iter().take(k).collect();
+        let deq: Vec<f32> = dequantize_binary(&packed, scale)
+            .into_iter()
+            .take(k)
+            .collect();
         all_deq.extend(deq);
     }
 
@@ -147,7 +155,10 @@ pub fn binary_matmul_roundtrip(
         let row_start = row * k;
         let row_data = &a_weights[row_start..row_start + k];
         let (packed, scale) = quantize_binary(row_data);
-        let deq: Vec<f32> = dequantize_binary(&packed, scale).into_iter().take(k).collect();
+        let deq: Vec<f32> = dequantize_binary(&packed, scale)
+            .into_iter()
+            .take(k)
+            .collect();
         all_deq.extend(deq);
     }
     let a_deq_tensor = Tensor::from_f32(&all_deq, &[m, k]);
@@ -173,8 +184,9 @@ mod tests {
         let n = 2;
         let k = 4;
 
-        let result = binary_quant_matmul_f32(&a_weights,
-            &Tensor::from_f32(&b_data, &[k, n]), m, n, k).unwrap();
+        let result =
+            binary_quant_matmul_f32(&a_weights, &Tensor::from_f32(&b_data, &[k, n]), m, n, k)
+                .unwrap();
         let data = result.as_f32_slice().unwrap();
 
         assert!((data[0] - 2.0).abs() < 0.5, "got {}", data[0]);
@@ -184,17 +196,20 @@ mod tests {
     #[test]
     fn test_binary_dequant_matmul_per_row() {
         // M=2, K=4, N=2
-        let a_weights = vec![
-            1.0f32, -1.0, 1.0, -1.0,
-            -1.0, 1.0, -1.0, 1.0,
-        ];
+        let a_weights = vec![1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0];
         let b_data = vec![1.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
         let m = 2;
         let n = 2;
         let k = 4;
 
-        let result = binary_quant_matmul_f32_per_row(&a_weights,
-            &Tensor::from_f32(&b_data, &[k, n]), m, n, k).unwrap();
+        let result = binary_quant_matmul_f32_per_row(
+            &a_weights,
+            &Tensor::from_f32(&b_data, &[k, n]),
+            m,
+            n,
+            k,
+        )
+        .unwrap();
         let data = result.as_f32_slice().unwrap();
 
         assert!((data[0] - 2.0).abs() < 0.5, "got {}", data[0]);
@@ -214,8 +229,18 @@ mod tests {
         let (quant, ref_data) = binary_matmul_roundtrip(&a_weights[..], &b_data[..], m, n, k);
 
         for i in 0..quant.len() {
-            assert!(quant[i].is_finite(), "quant[{}] not finite: {}", i, quant[i]);
-            assert!(ref_data[i].is_finite(), "ref[{}] not finite: {}", i, ref_data[i]);
+            assert!(
+                quant[i].is_finite(),
+                "quant[{}] not finite: {}",
+                i,
+                quant[i]
+            );
+            assert!(
+                ref_data[i].is_finite(),
+                "ref[{}] not finite: {}",
+                i,
+                ref_data[i]
+            );
         }
     }
 
@@ -228,8 +253,14 @@ mod tests {
         let a_weights: Vec<f32> = (0..m * k).map(|i| ((i % 3) as f32 - 1.0)).collect();
         let b_data: Vec<f32> = (0..k * n).map(|i| (i % 5) as f32 * 0.1).collect();
 
-        let result = binary_quant_matmul_f32_per_row(&a_weights,
-            &Tensor::from_f32(&b_data, &[k, n]), m, n, k).unwrap();
+        let result = binary_quant_matmul_f32_per_row(
+            &a_weights,
+            &Tensor::from_f32(&b_data, &[k, n]),
+            m,
+            n,
+            k,
+        )
+        .unwrap();
         let data = result.as_f32_slice().unwrap();
 
         assert_eq!(data.len(), m * n);

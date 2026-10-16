@@ -19,6 +19,58 @@ fn loaded_set() -> &'static Mutex<HashSet<(usize, String)>> {
     LOADED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+fn module_func_names(module_name: &str) -> &[&'static str] {
+    match module_name {
+        "elementwise" => &[
+            "add_f32",
+            "sub_f32",
+            "mul_f32",
+            "div_f32",
+            "neg_f32",
+            "abs_f32",
+            "sqrt_f32",
+            "exp_f32",
+            "log_f32",
+            "relu_f32",
+            "gelu_f32",
+            "silu_f32",
+            "sigmoid_f32",
+            "tanh_f32",
+            "add_scalar_f32",
+            "mul_scalar_f32",
+            "pow_scalar_f32",
+            "clamp_f32",
+            "add_broadcast_f32",
+            "sub_broadcast_f32",
+            "mul_broadcast_f32",
+            "div_broadcast_f32",
+        ],
+        "matmul" => &["matmul_f32", "matmul_f32_tiled2x2", "matmul_bias_relu_f32"],
+        "reduce" => &[
+            "reduce_sum_f32",
+            "reduce_max_f32",
+            "reduce_sum_rows_f32",
+            "reduce_max_rows_f32",
+        ],
+        "softmax" => &["softmax_f32", "softmax_causal_f32"],
+        "rms_norm" => &["rms_norm_f32", "rms_norm_inplace_f32"],
+        "rope" => &["rope_freqs_f32", "rope_f32"],
+        "fused_norm_proj" => &[
+            "fused_rms_norm_proj_f32",
+            "fused_rms_norm_proj_smem_f32",
+            "fused_rms_norm_silu_gate_f32",
+        ],
+        "dequant_matmul" => &[
+            "dequant_quat_matmul_f32",
+            "dequant_quat_matmul_tiled2x2_f32",
+            "dequant_quat_matmul_bias_relu_f32",
+        ],
+        "mamba_scan" => &["mamba3_scan_chunk_f32", "mamba3_scan_prefix_f32"],
+        "mamba_scan_backward" => &["mamba3_scan_backward_f32"],
+        _ => &[],
+    }
+}
+
 /// Ensure a PTX module is compiled and loaded on the given device.
 /// No-op if already loaded.
 pub fn ensure_module(
@@ -40,8 +92,9 @@ pub fn ensure_module(
         msg: e.to_string(),
     })?;
 
+    let fn_names = module_func_names(module_name);
     device
-        .load_ptx(ptx, module_name, &[])
+        .load_ptx(ptx, module_name, fn_names)
         .map_err(|e| CudaError::ModuleLoad {
             module: module_name.to_string(),
             msg: e.to_string(),

@@ -9,6 +9,8 @@
 //! - Fused operations (linear+ReLU, LayerNorm, softmax)
 //! - CUDA dispatch (behind `cuda` feature flag)
 
+pub mod cpu_binary_dequant;
+pub mod cpu_binary_matmul;
 pub mod cpu_fused;
 pub mod cpu_fused_backward;
 pub mod cpu_matmul;
@@ -16,14 +18,10 @@ pub mod cpu_matmul_f16;
 pub mod cpu_quat_matmul;
 pub mod cpu_ternary_dequant;
 pub mod cpu_ternary_matmul;
-pub mod cpu_binary_dequant;
-pub mod cpu_binary_matmul;
+pub mod hadamard;
 pub mod simd;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
-
-#[cfg(feature = "rocm")]
-pub mod rocm;
 
 pub use simd::SimdCapability;

@@ -75,6 +75,47 @@ __global__ void div_f32(const float* a, const float* b, float* c, unsigned int n
     }
 }
 
+__global__ void add_broadcast_f32(const float* a, const float* b, float* c, unsigned int n, unsigned int a_n, unsigned int b_n) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = blockDim.x * gridDim.x;
+    for (unsigned int i = idx; i < n; i += stride) {
+        unsigned int a_idx = (a_n == n) ? i : (i % a_n);
+        unsigned int b_idx = (b_n == n) ? i : (i % b_n);
+        c[i] = a[a_idx] + b[b_idx];
+    }
+}
+
+__global__ void sub_broadcast_f32(const float* a, const float* b, float* c, unsigned int n, unsigned int a_n, unsigned int b_n) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = blockDim.x * gridDim.x;
+    for (unsigned int i = idx; i < n; i += stride) {
+        unsigned int a_idx = (a_n == n) ? i : (i % a_n);
+        unsigned int b_idx = (b_n == n) ? i : (i % b_n);
+        c[i] = a[a_idx] - b[b_idx];
+    }
+}
+
+__global__ void mul_broadcast_f32(const float* a, const float* b, float* c, unsigned int n, unsigned int a_n, unsigned int b_n) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = blockDim.x * gridDim.x;
+    for (unsigned int i = idx; i < n; i += stride) {
+        unsigned int a_idx = (a_n == n) ? i : (i % a_n);
+        unsigned int b_idx = (b_n == n) ? i : (i % b_n);
+        c[i] = a[a_idx] * b[b_idx];
+    }
+}
+
+__global__ void div_broadcast_f32(const float* a, const float* b, float* c, unsigned int n, unsigned int a_n, unsigned int b_n) {
+    unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned int stride = blockDim.x * gridDim.x;
+    for (unsigned int i = idx; i < n; i += stride) {
+        unsigned int a_idx = (a_n == n) ? i : (i % a_n);
+        unsigned int b_idx = (b_n == n) ? i : (i % b_n);
+        c[i] = a[a_idx] / b[b_idx];
+    }
+}
+
+
 // ============================================================================
 // Scalar ops: C[i] = op(A[i], scalar)
 // ============================================================================

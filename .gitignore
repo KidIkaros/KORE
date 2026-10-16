@@ -24,3 +24,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.iml
+
+# Model artifacts (GGUF/safetensors)
+models/

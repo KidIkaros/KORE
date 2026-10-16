@@ -29,11 +29,17 @@ pub struct QuatLinear {
     packed_weights: Vec<u8>,
     /// Per-row scale factors: [out_features]
     scales: Vec<f32>,
+    /// Optional device-resident packed weights tensor: [out_features, in_features] (DType::Quaternary)
+    gpu_weights: Option<Tensor>,
+    /// Optional device-resident scale factors tensor: [out_features] (DType::F32)
+    gpu_scales: Option<Tensor>,
     /// Optional bias: [out_features]
     bias: Option<Tensor>,
     /// Logical dimensions
     in_features: usize,
     out_features: usize,
+    /// Whether weights were quantized in the Fast Walsh-Hadamard rotated basis
+    hadamard_rotated: bool,
     training: bool,
 }
 
@@ -44,6 +50,15 @@ impl QuatLinear {
     /// * `weight` - f32 weight tensor of shape [out_features, in_features]
     /// * `bias` - optional f32 bias tensor of shape [out_features]
     pub fn new(weight: &Tensor, bias: Option<&Tensor>) -> Self {
+        Self::build(weight, bias, false)
+    }
+
+    /// Create a QuatLinear layer in the Fast Walsh-Hadamard rotated basis (`QuIP#` / `SpinQuant` style).
+    pub fn new_with_hadamard(weight: &Tensor, bias: Option<&Tensor>) -> Self {
+        Self::build(weight, bias, true)
+    }
+
+    fn build(weight: &Tensor, bias: Option<&Tensor>, hadamard_rotated: bool) -> Self {
         let dims = weight.shape().dims();
         assert!(
             dims.len() == 2,
@@ -53,8 +68,16 @@ impl QuatLinear {
         let out_features = dims[0];
         let in_features = dims[1];
 
-        let w_data = weight.contiguous();
-        let w_slice = w_data
+        let w_prepared = if hadamard_rotated {
+            weight
+                .cpu()
+                .unwrap_or_else(|_| weight.clone())
+                .hadamard()
+                .expect("QuatLinear Hadamard rotation failed")
+        } else {
+            weight.cpu().unwrap_or_else(|_| weight.clone()).contiguous()
+        };
+        let w_slice = w_prepared
             .as_f32_slice()
             .expect("QuatLinear requires f32 weights");
 
@@ -65,9 +88,12 @@ impl QuatLinear {
         Self {
             packed_weights,
             scales,
+            gpu_weights: None,
+            gpu_scales: None,
             bias: bias_tensor,
             in_features,
             out_features,
+            hadamard_rotated,
             training: false,
         }
     }
@@ -75,6 +101,55 @@ impl QuatLinear {
     /// Create a QuatLinear from an existing f32 Linear layer.
     pub fn from_linear(linear: &crate::Linear) -> Self {
         Self::new(linear.weight(), linear.bias())
+    }
+
+    /// Create a Hadamard-rotated QuatLinear from an existing f32 Linear layer.
+    pub fn from_linear_with_hadamard(linear: &crate::Linear) -> Self {
+        Self::new_with_hadamard(linear.weight(), linear.bias())
+    }
+
+    /// Move packed quaternary weights, per-row scales, and optional bias to the target device.
+    pub fn to(&self, device: kore_core::Device) -> kore_core::Result<Self> {
+        if device.is_cpu() {
+            return Ok(Self {
+                packed_weights: self.packed_weights.clone(),
+                scales: self.scales.clone(),
+                gpu_weights: None,
+                gpu_scales: None,
+                bias: self.bias.as_ref().map(|b| b.to(device)).transpose()?,
+                in_features: self.in_features,
+                out_features: self.out_features,
+                hadamard_rotated: self.hadamard_rotated,
+                training: self.training,
+            });
+        }
+
+        let w_storage = kore_core::Storage::from_packed_bytes(
+            DType::Quaternary,
+            self.out_features * self.in_features,
+            self.packed_weights.clone(),
+        );
+        let gpu_weights =
+            Tensor::from_storage(w_storage, &[self.out_features, self.in_features]).to(device)?;
+        let gpu_scales = Tensor::from_f32(&self.scales, &[self.out_features]).to(device)?;
+        let bias = self.bias.as_ref().map(|b| b.to(device)).transpose()?;
+
+        Ok(Self {
+            packed_weights: self.packed_weights.clone(),
+            scales: self.scales.clone(),
+            gpu_weights: Some(gpu_weights),
+            gpu_scales: Some(gpu_scales),
+            bias,
+            in_features: self.in_features,
+            out_features: self.out_features,
+            hadamard_rotated: self.hadamard_rotated,
+            training: self.training,
+        })
+    }
+
+    /// Whether weights are stored in the Hadamard-rotated basis.
+    pub fn is_hadamard_rotated(&self) -> bool {
+        self.hadamard_rotated
     }
 
     /// Create a QuatLinear with random weights (for testing).
@@ -153,7 +228,12 @@ impl QuatLinear {
             }
         }
 
-        Tensor::from_f32(&result, &[self.out_features, self.in_features])
+        let t = Tensor::from_f32(&result, &[self.out_features, self.in_features]);
+        if self.hadamard_rotated {
+            t.hadamard().unwrap_or(t)
+        } else {
+            t
+        }
     }
 }
 
@@ -190,7 +270,7 @@ impl QuatLinear {
 
         // Upload input_t as raw bytes
         let input_data = input_t.contiguous();
-        let input_slice = input_data.as_f32_slice().ok()?;
+        let input_slice = input_data.as_f32_slice()?;
         let input_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(input_slice.as_ptr() as *const u8, input_slice.len() * 4)
         };
@@ -259,7 +339,7 @@ impl Module for QuatLinear {
             1
         };
 
-        let input_2d = if ndim == 1 {
+        let mut input_2d = if ndim == 1 {
             input.reshape(&[1, self.in_features as isize])?
         } else if ndim > 2 {
             input.reshape(&[batch_size as isize, self.in_features as isize])?
@@ -267,15 +347,42 @@ impl Module for QuatLinear {
             input.clone()
         };
 
-        // quat_matmul expects: a_packed[M,K] @ b[K,N] → [M,N]
-        // We need: output[batch, out] = input[batch, in] @ W^T[in, out]
-        // Which is: output^T[out, batch] = W[out, in] @ input^T[in, batch]
-        let input_t = input_2d.transpose()?.contiguous();
+        if self.hadamard_rotated {
+            input_2d = input_2d.hadamard()?;
+        }
 
-        #[cfg(feature = "cuda")]
-        let mut output = self
-            .try_cuda_forward(&input_t, batch_size)
-            .unwrap_or_else(|| {
+        let target_dev = if !input_2d.device().is_cpu() {
+            Some(input_2d.device())
+        } else {
+            self.gpu_weights.as_ref().map(|w| w.device())
+        };
+
+        let mut output = if let Some(dev) = target_dev {
+            if let Some(backend) = kore_core::device::get_backend(dev) {
+                let x_dev = if input_2d.device() != dev {
+                    input_2d.to(dev)?
+                } else {
+                    input_2d.clone()
+                };
+                let w_dev = match &self.gpu_weights {
+                    Some(w) if w.device() == dev => w.clone(),
+                    _ => {
+                        let w_storage = kore_core::Storage::from_packed_bytes(
+                            DType::Quaternary,
+                            self.out_features * self.in_features,
+                            self.packed_weights.clone(),
+                        );
+                        Tensor::from_storage(w_storage, &[self.out_features, self.in_features])
+                            .to(dev)?
+                    }
+                };
+                let s_dev = match &self.gpu_scales {
+                    Some(s) if s.device() == dev => s.clone(),
+                    _ => Tensor::from_f32(&self.scales, &[self.out_features]).to(dev)?,
+                };
+                backend.quantized_matmul(&x_dev, &w_dev, &s_dev, 3)?
+            } else {
+                let input_t = input_2d.cpu()?.transpose()?.contiguous();
                 quat_matmul(
                     &self.packed_weights,
                     &self.scales,
@@ -283,26 +390,50 @@ impl Module for QuatLinear {
                     self.out_features,
                     batch_size,
                     self.in_features,
-                )
-                .expect("CPU quat_matmul failed")
-            });
+                )?
+                .transpose()?
+                .contiguous()
+                .to(dev)?
+            }
+        } else {
+            let input_t = input_2d.transpose()?.contiguous();
 
-        #[cfg(not(feature = "cuda"))]
-        let mut output = quat_matmul(
-            &self.packed_weights,
-            &self.scales,
-            &input_t,
-            self.out_features,
-            batch_size,
-            self.in_features,
-        )?;
+            #[cfg(feature = "cuda")]
+            let out_t = self
+                .try_cuda_forward(&input_t, batch_size)
+                .unwrap_or_else(|| {
+                    quat_matmul(
+                        &self.packed_weights,
+                        &self.scales,
+                        &input_t,
+                        self.out_features,
+                        batch_size,
+                        self.in_features,
+                    )
+                    .expect("CPU quat_matmul failed")
+                });
 
-        // output is [out_features, batch_size], transpose to [batch_size, out_features]
-        output = output.transpose()?.contiguous();
+            #[cfg(not(feature = "cuda"))]
+            let out_t = quat_matmul(
+                &self.packed_weights,
+                &self.scales,
+                &input_t,
+                self.out_features,
+                batch_size,
+                self.in_features,
+            )?;
+
+            out_t.transpose()?.contiguous()
+        };
 
         // Add bias
         if let Some(ref bias) = self.bias {
-            output = output.add(bias)?;
+            let b_dev = if bias.device() != output.device() {
+                bias.to(output.device())?
+            } else {
+                bias.clone()
+            };
+            output = output.add(&b_dev)?;
         }
 
         // Reshape back to original batch dims
@@ -429,5 +560,26 @@ mod tests {
         assert!(sd.contains_key("weight"));
         assert!(sd.contains_key("bias"));
         assert_eq!(sd["weight"].shape().dims(), &[8, 16]);
+    }
+
+    #[test]
+    fn test_quat_linear_hadamard_rotation() {
+        let k = 64;
+        let m = 8;
+        let w_data: Vec<f32> = (0..(m * k))
+            .map(|i| {
+                ((i as f32 * 1.37 + (i * i) as f32 * 0.19).sin() * 0.5)
+                    + if i % k == 3 { 12.0 } else { 0.0 }
+            })
+            .collect();
+        let x_data: Vec<f32> = (0..(2 * k)).map(|i| (i as f32 * 0.31).cos()).collect();
+        let w = Tensor::from_f32(&w_data, &[m, k]);
+        let x = Tensor::from_f32(&x_data, &[2, k]);
+
+        let ql_rot = QuatLinear::new_with_hadamard(&w, None);
+        assert!(ql_rot.is_hadamard_rotated());
+        let y_rot = ql_rot.forward(&x).unwrap();
+        assert_eq!(y_rot.shape().dims(), &[2, m]);
+        assert!(y_rot.as_f32_slice().unwrap().iter().all(|v| v.is_finite()));
     }
 }

@@ -1,6 +1,9 @@
 // Reduction kernels for Kore: sum, mean, max, min
 // Uses warp-shuffle reductions for maximum throughput.
 // Two-pass: per-block partial reduce → final reduce for large tensors.
+#ifndef INFINITY
+#define INFINITY (__int_as_float(0x7f800000))
+#endif
 
 extern "C" {
 

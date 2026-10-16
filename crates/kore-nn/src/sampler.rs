@@ -14,6 +14,9 @@ pub struct SamplerConfig {
     /// EOS token ID. Generation stops when this token is sampled.
     /// `None` means no early stopping.
     pub eos_token_id: Option<usize>,
+    /// Use Coupled Gumbel-Max sampling (`argmax_i(p_i / E_{seed, pos, i})`) so draft and target
+    /// models share identical per-position exponential noise during speculative decoding.
+    pub gumbel_coupled: bool,
 }
 
 impl Default for SamplerConfig {
@@ -24,6 +27,7 @@ impl Default for SamplerConfig {
             top_p: 1.0,
             repetition_penalty: 1.0,
             eos_token_id: None,
+            gumbel_coupled: false,
         }
     }
 }
@@ -89,6 +93,52 @@ pub fn apply_repetition_penalty(logits: &mut [f32], previous_tokens: &[usize], p
     }
 }
 
+/// Sample a token from a `Tensor` of logits (`[1, vocab_size]` or `[vocab_size]`),
+/// using the GPU-side `argmax_tokens()` fast path (4-byte readback) when greedy.
+pub fn sample_from_tensor(
+    logits_tensor: &kore_core::Tensor,
+    previous_tokens: &[usize],
+    config: &SamplerConfig,
+    seed: u64,
+    pos: usize,
+) -> kore_core::Result<usize> {
+    if config.temperature <= 0.0
+        && config.repetition_penalty == 1.0
+        && !logits_tensor.device().is_cpu()
+    {
+        let indices = logits_tensor.argmax_tokens()?;
+        if let Some(&tok) = indices.last() {
+            return Ok(tok as usize);
+        }
+    }
+    let cpu_t = logits_tensor.cpu()?;
+    let slice = cpu_t
+        .as_f32_slice()
+        .ok_or_else(|| kore_core::KoreError::UnsupportedDType(logits_tensor.dtype()))?;
+    let dims = cpu_t.shape().dims();
+    let vocab_size = *dims.last().unwrap_or(&slice.len());
+    let last_row = &slice[slice.len().saturating_sub(vocab_size)..];
+    Ok(sample_with_pos(
+        last_row,
+        previous_tokens,
+        config,
+        seed,
+        pos,
+    ))
+}
+
+/// Sample a token from logits at sequence position `pos`, supporting Coupled Gumbel-Max.
+pub fn sample_with_pos(
+    logits: &[f32],
+    previous_tokens: &[usize],
+    config: &SamplerConfig,
+    seed: u64,
+    pos: usize,
+) -> usize {
+    let mut rng = Rng::new(seed.wrapping_add(pos as u64));
+    sample_internal(logits, previous_tokens, config, &mut rng, seed, pos)
+}
+
 /// Sample a token from logits using the given config and RNG.
 ///
 /// `logits`: raw logits of shape [vocab_size]
@@ -102,6 +152,18 @@ pub fn sample(
     previous_tokens: &[usize],
     config: &SamplerConfig,
     rng: &mut Rng,
+) -> usize {
+    let seed = rng.state;
+    sample_internal(logits, previous_tokens, config, rng, seed, 0)
+}
+
+fn sample_internal(
+    logits: &[f32],
+    previous_tokens: &[usize],
+    config: &SamplerConfig,
+    rng: &mut Rng,
+    seed: u64,
+    pos: usize,
 ) -> usize {
     let vocab_size = logits.len();
     if vocab_size == 0 {
@@ -146,8 +208,42 @@ pub fn sample(
         probs
     };
 
-    // 7. Categorical sampling
-    categorical_sample(&probs, rng)
+    // 7. Coupled Gumbel-Max or Categorical sampling
+    if config.gumbel_coupled {
+        gumbel_coupled_sample(&probs, seed, pos)
+    } else {
+        categorical_sample(&probs, rng)
+    }
+}
+
+/// Coupled Gumbel-Max sampling (`Strata` style):
+/// Computes `argmax_i (p_i / E_{seed, pos, i})` where `E_{seed, pos, i} = -ln(U_{seed, pos, i})`
+/// is a deterministic SplitMix64-derived exponential random variate shared between draft and target.
+pub fn gumbel_coupled_sample(probs: &[f32], seed: u64, pos: usize) -> usize {
+    let mut best_idx = 0usize;
+    let mut best_score = f32::NEG_INFINITY;
+    let base_hash = seed ^ (pos as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+    for (i, &p) in probs.iter().enumerate() {
+        if p <= 0.0 {
+            continue;
+        }
+        // SplitMix64 finalizer per (seed, pos, token_idx)
+        let mut z = base_hash.wrapping_add((i as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+
+        // Map to open interval (0, 1)
+        let u = ((z >> 40) as f32 + 0.5) / ((1u64 << 24) as f32);
+        let exp_noise = (-u.ln()).max(1e-20);
+        let score = p / exp_noise;
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+    best_idx
 }
 
 fn argmax(data: &[f32]) -> usize {
@@ -159,29 +255,49 @@ fn argmax(data: &[f32]) -> usize {
 }
 
 fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max_val = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut probs: Vec<f32> = logits.iter().map(|&v| (v - max_val).exp()).collect();
-    let sum: f32 = probs.iter().sum();
+    let max_val = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    let mut probs: Vec<f32> = logits
+        .iter()
+        .map(|&v| {
+            if v == f32::NEG_INFINITY {
+                0.0
+            } else {
+                let e = (v - max_val).exp();
+                sum += e;
+                e
+            }
+        })
+        .collect();
     if sum > 0.0 {
+        let inv_sum = 1.0 / sum;
         for p in probs.iter_mut() {
-            *p /= sum;
+            if *p > 0.0 {
+                *p *= inv_sum;
+            }
         }
     }
     probs
 }
 
-/// Find the k-th largest value (threshold for top-k).
+/// Find the k-th largest value (threshold for top-k) in O(V) time via Quickselect.
 fn top_k_threshold(logits: &[f32], k: usize) -> f32 {
-    let mut sorted: Vec<f32> = logits.to_vec();
-    sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    sorted[k.min(sorted.len()) - 1]
+    let mut scratch: Vec<f32> = logits.to_vec();
+    let idx = k.min(scratch.len()).saturating_sub(1);
+    let (_, nth, _) = scratch.select_nth_unstable_by(idx, |a, b| b.total_cmp(a));
+    *nth
 }
 
 /// Zero out probabilities below the nucleus threshold, then renormalize.
 fn top_p_filter(probs: &[f32], p: f32) -> Vec<f32> {
-    // Sort indices by probability descending
-    let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
-    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Only collect non-zero probabilities (when top_k is active, this is at most k elements!)
+    let mut indexed: Vec<(usize, f32)> = probs
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|&(_, prob)| prob > 0.0)
+        .collect();
+    indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
     let mut cumsum = 0.0f32;
     let mut cutoff_idx = indexed.len();
@@ -194,15 +310,17 @@ fn top_p_filter(probs: &[f32], p: f32) -> Vec<f32> {
     }
 
     let mut filtered = vec![0.0f32; probs.len()];
+    let mut sum = 0.0f32;
     for &(idx, prob) in &indexed[..cutoff_idx] {
         filtered[idx] = prob;
+        sum += prob;
     }
 
-    // Renormalize
-    let sum: f32 = filtered.iter().sum();
+    // Renormalize only the active subset
     if sum > 0.0 {
-        for v in filtered.iter_mut() {
-            *v /= sum;
+        let inv_sum = 1.0 / sum;
+        for &(idx, _) in &indexed[..cutoff_idx] {
+            filtered[idx] *= inv_sum;
         }
     }
     filtered
@@ -322,5 +440,32 @@ mod tests {
         for &c in &counts {
             assert!(c > 50 && c < 200, "count {} out of expected range", c);
         }
+    }
+
+    #[test]
+    fn test_gumbel_coupled_sampling() {
+        let target_logits = vec![2.5, 1.2, 0.3, -1.0, 0.8];
+        let draft_logits = vec![2.48, 1.22, 0.29, -0.98, 0.79];
+        let config = SamplerConfig {
+            temperature: 0.8,
+            top_k: 4,
+            top_p: 0.95,
+            repetition_penalty: 1.0,
+            eos_token_id: None,
+            gumbel_coupled: true,
+        };
+        let mut agreements = 0;
+        for pos in 0..100 {
+            let t_tok = sample_with_pos(&target_logits, &[], &config, 777, pos);
+            let d_tok = sample_with_pos(&draft_logits, &[], &config, 777, pos);
+            if t_tok == d_tok {
+                agreements += 1;
+            }
+        }
+        // Coupled Gumbel-Max with nearly identical draft/target logits should agree > 95% of the time
+        assert!(
+            agreements >= 95,
+            "Expected high coupled agreement, got {agreements}/100"
+        );
     }
 }

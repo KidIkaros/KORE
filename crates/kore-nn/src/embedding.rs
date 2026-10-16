@@ -5,7 +5,8 @@ use kore_core::Tensor;
 
 /// Embedding lookup table: maps integer token IDs to dense vectors.
 pub struct Embedding {
-    weight: Tensor,
+    weight: Option<Tensor>,
+    raw_q4_k: Option<Vec<u8>>,
     num_embeddings: usize,
     embedding_dim: usize,
     training: bool,
@@ -31,7 +32,8 @@ impl Embedding {
         weight.set_requires_grad(true);
 
         Self {
-            weight,
+            weight: Some(weight),
+            raw_q4_k: None,
             num_embeddings,
             embedding_dim,
             training: true,
@@ -45,19 +47,56 @@ impl Embedding {
         Self {
             num_embeddings: dims[0],
             embedding_dim: dims[1],
-            weight,
+            weight: Some(weight),
+            raw_q4_k: None,
             training: true,
+        }
+    }
+
+    /// Create from raw Q4_K bytes, dequantizing single token vectors on-the-fly during lookup.
+    /// Eliminates multi-gigabyte memory footprint for large vocabulary models.
+    pub fn from_q4_k(raw_bytes: Vec<u8>, num_embeddings: usize, embedding_dim: usize) -> Self {
+        Self {
+            weight: None,
+            raw_q4_k: Some(raw_bytes),
+            num_embeddings,
+            embedding_dim,
+            training: false,
         }
     }
 
     /// Look up embeddings for a slice of token IDs.
     /// Returns tensor of shape [ids.len(), embedding_dim].
     pub fn lookup(&self, ids: &[usize]) -> Tensor {
-        let w = self.weight.contiguous();
+        let dim = self.embedding_dim;
+
+        if let Some(ref raw) = self.raw_q4_k {
+            let bytes_per_row = (dim / 256) * 144;
+            let mut result = vec![0.0f32; ids.len() * dim];
+            for (i, &id) in ids.iter().enumerate() {
+                if id < self.num_embeddings {
+                    let start = id * bytes_per_row;
+                    let end = start + bytes_per_row;
+                    if end <= raw.len() {
+                        let row_bytes = &raw[start..end];
+                        let out_row = &mut result[i * dim..(i + 1) * dim];
+                        if let Ok(deq) = oxillama_quant::dequantize_to_f32(
+                            row_bytes,
+                            oxillama_gguf::GgufTensorType::Q4K,
+                            dim,
+                        ) {
+                            out_row.copy_from_slice(&deq);
+                        }
+                    }
+                }
+            }
+            return Tensor::from_f32(&result, &[ids.len(), dim]);
+        }
+
+        let w = self.weight.as_ref().expect("Embedding has neither weight nor raw_q4_k").contiguous();
         let w_data = w
             .as_f32_slice()
             .expect("Embedding: weight tensor must be F32");
-        let dim = self.embedding_dim;
 
         let mut result = vec![0.0f32; ids.len() * dim];
         for (i, &id) in ids.iter().enumerate() {
@@ -71,9 +110,9 @@ impl Embedding {
         Tensor::from_f32(&result, &[ids.len(), dim])
     }
 
-    /// Get the weight tensor.
-    pub fn weight(&self) -> &Tensor {
-        &self.weight
+    /// Get the weight tensor (if materialized).
+    pub fn weight(&self) -> Option<&Tensor> {
+        self.weight.as_ref()
     }
 
     /// Number of embeddings.
@@ -84,6 +123,14 @@ impl Embedding {
     /// Embedding dimension.
     pub fn embedding_dim(&self) -> usize {
         self.embedding_dim
+    }
+
+    /// Move embedding weights to target device.
+    pub fn to(&mut self, device: kore_core::Device) -> kore_core::Result<()> {
+        if let Some(ref mut w) = self.weight {
+            *w = w.to(device)?;
+        }
+        Ok(())
     }
 }
 
@@ -99,11 +146,19 @@ impl Module for Embedding {
     }
 
     fn parameters(&self) -> Vec<&Tensor> {
-        vec![&self.weight]
+        if let Some(ref w) = self.weight {
+            vec![w]
+        } else {
+            vec![]
+        }
     }
 
     fn named_parameters(&self) -> Vec<(&str, &Tensor)> {
-        vec![("weight", &self.weight)]
+        if let Some(ref w) = self.weight {
+            vec![("weight", w)]
+        } else {
+            vec![]
+        }
     }
 
     fn train(&mut self, mode: bool) {
@@ -124,7 +179,7 @@ mod tests {
         let emb = Embedding::new(100, 32);
         assert_eq!(emb.num_embeddings(), 100);
         assert_eq!(emb.embedding_dim(), 32);
-        assert_eq!(emb.weight().shape().dims(), &[100, 32]);
+        assert_eq!(emb.weight().unwrap().shape().dims(), &[100, 32]);
     }
 
     #[test]

@@ -25,10 +25,12 @@
 pub mod cache;
 pub mod config;
 pub mod engine;
+pub mod gguf_loader;
 pub mod prefetcher;
 pub mod sharder;
 
 pub use cache::LayerCache;
 pub use config::LayeredConfig;
 pub use engine::{KvCache, LayeredEngine};
+pub use gguf_loader::{config_from_gguf, load_layer_from_gguf};
 pub use prefetcher::LayerPrefetcher;
