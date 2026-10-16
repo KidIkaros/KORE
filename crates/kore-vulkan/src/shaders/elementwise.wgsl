@@ -1,6 +1,6 @@
 struct ElementwiseUniforms {
     numel: u32,
-    op_type: u32, // 0=add, 1=mul, 2=sub, 3=div, 4=add_scalar, 5=mul_scalar, 6=silu, 7=swiglu, 8=copy_offset, 9=swiglu_split
+    op_type: u32, // 0=add, 1=mul, 2=sub, 3=div, 4=add_scalar, 5=mul_scalar, 6=silu, 7=swiglu, 8=copy_offset, 9=swiglu_split, 10=x_sigmoid_gate
     scalar: f32,
     a_numel: u32,
     b_numel: u32,
@@ -60,6 +60,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         } else if (params.op_type == 7u) {
             let sig = 1.0 / (1.0 + exp(-a));
             C[idx] = a * sig * b;
+        } else if (params.op_type == 10u) {
+            C[idx] = a / (1.0 + exp(-b));
         }
     }
 }

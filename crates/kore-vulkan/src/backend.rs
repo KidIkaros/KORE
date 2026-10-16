@@ -191,6 +191,64 @@ struct AddRmsNormUniforms {
     _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Q2GemvUniforms {
+    m: u32,
+    n: u32,
+    k: u32,
+    blocks_per_row: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct HadamardSignedUniforms {
+    total_blocks: u32,
+    block_size: u32,
+    scale: f32,
+    mode: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GdnConvUniforms {
+    conv_dim: u32,
+    conv_k: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GdnGatesUniforms {
+    hidden: u32,
+    n_v: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GdnStepUniforms {
+    n_v: u32,
+    d_k: u32,
+    d_v: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct QkNormRopeUniforms {
+    n_heads: u32,
+    n_kv: u32,
+    head_dim: u32,
+    rope_dim: u32,
+    pos: u32,
+    theta: f32,
+    eps: f32,
+    _pad: u32,
+}
+
 struct QueuedDispatch {
     pipeline: Arc<wgpu::ComputePipeline>,
     bind_group: wgpu::BindGroup,
@@ -258,6 +316,12 @@ pub struct VulkanBackend {
     rope_pair_pipeline: Arc<wgpu::ComputePipeline>,
     kv_append_pair_pipeline: Arc<wgpu::ComputePipeline>,
     add_rms_norm_pipeline: Arc<wgpu::ComputePipeline>,
+    gemv_q2_0_pipeline: Arc<wgpu::ComputePipeline>,
+    hadamard_signed_pipeline: Arc<wgpu::ComputePipeline>,
+    gdn_conv_pipeline: Arc<wgpu::ComputePipeline>,
+    gdn_gates_pipeline: Arc<wgpu::ComputePipeline>,
+    gdn_step_pipeline: Arc<wgpu::ComputePipeline>,
+    qknorm_rope_pipeline: Arc<wgpu::ComputePipeline>,
     batch: Arc<parking_lot::Mutex<PendingBatch>>,
     /// Lazily padded Q6_K weight buffers (210B -> 224B blocks), keyed by source buffer
     /// pointer; the source Arc is held so its address can never be recycled by the pool.
@@ -617,6 +681,96 @@ impl VulkanBackend {
             },
         ));
 
+        let q2_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_gemv_q2_0_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gemv_q2_0.wgsl").into()),
+        });
+        let gemv_q2_0_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_gemv_q2_0_pipeline"),
+                layout: None,
+                module: &q2_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let hads_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_hadamard_signed_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/hadamard_signed.wgsl").into()),
+        });
+        let hadamard_signed_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_hadamard_signed_pipeline"),
+                layout: None,
+                module: &hads_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let gdn_conv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_gdn_conv_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gdn_conv.wgsl").into()),
+        });
+        let gdn_conv_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_gdn_conv_pipeline"),
+                layout: None,
+                module: &gdn_conv_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let gdn_gates_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_gdn_gates_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gdn_gates.wgsl").into()),
+        });
+        let gdn_gates_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_gdn_gates_pipeline"),
+                layout: None,
+                module: &gdn_gates_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let gdn_step_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_gdn_step_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gdn_step.wgsl").into()),
+        });
+        let gdn_step_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_gdn_step_pipeline"),
+                layout: None,
+                module: &gdn_step_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let qknr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_qknorm_rope_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/qknorm_rope.wgsl").into()),
+        });
+        let qknorm_rope_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_qknorm_rope_pipeline"),
+                layout: None,
+                module: &qknr_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
         let batch = Arc::new(parking_lot::Mutex::new(PendingBatch {
             dispatches: Vec::with_capacity(1024),
             uniform_cursor: 0,
@@ -649,6 +803,12 @@ impl VulkanBackend {
             rope_pair_pipeline,
             kv_append_pair_pipeline,
             add_rms_norm_pipeline,
+            gemv_q2_0_pipeline,
+            hadamard_signed_pipeline,
+            gdn_conv_pipeline,
+            gdn_gates_pipeline,
+            gdn_step_pipeline,
+            qknorm_rope_pipeline,
             batch,
             q6k_pad_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         };
@@ -1972,6 +2132,288 @@ impl VulkanBackend {
         ))
     }
 
+    /// Q2_0 quantized GEMV: y[m,n] = x[m,k] @ W^T where W is [n,k] Q2_0-packed
+    /// (64 elems/block, 18 bytes: fp16 scale + 16 bytes of 2-bit {-1,0,1,2} codes).
+    pub fn gemv_q2_0(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+        if k % 64 != 0 {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_0".into(),
+                lhs: vec![k],
+                rhs: vec![64],
+            });
+        }
+        let x_shape = x.shape().dims();
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        if x.numel() != m * k {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_0".into(),
+                lhs: x_shape.to_vec(),
+                rhs: vec![m, k],
+            });
+        }
+        let blocks_per_row = k / 64;
+        if w_raw.numel() != n * blocks_per_row * 18 {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_0".into(),
+                lhs: w_raw.shape().dims().to_vec(),
+                rhs: vec![n * blocks_per_row * 18],
+            });
+        }
+        if m > 4 {
+            return Err(VulkanError::UnsupportedOperation(
+                "gemv_q2_0 supports up to 4 rows".into(),
+            ));
+        }
+
+        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(w_raw.storage_ref(), w_raw.shape().dims(), &self.device, &self.queue)?;
+        let out = crate::buffer::alloc_storage_buffer(&self.device, (m * n * 4).max(4), "kore_q2_out");
+
+        let uniforms = Q2GemvUniforms {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            blocks_per_row: blocks_per_row as u32,
+        };
+        self.record_dispatch(
+            &self.gemv_q2_0_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &out],
+            (n.div_ceil(4).max(1) as u32, m.div_ceil(4).max(1) as u32, 1),
+            "gemv_q2_0_pass",
+        );
+        Ok(self.make_tensor(KoreVulkanBuffer::new(out, DType::F32, vec![m, n]), &[m, n]))
+    }
+
+    /// Signed block-wise Hadamard transform.
+    /// mode 0 (forward): out = WHT(signs ⊙ x) / sqrt(block)
+    /// mode 1 (restore): out = signs ⊙ (WHT(x) / sqrt(block))
+    pub fn hadamard_signed(
+        &self,
+        x: &Tensor,
+        signs: &Tensor,
+        block_size: usize,
+        mode: u32,
+    ) -> Result<Tensor> {
+        let numel = x.numel();
+        if block_size != 512 || numel % block_size != 0 || signs.numel() < numel {
+            return Err(VulkanError::ShapeMismatch {
+                op: "hadamard_signed".into(),
+                lhs: vec![numel],
+                rhs: vec![signs.numel(), block_size],
+            });
+        }
+        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x.shape().dims(), &self.device, &self.queue)?;
+        let s_buf = KoreVulkanBuffer::from_storage(signs.storage_ref(), signs.shape().dims(), &self.device, &self.queue)?;
+        let out = crate::buffer::alloc_storage_buffer(&self.device, (numel * 4).max(4), "kore_hads_out");
+
+        let uniforms = HadamardSignedUniforms {
+            total_blocks: (numel / block_size) as u32,
+            block_size: block_size as u32,
+            scale: (block_size as f32).sqrt().recip(),
+            mode,
+        };
+        self.record_dispatch(
+            &self.hadamard_signed_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), s_buf.arc_buffer(), &out],
+            ((numel / block_size) as u32, 1, 1),
+            "hadamard_signed_pass",
+        );
+        Ok(self.make_tensor(KoreVulkanBuffer::new(out, DType::F32, vec![numel]), &[numel]))
+    }
+
+    /// Gated-DeltaNet depthwise causal conv + SiLU with in-place rolling history.
+    /// x [conv_dim], w [conv_dim, conv_k], hist [conv_dim, conv_k-1] mutated.
+    pub fn gdn_conv(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        hist: &Tensor,
+        conv_dim: usize,
+        conv_k: usize,
+    ) -> Result<Tensor> {
+        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x.shape().dims(), &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(w.storage_ref(), w.shape().dims(), &self.device, &self.queue)?;
+        let h_buf = KoreVulkanBuffer::from_storage(hist.storage_ref(), hist.shape().dims(), &self.device, &self.queue)?;
+        let out = crate::buffer::alloc_storage_buffer(&self.device, (conv_dim * 4).max(4), "kore_gdn_conv_out");
+
+        let uniforms = GdnConvUniforms {
+            conv_dim: conv_dim as u32,
+            conv_k: conv_k as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        self.record_dispatch(
+            &self.gdn_conv_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), h_buf.arc_buffer(), &out],
+            ((conv_dim as u32).div_ceil(256).max(1), 1, 1),
+            "gdn_conv_pass",
+        );
+        Ok(self.make_tensor(KoreVulkanBuffer::new(out, DType::F32, vec![conv_dim]), &[conv_dim]))
+    }
+
+    /// Fused alpha/beta gates: beta = sigmoid(W_b @ h),
+    /// gate = softplus(W_a @ h + dt_bias) * a. Returns (beta[n_v], gate[n_v]).
+    pub fn gdn_gates(
+        &self,
+        h: &Tensor,
+        w_alpha: &Tensor,
+        w_beta: &Tensor,
+        dt_bias: &Tensor,
+        ssm_a: &Tensor,
+        hidden: usize,
+        n_v: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let h_buf = KoreVulkanBuffer::from_storage(h.storage_ref(), h.shape().dims(), &self.device, &self.queue)?;
+        let wa_buf = KoreVulkanBuffer::from_storage(w_alpha.storage_ref(), w_alpha.shape().dims(), &self.device, &self.queue)?;
+        let wb_buf = KoreVulkanBuffer::from_storage(w_beta.storage_ref(), w_beta.shape().dims(), &self.device, &self.queue)?;
+        let dt_buf = KoreVulkanBuffer::from_storage(dt_bias.storage_ref(), dt_bias.shape().dims(), &self.device, &self.queue)?;
+        let a_buf = KoreVulkanBuffer::from_storage(ssm_a.storage_ref(), ssm_a.shape().dims(), &self.device, &self.queue)?;
+        let beta_out = crate::buffer::alloc_storage_buffer(&self.device, (n_v * 4).max(4), "kore_gdn_beta");
+        let gate_out = crate::buffer::alloc_storage_buffer(&self.device, (n_v * 4).max(4), "kore_gdn_gate");
+
+        let uniforms = GdnGatesUniforms {
+            hidden: hidden as u32,
+            n_v: n_v as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        self.record_dispatch(
+            &self.gdn_gates_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[
+                h_buf.arc_buffer(),
+                wa_buf.arc_buffer(),
+                wb_buf.arc_buffer(),
+                dt_buf.arc_buffer(),
+                a_buf.arc_buffer(),
+                &beta_out,
+                &gate_out,
+            ],
+            (n_v as u32, 1, 1),
+            "gdn_gates_pass",
+        );
+        Ok((
+            self.make_tensor(KoreVulkanBuffer::new(beta_out, DType::F32, vec![n_v]), &[n_v]),
+            self.make_tensor(KoreVulkanBuffer::new(gate_out, DType::F32, vec![n_v]), &[n_v]),
+        ))
+    }
+
+    /// Fused DeltaNet recurrent step: L2-normed q/k, delta-rule state update
+    /// (state mutated in place), output projection, gated RMSNorm with z.
+    /// qkv = [q | k | v] conv output, state [n_v*d_v*d_v], out [n_v*d_v].
+    pub fn gdn_step(
+        &self,
+        qkv: &Tensor,
+        z: &Tensor,
+        state: &Tensor,
+        beta: &Tensor,
+        gate: &Tensor,
+        norm_w: &Tensor,
+        n_v: usize,
+        d_k: usize,
+        d_v: usize,
+        eps: f32,
+    ) -> Result<Tensor> {
+        let qkv_buf = KoreVulkanBuffer::from_storage(qkv.storage_ref(), qkv.shape().dims(), &self.device, &self.queue)?;
+        let z_buf = KoreVulkanBuffer::from_storage(z.storage_ref(), z.shape().dims(), &self.device, &self.queue)?;
+        let s_buf = KoreVulkanBuffer::from_storage(state.storage_ref(), state.shape().dims(), &self.device, &self.queue)?;
+        let b_buf = KoreVulkanBuffer::from_storage(beta.storage_ref(), beta.shape().dims(), &self.device, &self.queue)?;
+        let g_buf = KoreVulkanBuffer::from_storage(gate.storage_ref(), gate.shape().dims(), &self.device, &self.queue)?;
+        let nw_buf = KoreVulkanBuffer::from_storage(norm_w.storage_ref(), norm_w.shape().dims(), &self.device, &self.queue)?;
+        let out = crate::buffer::alloc_storage_buffer(&self.device, (n_v * d_v * 4).max(4), "kore_gdn_step_out");
+
+        let uniforms = GdnStepUniforms {
+            n_v: n_v as u32,
+            d_k: d_k as u32,
+            d_v: d_v as u32,
+            eps,
+        };
+        self.record_dispatch(
+            &self.gdn_step_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[
+                qkv_buf.arc_buffer(),
+                z_buf.arc_buffer(),
+                s_buf.arc_buffer(),
+                b_buf.arc_buffer(),
+                g_buf.arc_buffer(),
+                nw_buf.arc_buffer(),
+                &out,
+            ],
+            (n_v as u32, 1, 1),
+            "gdn_step_pass",
+        );
+        Ok(self.make_tensor(
+            KoreVulkanBuffer::new(out, DType::F32, vec![n_v * d_v]),
+            &[n_v * d_v],
+        ))
+    }
+
+    /// Per-head Q/K RMSNorm + gate split + partial NEOX RoPE for Qwen3.5
+    /// full-attention layers. qg [n_heads*(2*head_dim)] = [q|gate] per head.
+    /// Returns (q_roped, k_roped, gate).
+    pub fn qknorm_rope(
+        &self,
+        qg: &Tensor,
+        kk: &Tensor,
+        q_norm: &Tensor,
+        k_norm: &Tensor,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        pos: usize,
+        theta: f32,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        if head_dim != 256 {
+            return Err(VulkanError::UnsupportedOperation(
+                "qknorm_rope requires head_dim 256".into(),
+            ));
+        }
+        let qg_buf = KoreVulkanBuffer::from_storage(qg.storage_ref(), qg.shape().dims(), &self.device, &self.queue)?;
+        let kk_buf = KoreVulkanBuffer::from_storage(kk.storage_ref(), kk.shape().dims(), &self.device, &self.queue)?;
+        let qn_buf = KoreVulkanBuffer::from_storage(q_norm.storage_ref(), q_norm.shape().dims(), &self.device, &self.queue)?;
+        let kn_buf = KoreVulkanBuffer::from_storage(k_norm.storage_ref(), k_norm.shape().dims(), &self.device, &self.queue)?;
+        let q_out = crate::buffer::alloc_storage_buffer(&self.device, (n_heads * head_dim * 4).max(4), "kore_qknr_q");
+        let k_out = crate::buffer::alloc_storage_buffer(&self.device, (n_kv * head_dim * 4).max(4), "kore_qknr_k");
+        let g_out = crate::buffer::alloc_storage_buffer(&self.device, (n_heads * head_dim * 4).max(4), "kore_qknr_g");
+
+        let uniforms = QkNormRopeUniforms {
+            n_heads: n_heads as u32,
+            n_kv: n_kv as u32,
+            head_dim: head_dim as u32,
+            rope_dim: rope_dim as u32,
+            pos: pos as u32,
+            theta,
+            eps,
+            _pad: 0,
+        };
+        self.record_dispatch(
+            &self.qknorm_rope_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[
+                qg_buf.arc_buffer(),
+                kk_buf.arc_buffer(),
+                qn_buf.arc_buffer(),
+                kn_buf.arc_buffer(),
+                &q_out,
+                &k_out,
+                &g_out,
+            ],
+            ((n_heads + n_kv) as u32, 1, 1),
+            "qknorm_rope_pass",
+        );
+        Ok((
+            self.make_tensor(KoreVulkanBuffer::new(q_out, DType::F32, vec![1, n_heads * head_dim]), &[1, n_heads * head_dim]),
+            self.make_tensor(KoreVulkanBuffer::new(k_out, DType::F32, vec![1, n_kv * head_dim]), &[1, n_kv * head_dim]),
+            self.make_tensor(KoreVulkanBuffer::new(g_out, DType::F32, vec![1, n_heads * head_dim]), &[1, n_heads * head_dim]),
+        ))
+    }
+
     /// Register this Vulkan backend instance with `kore_core`'s global backend registry.
     pub fn register(self: Arc<Self>) {
         kore_core::device::register_backend(self);
@@ -2257,6 +2699,94 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         eps: f32,
     ) -> kore_core::Result<(Tensor, Tensor)> {
         self.add_rms_norm(a, b, weight, eps)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn sigmoid_mul(&self, a: &Tensor, b: &Tensor) -> kore_core::Result<Tensor> {
+        self.elementwise_binary(a, b, 10)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gemv_q2_0(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q2_0(x, w_raw, n, k)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn hadamard_signed(
+        &self,
+        x: &Tensor,
+        signs: &Tensor,
+        block_size: usize,
+        mode: u32,
+    ) -> kore_core::Result<Tensor> {
+        self.hadamard_signed(x, signs, block_size, mode)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gdn_conv(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        hist: &Tensor,
+        conv_dim: usize,
+        conv_k: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gdn_conv(x, w, hist, conv_dim, conv_k)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gdn_gates(
+        &self,
+        h: &Tensor,
+        w_alpha: &Tensor,
+        w_beta: &Tensor,
+        dt_bias: &Tensor,
+        ssm_a: &Tensor,
+        hidden: usize,
+        n_v: usize,
+    ) -> kore_core::Result<(Tensor, Tensor)> {
+        self.gdn_gates(h, w_alpha, w_beta, dt_bias, ssm_a, hidden, n_v)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gdn_step(
+        &self,
+        qkv: &Tensor,
+        z: &Tensor,
+        state: &Tensor,
+        beta: &Tensor,
+        gate: &Tensor,
+        norm_w: &Tensor,
+        n_v: usize,
+        d_k: usize,
+        d_v: usize,
+        eps: f32,
+    ) -> kore_core::Result<Tensor> {
+        self.gdn_step(qkv, z, state, beta, gate, norm_w, n_v, d_k, d_v, eps)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn qknorm_rope(
+        &self,
+        qg: &Tensor,
+        kk: &Tensor,
+        q_norm: &Tensor,
+        k_norm: &Tensor,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        pos: usize,
+        theta: f32,
+        eps: f32,
+    ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
+        self.qknorm_rope(qg, kk, q_norm, k_norm, n_heads, n_kv, head_dim, rope_dim, pos, theta, eps)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 }

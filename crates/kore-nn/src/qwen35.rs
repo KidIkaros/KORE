@@ -733,3 +733,306 @@ impl Qwen35Model {
         Ok(out)
     }
 }
+
+// ---------- Vulkan GPU path ----------
+
+use kore_core::device::{get_backend, DeviceBackend};
+use kore_core::{Device, DType, Storage, Tensor};
+
+struct GpuDelta {
+    attn_norm: Tensor,
+    post_norm: Tensor,
+    conv: Tensor,
+    a: Tensor,
+    alpha_w: Tensor,
+    beta_w: Tensor,
+    dt_bias: Tensor,
+    ssm_norm: Tensor,
+    qkv: Tensor,
+    z: Tensor,
+    out: Tensor,
+    ffn_gate: Tensor,
+    ffn_up: Tensor,
+    ffn_down: Tensor,
+}
+
+struct GpuFull {
+    attn_norm: Tensor,
+    post_norm: Tensor,
+    q_norm: Tensor,
+    k_norm: Tensor,
+    wq: Tensor,
+    wk: Tensor,
+    wv: Tensor,
+    wo: Tensor,
+    ffn_gate: Tensor,
+    ffn_up: Tensor,
+    ffn_down: Tensor,
+}
+
+enum GpuLayer {
+    Delta(GpuDelta),
+    Full(GpuFull),
+}
+
+/// Mutable per-layer device state.
+pub enum GpuState {
+    Delta { hist: Tensor, state: Tensor },
+    Full { kc: Tensor, vc: Tensor, len: usize },
+}
+
+/// Qwen3.5 with all weights device-resident; single-token decode via the
+/// fused Vulkan kernels. Requires `n_k == n_v` and `d_k == d_v` (true for
+/// Bonsai-2B) plus head_dim == 256.
+pub struct Qwen35Gpu {
+    cfg: Qwen35Config,
+    device: Device,
+    backend: Arc<dyn DeviceBackend>,
+    emb: Tensor, // U8 packed Q2_0 rows
+    emb_m: usize,
+    layers: Vec<GpuLayer>,
+    out_norm: Tensor,
+    signs: Vec<(usize, Tensor)>,
+}
+
+impl Qwen35Gpu {
+    /// Materialize a device copy of `cpu` on `device`.
+    pub fn from_cpu(cpu: &Qwen35Model, device: Device) -> Result<Self> {
+        let backend = get_backend(device).ok_or_else(|| err("no backend for device"))?;
+        let cfg = cpu.cfg.clone();
+        let n_k = cfg.ssm_groups;
+        let n_v = cfg.ssm_dt_rank;
+        let d_k = cfg.ssm_state;
+        let d_v = cfg.ssm_inner / n_v;
+        if n_k != n_v || d_k != d_v {
+            return Err(err("gpu path requires n_k == n_v and d_k == d_v"));
+        }
+        if cfg.head_dim != 256 {
+            return Err(err("gpu path requires head_dim 256"));
+        }
+
+        let up_f32 = |v: &[f32]| -> Result<Tensor> {
+            Tensor::from_f32(v, &[v.len()])
+                .to(device)
+                .map_err(|e| err(&format!("upload: {e}")))
+        };
+        let up_q2 = |w: &Q2W| -> Result<Tensor> {
+            let bytes = w.bytes().to_vec();
+            let n = bytes.len();
+            let s = Storage::from_bytes(DType::U8, n, bytes)?;
+            Tensor::from_storage(s, &[n])
+                .to(device)
+                .map_err(|e| err(&format!("upload q2: {e}")))
+        };
+
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for layer in &cpu.layers {
+            match layer {
+                Layer::Delta(l) => layers.push(GpuLayer::Delta(GpuDelta {
+                    attn_norm: up_f32(&l.attn_norm)?,
+                    post_norm: up_f32(&l.post_norm)?,
+                    conv: up_f32(&l.conv)?,
+                    a: up_f32(&l.a)?,
+                    alpha_w: up_f32(&l.alpha_w)?,
+                    beta_w: up_f32(&l.beta_w)?,
+                    dt_bias: up_f32(&l.dt_bias)?,
+                    ssm_norm: up_f32(&l.ssm_norm)?,
+                    qkv: up_q2(&l.qkv)?,
+                    z: up_q2(&l.z)?,
+                    out: up_q2(&l.out)?,
+                    ffn_gate: up_q2(&l.ffn_gate)?,
+                    ffn_up: up_q2(&l.ffn_up)?,
+                    ffn_down: up_q2(&l.ffn_down)?,
+                })),
+                Layer::Full(l) => layers.push(GpuLayer::Full(GpuFull {
+                    attn_norm: up_f32(&l.attn_norm)?,
+                    post_norm: up_f32(&l.post_norm)?,
+                    q_norm: up_f32(&l.q_norm)?,
+                    k_norm: up_f32(&l.k_norm)?,
+                    wq: up_q2(&l.wq)?,
+                    wk: up_q2(&l.wk)?,
+                    wv: up_q2(&l.wv)?,
+                    wo: up_q2(&l.wo)?,
+                    ffn_gate: up_q2(&l.ffn_gate)?,
+                    ffn_up: up_q2(&l.ffn_up)?,
+                    ffn_down: up_q2(&l.ffn_down)?,
+                })),
+            }
+        }
+
+        let emb = {
+            let bytes = cpu.emb.bytes().to_vec();
+            let n = bytes.len();
+            let s = Storage::from_bytes(DType::U8, n, bytes)?;
+            Tensor::from_storage(s, &[n])
+                .to(device)
+                .map_err(|e| err(&format!("upload emb: {e}")))?
+        };
+
+        let mut signs = Vec::new();
+        for (w, t) in &cpu.sign_tables {
+            signs.push((*w, up_f32(t)?));
+        }
+
+        Ok(Self {
+            emb_m: cpu.emb.m,
+            cfg,
+            device,
+            backend,
+            emb,
+            layers,
+            out_norm: up_f32(&cpu.out_norm)?,
+            signs,
+        })
+    }
+
+    /// Fresh per-layer states; `max_ctx` bounds the full-attention KV caches.
+    pub fn new_state(&self, max_ctx: usize) -> Result<Vec<GpuState>> {
+        let cfg = &self.cfg;
+        let conv_dim = cfg.ssm_inner + 2 * cfg.ssm_groups * cfg.ssm_state;
+        let kv_dim = cfg.n_kv * cfg.head_dim;
+        let mut out = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            match layer {
+                GpuLayer::Delta(_) => out.push(GpuState::Delta {
+                    hist: Tensor::zeros(&[conv_dim * (cfg.ssm_conv - 1)], DType::F32)
+                        .to(self.device)
+                        .map_err(|e| err(&format!("hist: {e}")))?,
+                    state: Tensor::zeros(
+                        &[cfg.ssm_dt_rank * cfg.ssm_state * cfg.ssm_state],
+                        DType::F32,
+                    )
+                    .to(self.device)
+                    .map_err(|e| err(&format!("state: {e}")))?,
+                }),
+                GpuLayer::Full(_) => out.push(GpuState::Full {
+                    kc: Tensor::zeros(&[max_ctx, kv_dim], DType::F32)
+                        .to(self.device)
+                        .map_err(|e| err(&format!("kc: {e}")))?,
+                    vc: Tensor::zeros(&[max_ctx, kv_dim], DType::F32)
+                        .to(self.device)
+                        .map_err(|e| err(&format!("vc: {e}")))?,
+                    len: 0,
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    fn signs_t(&self, width: usize) -> Result<&Tensor> {
+        self.signs
+            .iter()
+            .find(|(w, _)| *w == width)
+            .map(|(_, t)| t)
+            .ok_or_else(|| err(&format!("no gpu sign table width {width}")))
+    }
+
+    fn had_fwd(&self, x: &Tensor) -> Result<Tensor> {
+        self.backend.hadamard_signed(x, self.signs_t(x.numel())?, 512, 0)
+    }
+
+    /// Shared FFN: x += down(swiglu(gate, up) after hadamard) style block.
+    fn ffn_gpu(&self, x: &Tensor, post_norm: &Tensor, g: &Tensor, u: &Tensor, d: &Tensor, ffn: usize, hidden: usize) -> Result<Tensor> {
+        let b = &self.backend;
+        let h = b.rms_norm(x, post_norm, self.cfg.eps)?;
+        let ht = self.had_fwd(&h)?;
+        let gv = b.gemv_q2_0(&ht, g, ffn, hidden)?;
+        let uv = b.gemv_q2_0(&ht, u, ffn, hidden)?;
+        let act = b.swiglu(&gv, &uv)?;
+        let actt = self.had_fwd(&act)?;
+        let down = b.gemv_q2_0(&actt, d, hidden, ffn)?;
+        b.add(x, &down)
+    }
+
+    /// One decode step; returns the next greedy token.
+    pub fn forward(&self, cpu: &Qwen35Model, token: u32, pos: usize, states: &mut [GpuState]) -> Result<u32> {
+        let b = &self.backend;
+        let cfg = &self.cfg;
+        let hidden = cfg.hidden;
+        let ffn = cfg.ffn;
+        let n_v = cfg.ssm_dt_rank;
+        let d_k = cfg.ssm_state;
+        let d_v = cfg.ssm_inner / n_v;
+        let conv_dim = cfg.ssm_inner + 2 * cfg.ssm_groups * cfg.ssm_state;
+        let kv_dim = cfg.n_kv * cfg.head_dim;
+        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+
+        // embed on CPU (row dequant + restore), upload
+        let e = cpu.embed(token)?;
+        let mut x = Tensor::from_f32(&e, &[1, hidden])
+            .to(self.device)
+            .map_err(|e2| err(&format!("embed upload: {e2}")))?;
+
+        for (layer, st) in self.layers.iter().zip(states.iter_mut()) {
+            match (layer, st) {
+                (GpuLayer::Delta(l), GpuState::Delta { hist, state }) => {
+                    let h = b.rms_norm(&x, &l.attn_norm, cfg.eps)?;
+                    let ht = self.had_fwd(&h)?;
+                    let qkv = b.gemv_q2_0(&ht, &l.qkv, conv_dim, hidden)?;
+                    let z = b.gemv_q2_0(&ht, &l.z, hidden, hidden)?;
+                    let (beta, gate) = b.gdn_gates(&h, &l.alpha_w, &l.beta_w, &l.dt_bias, &l.a, hidden, n_v)?;
+                    let conv_out = b.gdn_conv(&qkv, &l.conv, hist, conv_dim, cfg.ssm_conv)?;
+                    let o = b.gdn_step(&conv_out, &z, state, &beta, &gate, &l.ssm_norm, n_v, d_k, d_v, cfg.eps)?;
+                    let ot = self.had_fwd(&o)?;
+                    let proj = b.gemv_q2_0(&ot, &l.out, hidden, hidden)?;
+                    x = b.add(&x, &proj)?;
+                    x = self.ffn_gpu(&x, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
+                }
+                (GpuLayer::Full(l), GpuState::Full { kc, vc, len }) => {
+                    let h = b.rms_norm(&x, &l.attn_norm, cfg.eps)?;
+                    let ht = self.had_fwd(&h)?;
+                    let qg = b.gemv_q2_0(&ht, &l.wq, 2 * cfg.n_heads * cfg.head_dim, hidden)?;
+                    let kk = b.gemv_q2_0(&ht, &l.wk, kv_dim, hidden)?;
+                    let vv = b.gemv_q2_0(&ht, &l.wv, kv_dim, hidden)?;
+                    let (q, k, g) = b.qknorm_rope(
+                        &qg, &kk, &l.q_norm, &l.k_norm,
+                        cfg.n_heads, cfg.n_kv, cfg.head_dim, cfg.rope_dim,
+                        pos, cfg.theta, cfg.eps,
+                    )?;
+                    let (kv, vv2) = b.kv_cache_append_pair(kc, vc, &k, &vv, *len)?;
+                    *len += 1;
+                    let attn = b.fused_attention_decode_gqa(
+                        &q, &kv, &vv2, cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
+                    )?;
+                    let attn = b.sigmoid_mul(&attn, &g)?;
+                    let ot = self.had_fwd(&attn)?;
+                    let proj = b.gemv_q2_0(&ot, &l.wo, hidden, hidden)?;
+                    x = b.add(&x, &proj)?;
+                    x = self.ffn_gpu(&x, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
+                }
+                _ => return Err(err("gpu state/layer mismatch")),
+            }
+        }
+
+        let h = b.rms_norm(&x, &self.out_norm, cfg.eps)?;
+        let ht = self.had_fwd(&h)?;
+        let logits = b.gemv_q2_0(&ht, &self.emb, cfg.vocab, self.emb_m)?;
+        let toks = b.argmax_last_dim(&logits)?;
+        Ok(toks[0])
+    }
+
+    /// Greedy generation on GPU; returns generated tokens.
+    pub fn generate_greedy(
+        &self,
+        cpu: &Qwen35Model,
+        tokens: &[u32],
+        n_new: usize,
+        max_ctx: usize,
+    ) -> Result<Vec<u32>> {
+        let mut states = self.new_state(max_ctx)?;
+        let mut out = Vec::with_capacity(n_new);
+        let mut next = 0u32;
+        for (i, &t) in tokens.iter().enumerate() {
+            next = self.forward(cpu, t, i, &mut states)?;
+        }
+        for k in 0..n_new {
+            let tok = next;
+            if tok == cpu.cfg.eos {
+                break;
+            }
+            out.push(tok);
+            next = self.forward(cpu, tok, tokens.len() + k, &mut states)?;
+        }
+        Ok(out)
+    }
+}

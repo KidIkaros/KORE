@@ -474,6 +474,125 @@ pub trait DeviceBackend: Send + Sync {
             self.device_name()
         )))
     }
+
+    /// Elementwise attention gating: `C = A * sigmoid(B)`.
+    fn sigmoid_mul(
+        &self,
+        _a: &crate::Tensor,
+        _b: &crate::Tensor,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "sigmoid_mul not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Q2_0 quantized GEMV: `y[m,n] = x[m,k] @ W^T`, W packed [n,k] blocks of
+    /// 64 elems / 18 bytes (fp16 scale + 2-bit {-1,0,1,2} codes).
+    fn gemv_q2_0(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q2_0 not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Signed block-wise Hadamard transform.
+    /// mode 0: `out = WHT(signs * x) / sqrt(block)` (forward projection input);
+    /// mode 1: `out = signs * WHT(x) / sqrt(block)` (embedding restore).
+    fn hadamard_signed(
+        &self,
+        _x: &crate::Tensor,
+        _signs: &crate::Tensor,
+        _block_size: usize,
+        _mode: u32,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "hadamard_signed not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Gated-DeltaNet depthwise causal conv + SiLU; `hist` mutated in place.
+    fn gdn_conv(
+        &self,
+        _x: &crate::Tensor,
+        _w: &crate::Tensor,
+        _hist: &crate::Tensor,
+        _conv_dim: usize,
+        _conv_k: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gdn_conv not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Fused DeltaNet gates: `beta = sigmoid(W_b h)`,
+    /// `gate = softplus(W_a h + dt_bias) * a`. Returns `(beta[n_v], gate[n_v])`.
+    fn gdn_gates(
+        &self,
+        _h: &crate::Tensor,
+        _w_alpha: &crate::Tensor,
+        _w_beta: &crate::Tensor,
+        _dt_bias: &crate::Tensor,
+        _ssm_a: &crate::Tensor,
+        _hidden: usize,
+        _n_v: usize,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor)> {
+        Err(crate::KoreError::StorageError(format!(
+            "gdn_gates not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Fused DeltaNet recurrent step: L2-normed q/k, in-place delta-rule state
+    /// update, output readout, gated RMSNorm with z. Returns `[n_v*d_v]`.
+    fn gdn_step(
+        &self,
+        _qkv: &crate::Tensor,
+        _z: &crate::Tensor,
+        _state: &crate::Tensor,
+        _beta: &crate::Tensor,
+        _gate: &crate::Tensor,
+        _norm_w: &crate::Tensor,
+        _n_v: usize,
+        _d_k: usize,
+        _d_v: usize,
+        _eps: f32,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gdn_step not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Per-head Q/K RMSNorm + gate split + partial NEOX RoPE (Qwen3.5).
+    /// Returns `(q_roped, k_roped, gate)`.
+    fn qknorm_rope(
+        &self,
+        _qg: &crate::Tensor,
+        _kk: &crate::Tensor,
+        _q_norm: &crate::Tensor,
+        _k_norm: &crate::Tensor,
+        _n_heads: usize,
+        _n_kv: usize,
+        _head_dim: usize,
+        _rope_dim: usize,
+        _pos: usize,
+        _theta: f32,
+        _eps: f32,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor, crate::Tensor)> {
+        Err(crate::KoreError::StorageError(format!(
+            "qknorm_rope not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
 }
 
 static BACKEND_REGISTRY: std::sync::OnceLock<
