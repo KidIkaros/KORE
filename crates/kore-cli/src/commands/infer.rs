@@ -428,6 +428,13 @@ pub fn cmd_infer_gguf(
             std::process::exit(1);
         });
 
+    // arch dispatch: bounded header read, qwen35 takes the hybrid path
+    if let Ok(gg) = kore_nn::gguf_min::MiniGguf::load(path) {
+        if gg.get_str("general.architecture") == Some("qwen35") {
+            return infer_gguf_qwen35(path, &tokenizer, prompt, max_new_tokens);
+        }
+    }
+
     // 2. Load GGUF model
     println!("Loading model from GGUF: {}", path.display());
     let t_load = Instant::now();
@@ -556,5 +563,82 @@ pub fn cmd_infer_gguf(
         decode_time.as_secs_f64(),
         decode_tok_s,
         total_time.as_secs_f64()
+    );
+}
+
+/// qwen35 (Bonsai ternary hybrid) — CPU reference path.
+fn infer_gguf_qwen35(
+    path: &Path,
+    tokenizer: &Tokenizer,
+    prompt: Option<String>,
+    max_new_tokens: usize,
+) {
+    use kore_nn::qwen35::Qwen35Model;
+
+    println!("Loading qwen35 model: {}", path.display());
+    let t_load = Instant::now();
+    let model = Qwen35Model::from_gguf(path).unwrap_or_else(|e| {
+        eprintln!("Error: failed to load qwen35 model: {}", e);
+        std::process::exit(1);
+    });
+    println!("  Loaded in {:.2}s: {:?}", t_load.elapsed().as_secs_f64(), model.cfg);
+
+    let prompt_str = prompt.unwrap_or_else(|| "Hello, my name is".to_string());
+    println!("\nPrompt: \"{}\"", prompt_str);
+    let prompt_tokens: Vec<u32> = tokenizer
+        .encode(prompt_str.as_str(), false)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: tokenization failed: {}", e);
+            std::process::exit(1);
+        })
+        .get_ids()
+        .to_vec();
+
+    print!("\nGenerated: ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    let t_gen = Instant::now();
+    let (mut dstate, mut astate) = model.new_state();
+    let mut generated = 0usize;
+    let mut logits = Vec::new();
+    for (i, &t) in prompt_tokens.iter().enumerate() {
+        logits = model.forward(t, i, &mut dstate, &mut astate).unwrap_or_else(|e| {
+            eprintln!("\nError during prefill: {}", e);
+            std::process::exit(1);
+        });
+    }
+    let prefill_time = t_gen.elapsed();
+    let mut pos = prompt_tokens.len();
+    for _ in 0..max_new_tokens {
+        let tok = Qwen35Model::argmax(&logits);
+        if tok == model.cfg.eos {
+            break;
+        }
+        generated += 1;
+        if let Ok(text) = tokenizer.decode(&[tok], false) {
+            print!("{}", text);
+            let _ = std::io::stdout().flush();
+        }
+        logits = model.forward(tok, pos, &mut dstate, &mut astate).unwrap_or_else(|e| {
+            eprintln!("\nError during decode: {}", e);
+            std::process::exit(1);
+        });
+        pos += 1;
+    }
+    let total = t_gen.elapsed();
+
+    println!("\n\n--------------------------------------------------");
+    println!(
+        "Prefill:   {} tokens in {:.3}s ({:.2} tok/s)",
+        prompt_tokens.len(),
+        prefill_time.as_secs_f64(),
+        prompt_tokens.len() as f64 / prefill_time.as_secs_f64()
+    );
+    println!(
+        "Decode:    {} tokens in {:.3}s ({:.2} tok/s)",
+        generated,
+        total.as_secs_f64(),
+        generated as f64 / total.as_secs_f64()
     );
 }

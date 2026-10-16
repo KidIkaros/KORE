@@ -51,6 +51,7 @@ pub struct Qwen35Config {
     pub vocab: usize,
     pub context: usize,
     pub hadamard_block: usize,
+    pub eos: u32,
 }
 
 // ---------- Hadamard transform ----------
@@ -264,6 +265,11 @@ impl Qwen35Model {
             vocab: gg.tensor("token_embd.weight")?.dims[1],
             context: get_u("qwen35.context_length").unwrap_or(8192),
             hadamard_block: get_u("prism.hadamard.block_size").unwrap_or(512),
+            eos: meta
+                .get("tokenizer.ggml.eos_token_id")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(248046),
         };
 
         // sign tables
