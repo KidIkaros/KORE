@@ -473,6 +473,9 @@ is 28% of a step, so the honest ceiling for `m=2` is not the GEMV's 1.24× but
 something above it once the per-*step* overheads amortise — which is why the
 first thing to build is the equality test, not the optimisation.
 
+**STATUS (2026-10-17): every row of that table except `GpuState` has landed and
+the forward is bit-identical at `m = 1, 2, 4`; see §2c.**
+
 Build order that keeps every step verifiable: get `m=2` bit-identical to two
 `m=1` steps first (the batch-invariance gate, now over the *whole* forward rather
 than one kernel), then `m=4`, then the drafter and the acceptance loop, then the
@@ -569,6 +572,77 @@ reuse — and transposing trades that reuse for a fresh line every instruction.
 The pattern that looks wrong on a coalescing diagram is the one that is right,
 which is why it was A/B'd rather than rewritten. Recorded here so it is not
 re-attempted.
+
+#### 2c. The multi-column forward — LANDED, and the context decay was an allocation bug
+
+`Qwen35Gpu::forward_batch` advances `m = tokens.len()` positions in one pass and
+returns one greedy token per column (`m ≤ 4`, set by the ternary GEMV's
+accumulator width). Everything whose cost is the weight stream — both Hadamards,
+every projection matvec, the FFN, attention — runs once over all columns; the two
+ops whose state carries across columns (the DeltaNet conv history and its
+recurrent state) run one column at a time, which is bit-identical to that many
+single-token steps by construction.
+
+Gate (`verify_m`): drives a sequential reference over a token stream, records the
+token every position predicts, replays the stream through `forward_batch` in
+chunks of `m`, and requires an element-for-element match plus one extra
+single-token step from each state. The stream is run **past
+`ATTN_SPLIT_MIN_SEQ_K` (256)**, because below it neither path shards and the
+long-context behaviour under test is not exercised: 325/325 positions identical
+at `m = 1, 2, 4`, state probe agreeing. Token ids stay byte-identical to the
+pre-change baseline.
+
+**It worked, and then decayed with context.** Cool-die, interleaved,
+same-context A/B (`bench_multi_cool`, 8 tok/round, 6 rounds, order-alternating),
+ms/token and ratio vs `m = 1`:
+
+| ctx | m=1 | m=2 | m=4 | m=2 / m=4 before |
+|---|---|---|---|---|
+| 320 | 8.56 | 6.27 (1.37×) | 5.18 (1.65×) | 1.30× / 1.63× |
+| 1024 | 8.67 | 6.43 (1.35×) | 5.22 (1.66×) | 1.01× / 1.42× |
+| 2048 | 8.81 | 6.44 (1.37×) | 5.43 (1.62×) | **0.80×** / 1.23× |
+
+Two independent causes, and the second only became visible once the first was
+fixed.
+
+**1. `m > 1` could not use the split-KV kernel.** It is `seq_q == 1` only, so a
+batch had to attend all `m` columns in one call through the single-group kernel
+— the latency-bound one sharding exists to replace (2.18× at ctx 4104). Fix:
+both kernels take an explicit `seq_k` that *narrows* the window (never widens it
+past what is resident), and `forward_batch` calls them once per column with that
+column's own `seq_k = len - m + r + 1` and the shard count `forward` would have
+used at that position. Row `r`'s reduction is therefore the same arithmetic, bit
+for bit, as its sequential step. It also reads only up to that row's own
+`max_t`, where one batched call reads the full `seq_k` for every row.
+
+**2. …and fixing that moved nothing, which located the real cost.** An ablation
+that skipped the attention call entirely and re-measured priced in-situ attention
+at **9.9 ms/step for 12 calls (0.83 ms/call)** at `m = 2`, ctx 2048 — against
+0.146 ms/call for the same kernel in isolation, and 0.095 ms/call for the *same
+kernel* called 6 times per step at `m = 1`. The split kernel's `ml`/`acc` scratch
+is allocated with `alloc_storage_buffer` and bound directly, never wrapped in a
+tensor, so nothing ever returned it to the pool — only `KoreVulkanBuffer`'s
+`Drop` does that. Both were destroyed and re-created on **every** call, an
+`n_shards * head_dim * 4` allocation (270 KB at ctx 2048). A per-call allocation
+is invisible at `m = 1` and multiplied by `m` at `m > 1`, which is why attention
+was the one thing whose cost grew with the batch. `PooledBuffer` gives scratch
+the same recycling as every other intermediate in the step, and the gain is then
+flat in context.
+
+Verified on the pool itself, which is the measurement that says there is no other
+leak of this class: `KORE_ATTN_SPLIT_MIN=2 op_counts` (sharding forced on from
+step 2 so every step runs the split kernel) now reports **540.8 reused buffers
+against 0.2 `create_buffer` per step**, where the leaked scratch alone was 12
+creations per step. Every other scratch buffer in the backend was already
+wrapped in a `KoreVulkanBuffer` and was therefore already recycling.
+
+**Methodology, recorded because it cost time.** `KORE_SKIP_OPS` could not have
+found this: it skips *dispatches* while still allocating, so a cost that lives in
+the allocation is exactly what it cannot see — `KORE_SKIP_OPS=flash_decode_*`
+would have reported attention as nearly free. Pricing it needed a call-level
+ablation. And `bench_multi` (one state built from ctx 0, no cooling) is valid
+only for short-context *ratios*: it reports 41.1 ms/token at ctx 1024, a
+heat-saturated die, where the cooled figure is 8.6.
 
 ### 3. Small-op fusion/parallelisation (~25% of the token)
 
@@ -754,6 +828,13 @@ per-submission buffer recycling (`fbcbe71`). Its own baseline sits a little
 below the 112.3 row because the two A/Bs ran under different thermal
 conditions — compare within a run, never across.
 
+**The multi-column forward is now in-tree and flat in context** (§2c): at a
+cooled die on Bonsai-2, one pass over `m` positions buys **1.37× per token at
+`m = 2` and 1.62–1.66× at `m = 4`**, unchanged from ctx 320 to ctx 2048, and
+byte-identical to that many single-token steps (`verify_m`, 325/325 at
+`m = 1, 2, 4`). That is the machinery spec decode and chunked prefill both
+need; the missing piece for either is `GpuState` snapshot/restore.
+
 **What that leaves.** Three levers, none of them the *host-side* per-dispatch
 cost that the census was built to find (that turned out to be buffer creation,
 and it is now fixed):
@@ -779,8 +860,10 @@ and it is now fixed):
 2. **Chunked/batched prefill (the usability lever).** Prefill is token-at-a-time,
    so a 4096-token prompt costs the same 57.8 tok/s as decode. Needs a chunked
    parallel scan for the 18 DeltaNet/GDN layers plus batched GEMVs for the 6
-   full-attention layers. The `m = 2..4` GEMV path is now bit-invariant, which is
-   the precondition for verifying a batched prefill against the scalar path.
+   full-attention layers. The `m = 2..4` forward path is now bit-invariant
+   *end to end* (`verify_m`, 325/325), which is the precondition for verifying a
+   batched prefill against the scalar path; what is missing is the parallel scan
+   and, for a prefill that is re-run, `GpuState` snapshot/restore.
 3. **MoE expert offload (the capability lever) — engine SHIPPED, model path
    BLOCKED.** Weights ≫ VRAM streamed from system RAM while the GPU computes hot
    experts. This is the only shape that "punches above the weight class" on an
