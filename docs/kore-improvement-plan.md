@@ -452,21 +452,37 @@ measure it against, not before.
 its own logic; it is blocked on a **multi-column forward**, and that is the same
 machinery as chunked prefill:
 
-| piece | needs |
+| piece | status |
 |---|---|
-| `gemv_q2_0` | `m ≤ 4` ✓ already batch-invariant |
-| `had_pre`, `hadamard_signed` | multi-row variants |
-| `qknorm_rope` | takes `pos` as a scalar → per-row positions |
-| `flash_decode_gqa_q8` | `m` queries against one KV state |
-| `gdn_gates`/`gdn_conv`/`gdn_step` | an `m`-step loop inside one dispatch (the recurrence is sequential per token and does not parallelise, but its *weight* traffic amortises) |
-| `kv_cache_append_q8`, `quantize_q8_rows`, `argmax` | `m` rows |
-| `GpuState` | snapshot/restore, because a rejected draft must roll the KV cache and the scan state back to the accepted prefix |
+| `gemv_q2_0` | ✓ `m ≤ 4`, batch-invariant |
+| `had_pre` | ✓ already multi-row — grid is `rows × blocks` and modes 0/1 sum **per row** (`row = gid / blocks`, `base = row * cols`), so a `[m, cols]` input is the whole change |
+| `hadamard_signed` | ✓ flat `numel / 512` block grid, so `rows × cols` just works |
+| `quantize_q8_rows`, `argmax_last_dim` | ✓ take `rows` from `shape[0]` already |
+| `flash_decode_gqa_q8` | ✓ **already does it** — grid `(num_heads, seq_q, 1)` and `max_t = (seq_k - seq_q) + q_row + 1` under `is_causal`, i.e. exactly a causal chunk of `m` queries against one KV state whose last `m` rows are the chunk |
+| `qknorm_rope` | ✗ `pos` is a **scalar uniform** (`ang = pos * freq`); needs `pos0 + row` with the row from the grid |
+| `kv_cache_append_q8` | ✗ `dst_offset = row_offset * cols` is a single row; needs `row_offset + row` |
+| `gdn_gates` | ✗ outputs sized `n_v` (one row); needs an `m`-row variant |
+| `gdn_conv`, `gdn_step` | ✗ the scan is sequential per token and does not parallelise — keep a host-side `m`-step loop, which *is* bit-identical by construction (each step sees the previous state) but leaves the dispatch count alone |
+| `GpuState` | ✗ snapshot/restore, because a rejected draft rolls the KV cache and the scan state back to the accepted prefix |
+
+That is a much shorter list than it looks: the two hardest pieces — the causal
+multi-query attention and the per-row RMSNorm — are already there, the GEMV half
+is proven batch-invariant, and the only *new arithmetic* is a per-row position
+and a row offset. The GDN loop is the one piece that cannot be batched, and it
+is 28% of a step, so the honest ceiling for `m=2` is not the GEMV's 1.24× but
+something above it once the per-*step* overheads amortise — which is why the
+first thing to build is the equality test, not the optimisation.
 
 Build order that keeps every step verifiable: get `m=2` bit-identical to two
 `m=1` steps first (the batch-invariance gate, now over the *whole* forward rather
 than one kernel), then `m=4`, then the drafter and the acceptance loop, then the
 optimisations — with `bench_spec` as the per-shader instrument because it needs
-no forward to measure a kernel change.
+no forward at all, and `bonsai`'s token ids as the equality witness. In order:
+per-row `pos` in `qknorm_rope` (verifiable on its own: two rows at `pos0` must
+equal two `m=1` calls at `pos` and `pos+1`), then the row offset in
+`kv_cache_append_q8`, then `forward_batch` assembling the batched GEMV/`had_pre`
+path around a host-side sequential GDN loop, and only then the kernel-level
+optimisations (the `byte_deltas` hoist, a batched `gdn_gates`, `m=4`).
 
 **Where a step actually goes, measured.** `KORE_SKIP_OPS` (`b262115`) abandons
 this adapter's lack of GPU timestamps by ablating a dispatch group and
