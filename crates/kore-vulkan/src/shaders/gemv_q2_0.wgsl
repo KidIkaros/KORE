@@ -11,10 +11,17 @@ struct Q2Uniforms {
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 
 var<workgroup> sdata: array<vec4<f32>, 128>;
+// lut[byte] = vec4 of code deltas (c_i - 1) for the 4 elems that byte encodes.
+var<workgroup> lut: array<vec4<f32>, 256>;
 
-// Q2_0: 64 elems/block, 18 bytes = fp16 scale + 16 bytes of 2-bit codes.
-// Code c in {0,1,2,3} -> value c-1 in {-1,0,+1,+2}, times scale.
-// Blocks are byte-addressed (18 is not a multiple of 4).
+// Repacked Q2_0 row layout (u32-aligned, same byte count):
+//   codes:  u32 at (j*bpr + b)   -> block b, code word j (elems 16j..16j+15)
+//   scales: u16 at byte bpr*16 + 2b -> u32 idx bpr*4 + b/2, half (b&1)*16
+//
+// One warp (32 lanes) owns one output row. Per iteration the warp covers 2
+// blocks (128 contiguous elements): lane t owns elements i*128 + 4t .. +3,
+// i.e. block (2i + t/16) and code byte (t%16). x is read as a vec4 at index
+// i*32 + t (fully coalesced).
 
 fn fp16_to_f32(h: u32) -> f32 {
     let sign = (h >> 15u) & 1u;
@@ -31,20 +38,25 @@ fn fp16_to_f32(h: u32) -> f32 {
     return select(f, -f, sign == 1u);
 }
 
-fn get_byte(row_off: u32, byte_idx: u32) -> u32 {
-    let addr = row_off + byte_idx;
-    return (w[addr >> 2u] >> ((addr & 3u) * 8u)) & 0xFFu;
-}
-
-// Lane t covers elements {2t, 2t+1} of each block: code byte 2+(t>>1),
-// shift (t&1)*4. x pair = one vec4 element (xv.xy or xv.zw) per block pos.
 @compute @workgroup_size(128)
 fn main(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>
 ) {
-    let sub_warp = local_id.x / 32u;
-    let tid = local_id.x % 32u;
+    let lx = local_id.x;
+
+    for (var e = lx; e < 256u; e = e + 128u) {
+        lut[e] = vec4<f32>(
+            f32(i32(e & 3u) - 1),
+            f32(i32((e >> 2u) & 3u) - 1),
+            f32(i32((e >> 4u) & 3u) - 1),
+            f32(i32((e >> 6u) & 3u) - 1),
+        );
+    }
+    workgroupBarrier();
+
+    let sub_warp = lx / 32u;
+    let tid = lx % 32u;
     let row = workgroup_id.x * 4u + sub_warp;
     let m_base = workgroup_id.y * 4u;
     let base_sdata = sub_warp * 32u;
@@ -54,43 +66,48 @@ fn main(
     }
     let m_rem = min(4u, params.m - m_base);
     let kv = params.k / 4u;
+    let bpr = params.blocks_per_row;
+    let row_words = bpr * 18u / 4u;
+
+    // lane's block-within-8 and code-byte constants
+    let b_in8 = tid >> 4u;           // 0..1
+    let byte_p = tid & 15u;          // code byte within block
+    let cw_j = byte_p >> 2u;         // which code u32 word
+    let cw_sh = (byte_p & 3u) * 8u;  // byte position within the word
 
     var sum = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 
     if (row < params.n) {
-        let row_off = row * params.blocks_per_row * 18u;
-        let byte_idx = 2u + (tid >> 1u);          // code byte within block
-        let shift = (tid & 1u) * 4u;
-        let xvec_idx = tid >> 1u;                 // vec4 index within block
-        let xlo = (tid & 1u) == 0u;               // .xy or .zw
+        let row_w = row * row_words;
+        // Each warp (32 lanes) owns one output row and covers 2 blocks (128
+        // elements) per iteration: lane t reads the vec4 at i*32 + t, which is
+        // elements i*128 + 4t (block i*2 + t/16, code byte t%16).
+        let n_iter = (bpr + 1u) / 2u;
+        for (var i = 0u; i < n_iter; i = i + 1u) {
+            let b = i * 2u + b_in8;
+            if (b >= bpr) {
+                break;
+            }
+            let sw = w[row_w + bpr * 4u + (b >> 1u)];
+            let h = (sw >> ((b & 1u) * 16u)) & 0xFFFFu;
+            let d = fp16_to_f32(h);
+            let cb = (w[row_w + cw_j * bpr + b] >> cw_sh) & 0xFFu;
+            let lv = lut[cb];
+            let xi = i * 32u + tid;
 
-        for (var b: u32 = 0u; b < params.blocks_per_row; b = b + 1u) {
-            let bo = row_off + b * 18u;
-            let lo = get_byte(bo, 0u);
-            let hi = get_byte(bo, 1u);
-            let d = fp16_to_f32(lo | (hi << 8u));
-            let cb = get_byte(bo, byte_idx);
-            let c0 = f32(i32((cb >> shift) & 3u) - 1);
-            let c1 = f32(i32((cb >> (shift + 2u)) & 3u) - 1);
-
-            let xi = b * 16u + xvec_idx;          // vec4 index into x row 0
-            var xv = x[xi];
-            var xp = select(xv.zw, xv.xy, xlo);
-            sum.x += d * (c0 * xp.x + c1 * xp.y);
+            var a = lv * x[xi];
+            sum.x += d * (a.x + a.y + a.z + a.w);
             if (m_rem > 1u) {
-                xv = x[xi + kv];
-                xp = select(xv.zw, xv.xy, xlo);
-                sum.y += d * (c0 * xp.x + c1 * xp.y);
+                a = lv * x[xi + kv];
+                sum.y += d * (a.x + a.y + a.z + a.w);
             }
             if (m_rem > 2u) {
-                xv = x[xi + 2u * kv];
-                xp = select(xv.zw, xv.xy, xlo);
-                sum.z += d * (c0 * xp.x + c1 * xp.y);
+                a = lv * x[xi + 2u * kv];
+                sum.z += d * (a.x + a.y + a.z + a.w);
             }
             if (m_rem > 3u) {
-                xv = x[xi + 3u * kv];
-                xp = select(xv.zw, xv.xy, xlo);
-                sum.w += d * (c0 * xp.x + c1 * xp.y);
+                a = lv * x[xi + 3u * kv];
+                sum.w += d * (a.x + a.y + a.z + a.w);
             }
         }
     }

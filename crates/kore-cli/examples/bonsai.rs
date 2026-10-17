@@ -27,6 +27,10 @@ fn main() {
         .get_ids()
         .to_vec();
     eprintln!("prompt tokens: {ids:?}");
+    let max_ctx: usize = std::env::args()
+        .nth(6)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(ids.len() + n_new + 8);
 
     if use_gpu {
         kore_vulkan::register_vulkan_backend().expect("vulkan backend");
@@ -35,7 +39,7 @@ fn main() {
         eprintln!("weights uploaded in {:?}", t_gpu.elapsed());
 
         let t1 = Instant::now();
-        let mut states = gpu.new_state(ids.len() + n_new + 8).expect("gpu state");
+        let mut states = gpu.new_state(max_ctx).expect("gpu state");
         let mut out = Vec::new();
         let mut next = 0u32;
         for (i, &t) in ids.iter().enumerate() {

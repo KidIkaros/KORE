@@ -454,3 +454,263 @@ fn test_vulkan_gemv_q4_k_correctness() {
 
     println!("All Q4_K GPU GEMV tests passed! Row 0 = {}, Row 1 = {}, Row 2 = {}", y3_slice[0], y3_slice[1], y3_slice[2]);
 }
+
+/// Quantize one F32 row to offset-binary INT8 + per-row scale (mirrors the CPU Q8 KV path).
+fn q8_quant_row(row: &[f32]) -> (Vec<u8>, f32) {
+    let absmax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let scale = if absmax > 0.0 { absmax / 127.0 } else { 1.0 };
+    let inv = 1.0 / scale;
+    let bytes = row
+        .iter()
+        .map(|&v| {
+            let q = (v * inv).round().clamp(-127.0, 127.0) as i16;
+            (q + 128) as u8
+        })
+        .collect();
+    (bytes, scale)
+}
+
+fn q8_dequant_row(bytes: &[u8], scale: f32) -> Vec<f32> {
+    bytes.iter().map(|&b| (b as f32 - 128.0) * scale).collect()
+}
+
+/// Q8 KV path regression: GPU `kv_cache_append_q8` + `fused_attention_decode_gqa_q8`
+/// must match a CPU reference computed from the *same dequantized* K/V (isolating
+/// the GPU realization from quantization error). The append is split across two
+/// offsets to exercise the non-zero `row_offset`/scale-append path.
+#[test]
+fn test_vulkan_kv_append_q8_and_decode_matches_reference() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+
+    let num_heads = 4usize;
+    let num_kv_heads = 2usize;
+    let head_dim = 16usize; // multiple of 4: packed-u32 requirement
+    let seq_q = 1usize;
+    let seq_k = 12usize;
+    let max_ctx = 32usize;
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let q_data: Vec<f32> = (0..(seq_q * q_dim)).map(|i| (i as f32 * 0.19).sin()).collect();
+    let k_data: Vec<f32> = (0..(seq_k * kv_dim)).map(|i| (i as f32 * 0.23).cos() * 3.0).collect();
+    let v_data: Vec<f32> = (0..(seq_k * kv_dim)).map(|i| (i as f32 * 0.31).sin() * 2.0).collect();
+
+    // Quantize K/V per token row and build the reference dequantized tensors.
+    let mut k_bytes = Vec::with_capacity(seq_k * kv_dim);
+    let mut v_bytes = Vec::with_capacity(seq_k * kv_dim);
+    let mut k_scales_host = vec![0.0f32; max_ctx];
+    let mut v_scales_host = vec![0.0f32; max_ctx];
+    let mut k_deq = vec![0.0f32; seq_k * kv_dim];
+    let mut v_deq = vec![0.0f32; seq_k * kv_dim];
+    for t in 0..seq_k {
+        let (kb, ks) = q8_quant_row(&k_data[t * kv_dim..(t + 1) * kv_dim]);
+        let (vb, vs) = q8_quant_row(&v_data[t * kv_dim..(t + 1) * kv_dim]);
+        k_deq[t * kv_dim..(t + 1) * kv_dim].copy_from_slice(&q8_dequant_row(&kb, ks));
+        v_deq[t * kv_dim..(t + 1) * kv_dim].copy_from_slice(&q8_dequant_row(&vb, vs));
+        k_bytes.extend_from_slice(&kb);
+        v_bytes.extend_from_slice(&vb);
+        k_scales_host[t] = ks;
+        v_scales_host[t] = vs;
+    }
+
+    // Resident caches (U8, max_ctx rows) + per-token F32 scales.
+    let mut kc = Tensor::zeros(&[max_ctx, kv_dim], kore_core::DType::U8)
+        .to(dev)
+        .unwrap();
+    let mut vc = Tensor::zeros(&[max_ctx, kv_dim], kore_core::DType::U8)
+        .to(dev)
+        .unwrap();
+    let k_scales = Tensor::from_f32(&k_scales_host, &[max_ctx]).to(dev).unwrap();
+    let v_scales = Tensor::from_f32(&v_scales_host, &[max_ctx]).to(dev).unwrap();
+
+    // Append in two chunks to exercise a non-zero row_offset.
+    let split = 5usize;
+    for (off, len) in [(0usize, split), (split, seq_k - split)] {
+        let k_new = Tensor::from_storage(
+            kore_core::Storage::from_bytes(
+                kore_core::DType::U8,
+                len * kv_dim,
+                k_bytes[off * kv_dim..(off + len) * kv_dim].to_vec(),
+            )
+            .unwrap(),
+            &[len, kv_dim],
+        )
+        .to(dev)
+        .unwrap();
+        let v_new = Tensor::from_storage(
+            kore_core::Storage::from_bytes(
+                kore_core::DType::U8,
+                len * kv_dim,
+                v_bytes[off * kv_dim..(off + len) * kv_dim].to_vec(),
+            )
+            .unwrap(),
+            &[len, kv_dim],
+        )
+        .to(dev)
+        .unwrap();
+        let ks_new = Tensor::from_f32(&k_scales_host[off..off + len], &[len]).to(dev).unwrap();
+        let vs_new = Tensor::from_f32(&v_scales_host[off..off + len], &[len]).to(dev).unwrap();
+
+        let (kv_view, vv_view) = backend
+            .kv_cache_append_q8(&kc, &vc, &k_scales, &v_scales, &k_new, &v_new, &ks_new, &vs_new, off)
+            .expect("kv_cache_append_q8");
+        assert_eq!(kv_view.shape().dims(), &[off + len, kv_dim]);
+        assert_eq!(vv_view.shape().dims(), &[off + len, kv_dim]);
+        kc = kv_view;
+        vc = vv_view;
+    }
+
+    // CPU reference: softmax(Q Kᵀ * scale) V over the dequantized K/V (seq_q == 1 → full attention).
+    let group = num_heads / num_kv_heads;
+    let mut expected = vec![0.0f32; seq_q * q_dim];
+    for qr in 0..seq_q {
+        for h in 0..num_heads {
+            let kvh = h / group;
+            let mut scores = vec![0.0f32; seq_k];
+            let mut maxs = f32::NEG_INFINITY;
+            for t in 0..seq_k {
+                let mut dot = 0.0f32;
+                for d in 0..head_dim {
+                    dot += q_data[qr * q_dim + h * head_dim + d]
+                        * k_deq[t * kv_dim + kvh * head_dim + d];
+                }
+                let s = dot * scale;
+                scores[t] = s;
+                maxs = maxs.max(s);
+            }
+            let mut sum = 0.0f32;
+            for s in scores.iter_mut() {
+                *s = (*s - maxs).exp();
+                sum += *s;
+            }
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for t in 0..seq_k {
+                    acc += scores[t] * v_deq[t * kv_dim + kvh * head_dim + d];
+                }
+                expected[qr * q_dim + h * head_dim + d] = acc / sum;
+            }
+        }
+    }
+
+    let q = Tensor::from_f32(&q_data, &[seq_q, q_dim]).to(dev).unwrap();
+    let actual = backend
+        .fused_attention_decode_gqa_q8(
+            &q, &kc, &vc, &k_scales, &v_scales, num_heads, num_kv_heads, head_dim, scale,
+        )
+        .expect("fused_attention_decode_gqa_q8")
+        .to(kore_core::Device::Cpu)
+        .unwrap();
+    let a = actual.as_f32_slice().unwrap();
+    assert_eq!(a.len(), expected.len());
+    for (i, (got, want)) in a.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-3,
+            "Q8 decode mismatch at {i}: got {got}, expected {want}"
+        );
+    }
+}
+
+/// GPU per-row INT8 quantization must match the exact CPU recipe:
+/// `scale = absmax/127`, `q = clamp(round(x/scale), -127, 127)`, stored `q + 128`.
+#[test]
+fn test_vulkan_quantize_q8_rows_matches_reference() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+
+    let rows = 4usize;
+    let cols = 64usize; // multiple of 4
+    let x: Vec<f32> = (0..rows * cols)
+        .map(|i| (((i * 13 + 7) % 101) as f32 - 50.0) * 0.37)
+        .collect();
+
+    let xt = Tensor::from_f32(&x, &[rows, cols]).to(dev).unwrap();
+    let (q, s) = backend.quantize_q8_rows(&xt).expect("quantize_q8_rows");
+    assert_eq!(q.shape().dims(), &[rows, cols]);
+    assert_eq!(q.dtype(), kore_core::DType::U8);
+    assert_eq!(s.shape().dims(), &[rows]);
+
+    let q_cpu = q.to(kore_core::Device::Cpu).unwrap();
+    let s_cpu = s.to(kore_core::Device::Cpu).unwrap();
+    let qb = q_cpu.storage_ref().as_bytes();
+    let sc = s_cpu.as_f32_slice().unwrap();
+
+    for r in 0..rows {
+        let row = &x[r * cols..(r + 1) * cols];
+        let absmax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let scale = if absmax > 0.0 { absmax / 127.0 } else { 1.0 };
+        assert!(
+            (sc[r] - scale).abs() < 1e-6,
+            "row {r} scale: got {}, want {scale}",
+            sc[r]
+        );
+        let inv = 1.0 / scale;
+        for c in 0..cols {
+            let want = ((row[c] * inv).round().clamp(-127.0, 127.0) as i16 + 128) as u8;
+            let got = qb[r * cols + c];
+            assert_eq!(got, want, "q[{r}, {c}]: got {got}, want {want}");
+        }
+    }
+}
+
+/// GPU Q2_0 GEMV must match the CPU reference exactly. `bpr=8` (k=512) forces
+/// the multi-iteration block walk, which catches weight-skipping stride bugs.
+#[test]
+fn test_vulkan_gemv_q2_0_matches_cpu_reference() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+
+    let k = 512usize; // in-dim; multiple of 512 (host guard) -> bpr = 8 blocks
+    let n = 7usize; // out-dim
+    let bpr = k / 64;
+    let row_bytes = bpr * 18;
+    // Valid Q2_0 blocks: fp16 scale 0.25 (0x3400 LE) + deterministic code bytes.
+    let mut w = vec![0u8; n * row_bytes];
+    for r in 0..n {
+        for b in 0..bpr {
+            let off = r * row_bytes + b * 18;
+            w[off] = 0x00;
+            w[off + 1] = 0x34;
+            for i in 0..16 {
+                w[off + 2 + i] = ((r * 7 + b * 31 + i * 17 + 3) % 256) as u8;
+            }
+        }
+    }
+    let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.13 - 3.7).sin()).collect();
+
+    // CPU reference
+    let mut want = vec![0.0f32; n];
+    kore_kernels::q2_0::gemv_q2_0(&w, k, n, &x, &mut want).unwrap();
+
+    // GPU path: repack + upload + run
+    let packed = kore_kernels::q2_0::repack_q2_0(&w, k, n).unwrap();
+    let nb = packed.len();
+    let ws = kore_core::Storage::from_bytes(kore_core::DType::U8, nb, packed).unwrap();
+    let wt = Tensor::from_storage(ws, &[nb]).to(dev).unwrap();
+    let xt = Tensor::from_f32(&x, &[1, k]).to(dev).unwrap();
+
+    let got = backend.gemv_q2_0(&xt, &wt, n, k).expect("gemv_q2_0");
+    let got_cpu = got.to(kore_core::Device::Cpu).unwrap();
+    let g = got_cpu.as_f32_slice().unwrap();
+    for i in 0..n {
+        assert!(
+            (g[i] - want[i]).abs() <= 1e-3 * (1.0 + want[i].abs()),
+            "out[{i}]: gpu {} cpu {}",
+            g[i],
+            want[i]
+        );
+    }
+}
+
+

@@ -184,6 +184,39 @@ struct KvAppendPairUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct KvAppendQ8Uniforms {
+    numel_k: u32,
+    dst_k_offset: u32,
+    src_k_offset: u32,
+    numel_v: u32,
+    dst_v_offset: u32,
+    src_v_offset: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Q8GqaUniforms {
+    seq_q: u32,
+    seq_k: u32,
+    head_dim: u32,
+    scale: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    kv_dim: u32,
+    q_dim: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct QuantQ8Uniforms {
+    rows: u32,
+    cols: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct AddRmsNormUniforms {
     rows: u32,
     cols: u32,
@@ -315,6 +348,9 @@ pub struct VulkanBackend {
     gemv_q6_k_split3_pipeline: Arc<wgpu::ComputePipeline>,
     rope_pair_pipeline: Arc<wgpu::ComputePipeline>,
     kv_append_pair_pipeline: Arc<wgpu::ComputePipeline>,
+    kv_cache_append_q8_pipeline: Arc<wgpu::ComputePipeline>,
+    flash_decode_gqa_q8_pipeline: Arc<wgpu::ComputePipeline>,
+    quantize_q8_rows_pipeline: Arc<wgpu::ComputePipeline>,
     add_rms_norm_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q2_0_pipeline: Arc<wgpu::ComputePipeline>,
     hadamard_signed_pipeline: Arc<wgpu::ComputePipeline>,
@@ -530,6 +566,20 @@ impl VulkanBackend {
                 cache: None,
             },
         ));
+        let flash_decode_gqa_q8_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_flash_decode_gqa_q8_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/flash_decode_gqa_q8.wgsl").into()),
+        });
+        let flash_decode_gqa_q8_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_flash_decode_gqa_q8_pipeline"),
+                layout: None,
+                module: &flash_decode_gqa_q8_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
 
         let rope_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kore_rope_shader"),
@@ -666,6 +716,36 @@ impl VulkanBackend {
             },
         ));
 
+        let kv_cache_append_q8_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_kv_cache_append_q8_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/kv_cache_append_q8.wgsl").into()),
+        });
+        let kv_cache_append_q8_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_kv_cache_append_q8_pipeline"),
+                layout: None,
+                module: &kv_cache_append_q8_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let quantize_q8_rows_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_quantize_q8_rows_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/quantize_q8_rows.wgsl").into()),
+        });
+        let quantize_q8_rows_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_quantize_q8_rows_pipeline"),
+                layout: None,
+                module: &quantize_q8_rows_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
         let add_rms_norm_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kore_add_rms_norm_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/add_rms_norm.wgsl").into()),
@@ -796,12 +876,15 @@ impl VulkanBackend {
             hadamard_pipeline,
             flash_decode_pipeline,
             flash_decode_gqa_pipeline,
+            flash_decode_gqa_q8_pipeline,
             rope_pipeline,
             argmax_pipeline,
             gemv_q4_k_split3_pipeline,
             gemv_q6_k_split3_pipeline,
             rope_pair_pipeline,
             kv_append_pair_pipeline,
+            kv_cache_append_q8_pipeline,
+            quantize_q8_rows_pipeline,
             add_rms_norm_pipeline,
             gemv_q2_0_pipeline,
             hadamard_signed_pipeline,
@@ -1459,6 +1542,188 @@ impl VulkanBackend {
         Ok(self.make_tensor(view_buf, &[total_rows, cols]))
     }
 
+    /// Q8 (quantized INT8) KV-cache append: writes a single-token U8 K/V plus
+    /// per-token f32 scales into the U8 caches and scale buffers. The decode
+    /// shader dequantizes K/V inline (see `fused_attention_decode_gqa_q8`).
+    pub fn kv_cache_append_q8(
+        &self,
+        k_cache_buf: &Tensor,
+        v_cache_buf: &Tensor,
+        k_scales_buf: &Tensor,
+        v_scales_buf: &Tensor,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        k_scales_new: &Tensor,
+        v_scales_new: &Tensor,
+        row_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let kc_shape = k_cache_buf.shape().dims();
+        let vc_shape = v_cache_buf.shape().dims();
+        let kn_shape = k_new.shape().dims();
+        let vn_shape = v_new.shape().dims();
+        let ks_shape = k_scales_new.shape().dims();
+        let vs_shape = v_scales_new.shape().dims();
+        if kc_shape.len() != 2 || vc_shape.len() != 2 || kn_shape.len() != 2
+            || vn_shape.len() != 2 || ks_shape.len() != 1 || vs_shape.len() != 1
+            || kn_shape[1] != kc_shape[1] || vn_shape[1] != vc_shape[1]
+            || kn_shape[0] != vn_shape[0] || kn_shape[0] != ks_shape[0]
+        {
+            return Err(VulkanError::ShapeMismatch {
+                op: "kv_cache_append_q8".into(),
+                lhs: kc_shape.to_vec(),
+                rhs: kn_shape.to_vec(),
+            });
+        }
+
+        let num_new = kn_shape[0];
+        let cols_k = kc_shape[1];
+        let cols_v = vc_shape[1];
+
+        // INT8 K/V are bound as packed `array<u32>` in WGSL (naga has no 8-bit scalar
+        // type), so every row width must be a multiple of 4 to keep byte offsets aligned.
+        if cols_k % 4 != 0 || cols_v % 4 != 0 {
+            return Err(VulkanError::UnsupportedOperation(
+                "kv_cache_append_q8 requires 4-aligned K/V row widths (packed INT8)".into(),
+            ));
+        }
+
+        let kc_buf = KoreVulkanBuffer::from_storage(k_cache_buf.storage_ref(), kc_shape, &self.device, &self.queue)?;
+        let vc_buf = KoreVulkanBuffer::from_storage(v_cache_buf.storage_ref(), vc_shape, &self.device, &self.queue)?;
+        let kn_buf = KoreVulkanBuffer::from_storage(k_new.storage_ref(), kn_shape, &self.device, &self.queue)?;
+        let vn_buf = KoreVulkanBuffer::from_storage(v_new.storage_ref(), vn_shape, &self.device, &self.queue)?;
+
+        let numel_k = (num_new * cols_k) as u32;
+        let numel_v = (num_new * cols_v) as u32;
+        if numel_k + numel_v > 0 {
+            let uniforms = KvAppendQ8Uniforms {
+                numel_k,
+                dst_k_offset: (row_offset * cols_k) as u32,
+                src_k_offset: 0,
+                numel_v,
+                dst_v_offset: (row_offset * cols_v) as u32,
+                src_v_offset: 0,
+            };
+            // Dispatch over u32 words (4 bytes each), not bytes.
+            let workgroups = numel_k.max(numel_v).div_ceil(4).div_ceil(256).max(1);
+            self.record_dispatch(
+                &self.kv_cache_append_q8_pipeline,
+                bytemuck::bytes_of(&uniforms),
+                &[kn_buf.arc_buffer(), vn_buf.arc_buffer(), kc_buf.arc_buffer(), vc_buf.arc_buffer()],
+                (workgroups, 1, 1),
+                "kv_cache_append_q8_pass",
+            );
+        }
+
+        let ks_buf = KoreVulkanBuffer::from_storage(k_scales_buf.storage_ref(), ks_shape, &self.device, &self.queue)?;
+        let vs_buf = KoreVulkanBuffer::from_storage(v_scales_buf.storage_ref(), vs_shape, &self.device, &self.queue)?;
+        let kns = KoreVulkanBuffer::from_storage(k_scales_new.storage_ref(), ks_shape, &self.device, &self.queue)?;
+        let vns = KoreVulkanBuffer::from_storage(v_scales_new.storage_ref(), vs_shape, &self.device, &self.queue)?;
+
+        if num_new > 0 {
+            let eu = ElementwiseUniforms {
+                numel: num_new as u32,
+                op_type: 8,
+                scalar: 0.0,
+                a_numel: num_new as u32,
+                b_numel: num_new as u32,
+                _pad0: row_offset as u32,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            let workgroups = (num_new as u32 + 255) / 256;
+            self.record_dispatch(
+                &self.elementwise_pipeline,
+                bytemuck::bytes_of(&eu),
+                &[kns.arc_buffer(), kns.arc_buffer(), ks_buf.arc_buffer()],
+                (workgroups, 1, 1),
+                "kv_cache_append_q8_k_scales",
+            );
+            let eu = ElementwiseUniforms {
+                numel: num_new as u32,
+                op_type: 8,
+                scalar: 0.0,
+                a_numel: num_new as u32,
+                b_numel: num_new as u32,
+                _pad0: row_offset as u32,
+                _pad1: 0,
+                _pad2: 0,
+            };
+            self.record_dispatch(
+                &self.elementwise_pipeline,
+                bytemuck::bytes_of(&eu),
+                &[vns.arc_buffer(), vns.arc_buffer(), vs_buf.arc_buffer()],
+                (workgroups, 1, 1),
+                "kv_cache_append_q8_v_scales",
+            );
+        }
+
+        let total_rows = row_offset + num_new;
+        let k_view = KoreVulkanBuffer::new(Arc::clone(kc_buf.arc_buffer()), DType::U8, vec![total_rows, cols_k]);
+        let v_view = KoreVulkanBuffer::new(Arc::clone(vc_buf.arc_buffer()), DType::U8, vec![total_rows, cols_v]);
+        Ok((self.make_tensor(k_view, &[total_rows, cols_k]), self.make_tensor(v_view, &[total_rows, cols_v])))
+    }
+
+    /// Quantize F32 rows to symmetric INT8 **on the GPU** (no host round-trip).
+    ///
+    /// Returns packed INT8 bytes `[rows, cols]` (4 bytes per u32 word, little-endian)
+    /// and per-row scales `[rows]`. This mirrors the CPU recipe used previously:
+    /// `scale = absmax(row) / 127`, `q = round(x / scale)` clamped to `[-127, 127]`,
+    /// stored offset-binary as `q + 128`. The output feeds `kv_cache_append_q8`.
+    pub fn quantize_q8_rows(&self, x: &Tensor) -> Result<(Tensor, Tensor)> {
+        let shape = x.shape().dims();
+        if shape.len() != 2 {
+            return Err(VulkanError::ShapeMismatch {
+                op: "quantize_q8_rows".into(),
+                lhs: shape.to_vec(),
+                rhs: vec![0, 0],
+            });
+        }
+        let rows = shape[0];
+        let cols = shape[1];
+        if cols % 4 != 0 {
+            return Err(VulkanError::UnsupportedOperation(
+                "quantize_q8_rows requires 4-aligned row width (packed INT8)".into(),
+            ));
+        }
+
+        let q_buffer = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (rows * cols).max(4),
+            "kore_quantize_q8_out",
+        );
+        let s_buffer = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (rows * 4).max(4),
+            "kore_quantize_q8_scales",
+        );
+
+        if rows > 0 && cols > 0 {
+            let in_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), shape, &self.device, &self.queue)?;
+            let uniforms = QuantQ8Uniforms {
+                rows: rows as u32,
+                cols: cols as u32,
+                _pad0: 0,
+                _pad1: 0,
+            };
+            self.record_dispatch(
+                &self.quantize_q8_rows_pipeline,
+                bytemuck::bytes_of(&uniforms),
+                &[in_buf.arc_buffer(), &q_buffer, &s_buffer],
+                (rows as u32, 1, 1),
+                "quantize_q8_rows_pass",
+            );
+        }
+
+        let q_view = KoreVulkanBuffer::new(q_buffer, DType::U8, vec![rows, cols]);
+        let s_view = KoreVulkanBuffer::new(s_buffer, DType::F32, vec![rows]);
+        let q_storage = kore_core::Storage::from_device(DType::U8, rows * cols, Arc::new(q_view));
+        let s_storage = kore_core::Storage::from_device(DType::F32, rows, Arc::new(s_view));
+        Ok((
+            Tensor::from_storage(q_storage, &[rows, cols]),
+            Tensor::from_storage(s_storage, &[rows]),
+        ))
+    }
+
     /// Apply normalized Fast Walsh-Hadamard Transform (`fwht`) along the last dimension on GPU.
     pub fn hadamard_transform(&self, input: &Tensor) -> Result<Tensor> {
         let shape = input.shape().dims();
@@ -1618,6 +1883,84 @@ impl VulkanBackend {
             &[q_buf.arc_buffer(), k_buf.arc_buffer(), v_buf.arc_buffer(), &out_buffer],
             (num_heads as u32, seq_q as u32, 1),
             "flash_decode_gqa_compute_pass",
+        );
+
+        let out_kore_buf = KoreVulkanBuffer::new(out_buffer, DType::F32, vec![seq_q, q_dim]);
+        Ok(self.make_tensor(out_kore_buf, &[seq_q, q_dim]))
+    }
+
+    /// Fused GQA decode attention (quantized; K/V are INT8 + per-token scales).
+    ///
+    /// Reads K/V as 8-bit storage arrays and dequantizes per-thread with the
+    /// per-token scale buffers — the KV read traffic is 4x lower than F32.
+    pub fn fused_attention_decode_gqa_q8(
+        &self,
+        q: &Tensor,
+        k_q8: &Tensor,
+        v_q8: &Tensor,
+        k_scales: &Tensor,
+        v_scales: &Tensor,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> Result<Tensor> {
+        let q_shape = q.shape().dims();
+        let k_shape = k_q8.shape().dims();
+        let v_shape = v_q8.shape().dims();
+        let ks_shape = k_scales.shape().dims();
+        let vs_shape = v_scales.shape().dims();
+        if q_shape.len() != 2 || k_shape.len() != 2 || v_shape.len() != 2
+            || ks_shape.len() != 1 || vs_shape.len() != 1
+        {
+            return Err(VulkanError::UnsupportedOperation(
+                "fused_attention_decode_gqa_q8 requires 2D Q/K/V + 1D scale buffers".into(),
+            ));
+        }
+        let seq_q = q_shape[0];
+        let q_dim = q_shape[1];
+        let seq_k = k_shape[0];
+        let kv_dim = k_shape[1];
+
+        if q_dim != num_heads * head_dim || kv_dim != num_kv_heads * head_dim {
+            return Err(VulkanError::ShapeMismatch {
+                op: "fused_attention_decode_gqa_q8".into(),
+                lhs: q_shape.to_vec(),
+                rhs: k_shape.to_vec(),
+            });
+        }
+        if kv_dim % 4 != 0 {
+            return Err(VulkanError::UnsupportedOperation(
+                "fused_attention_decode_gqa_q8 requires 4-aligned kv_dim (packed INT8)".into(),
+            ));
+        }
+
+        let q_buf = KoreVulkanBuffer::from_storage(q.storage_ref(), q_shape, &self.device, &self.queue)?;
+        let k_buf = KoreVulkanBuffer::from_storage(k_q8.storage_ref(), k_shape, &self.device, &self.queue)?;
+        let v_buf = KoreVulkanBuffer::from_storage(v_q8.storage_ref(), v_shape, &self.device, &self.queue)?;
+        let ks_buf = KoreVulkanBuffer::from_storage(k_scales.storage_ref(), ks_shape, &self.device, &self.queue)?;
+        let vs_buf = KoreVulkanBuffer::from_storage(v_scales.storage_ref(), vs_shape, &self.device, &self.queue)?;
+
+        let out_bytes = (seq_q * q_dim * std::mem::size_of::<f32>()).max(4);
+        let out_buffer = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_flash_decode_gqa_q8_out");
+
+        let uniforms = Q8GqaUniforms {
+            seq_q: seq_q as u32,
+            seq_k: seq_k as u32,
+            head_dim: head_dim as u32,
+            scale,
+            num_heads: num_heads as u32,
+            num_kv_heads: num_kv_heads as u32,
+            kv_dim: kv_dim as u32,
+            q_dim: q_dim as u32,
+        };
+
+        self.record_dispatch(
+            &self.flash_decode_gqa_q8_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[q_buf.arc_buffer(), k_buf.arc_buffer(), v_buf.arc_buffer(), ks_buf.arc_buffer(), vs_buf.arc_buffer(), &out_buffer],
+            (num_heads as u32, seq_q as u32, 1),
+            "flash_decode_gqa_q8_compute_pass",
         );
 
         let out_kore_buf = KoreVulkanBuffer::new(out_buffer, DType::F32, vec![seq_q, q_dim]);
@@ -2135,11 +2478,11 @@ impl VulkanBackend {
     /// Q2_0 quantized GEMV: y[m,n] = x[m,k] @ W^T where W is [n,k] Q2_0-packed
     /// (64 elems/block, 18 bytes: fp16 scale + 16 bytes of 2-bit {-1,0,1,2} codes).
     pub fn gemv_q2_0(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
-        if k % 64 != 0 {
+        if k % 512 != 0 {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q2_0".into(),
                 lhs: vec![k],
-                rhs: vec![64],
+                rhs: vec![512],
             });
         }
         let x_shape = x.shape().dims();
@@ -2164,6 +2507,7 @@ impl VulkanBackend {
                 "gemv_q2_0 supports up to 4 rows".into(),
             ));
         }
+
 
         let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
         let w_buf = KoreVulkanBuffer::from_storage(w_raw.storage_ref(), w_raw.shape().dims(), &self.device, &self.queue)?;
@@ -2787,6 +3131,48 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         eps: f32,
     ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
         self.qknorm_rope(qg, kk, q_norm, k_norm, n_heads, n_kv, head_dim, rope_dim, pos, theta, eps)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn kv_cache_append_q8(
+        &self,
+        k_cache_buf: &Tensor,
+        v_cache_buf: &Tensor,
+        k_scales_buf: &Tensor,
+        v_scales_buf: &Tensor,
+        k_new: &Tensor,
+        v_new: &Tensor,
+        k_scales_new: &Tensor,
+        v_scales_new: &Tensor,
+        row_offset: usize,
+    ) -> kore_core::Result<(Tensor, Tensor)> {
+        self.kv_cache_append_q8(
+            k_cache_buf, v_cache_buf, k_scales_buf, v_scales_buf, k_new, v_new,
+            k_scales_new, v_scales_new, row_offset,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn fused_attention_decode_gqa_q8(
+        &self,
+        q: &Tensor,
+        k_q8: &Tensor,
+        v_q8: &Tensor,
+        k_scales: &Tensor,
+        v_scales: &Tensor,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+    ) -> kore_core::Result<Tensor> {
+        self.fused_attention_decode_gqa_q8(
+            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn quantize_q8_rows(&self, x: &Tensor) -> kore_core::Result<(Tensor, Tensor)> {
+        self.quantize_q8_rows(x)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 }

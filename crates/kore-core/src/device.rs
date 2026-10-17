@@ -301,6 +301,56 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+
+    /// Fused GQA decode attention (quantized; K/V are INT8 + per-token scales).
+    fn fused_attention_decode_gqa_q8(
+        &self,
+        _q: &crate::Tensor,
+        _k_q8: &crate::Tensor,
+        _v_q8: &crate::Tensor,
+        _k_scales: &crate::Tensor,
+        _v_scales: &crate::Tensor,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "fused_attention_decode_gqa_q8 not implemented for backend '{}'", self.device_name()
+        )))
+    }
+
+    /// Copy quantized INT8 K/V + per-token INT8 scales into the quantized KV cache
+    /// and the parallel scale buffers.
+    fn kv_cache_append_q8(
+        &self,
+        _k_cache_buf: &crate::Tensor,
+        _v_cache_buf: &crate::Tensor,
+        _k_scales_buf: &crate::Tensor,
+        _v_scales_buf: &crate::Tensor,
+        _k_new: &crate::Tensor,
+        _v_new: &crate::Tensor,
+        _k_scales_new: &crate::Tensor,
+        _v_scales_new: &crate::Tensor,
+        _row_offset: usize,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor)> {
+        Err(crate::KoreError::StorageError(format!(
+            "kv_cache_append_q8 not implemented for backend '{}'", self.device_name()
+        )))
+    }
+
+    /// Quantize F32 rows to symmetric INT8 + per-row scales on device.
+    /// In: `[rows, cols]` F32 (each row independent).
+    /// Out: `([rows, cols]` packed INT8 bytes, `[rows]` F32 scales).
+    fn quantize_q8_rows(
+        &self,
+        _x: &crate::Tensor,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor)> {
+        Err(crate::KoreError::StorageError(format!(
+            "quantize_q8_rows not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
     /// Rotary Position Embedding (RoPE) on device.
     /// In: [M, num_heads * head_dim]
     /// Output: [M, num_heads * head_dim]

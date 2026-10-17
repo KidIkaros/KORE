@@ -97,6 +97,49 @@ pub fn q2_0_matvec(w: &[u8], m: usize, n: usize, x: &[f32]) -> Result<Tensor, Ko
     Ok(Tensor::from_f32(&out, &[1, n]))
 }
 
+/// Repack a packed Q2_0 tensor into the GPU-friendly layout consumed by
+/// `gemv_q2_0.wgsl`. Same byte count, u32-aligned access:
+///
+/// per row: [codes interleaved: u32 at (j*bpr + b) = block b code word j]
+///          [scales: u16 at byte offset bpr*16 + 2*b]
+///
+/// `m` = in-dim (per-row elems), `n` = rows. `m` must be a multiple of 128
+/// so every row stays u32-aligned.
+pub fn repack_q2_0(src: &[u8], m: usize, n: usize) -> Result<Vec<u8>, KoreError> {
+    if m % 128 != 0 {
+        return Err(KoreError::StorageError(format!(
+            "q2_0 repack in-dim {m} not multiple of 128"
+        )));
+    }
+    let bpr = m / Q2_0_BLOCK;
+    let row_bytes = bpr * Q2_0_BLOCK_BYTES;
+    if src.len() < n * row_bytes {
+        return Err(KoreError::StorageError(format!(
+            "q2_0 repack source too small: need {} got {}",
+            n * row_bytes,
+            src.len()
+        )));
+    }
+    let mut out = vec![0u8; n * row_bytes];
+    let codes_bytes = bpr * 16;
+    for r in 0..n {
+        let src_row = &src[r * row_bytes..(r + 1) * row_bytes];
+        let dst_row = &mut out[r * row_bytes..(r + 1) * row_bytes];
+        for b in 0..bpr {
+            let blk = &src_row[b * 18..];
+            // codes: 4 u32 words -> interleaved position (j*bpr + b)
+            for j in 0..4 {
+                let dst = (j * bpr + b) * 4;
+                dst_row[dst..dst + 4].copy_from_slice(&blk[2 + j * 4..2 + j * 4 + 4]);
+            }
+            // scale u16 -> tail
+            let so = codes_bytes + b * 2;
+            dst_row[so..so + 2].copy_from_slice(&blk[0..2]);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,7 +156,44 @@ mod tests {
         assert_eq!(out[1], 0.0);
         assert_eq!(out[2], 2.0);
         assert_eq!(out[3], 4.0);
-        assert_eq!(out[4], 0.0); // zero byte -> all code 1 -> value 0
+        assert_eq!(out[4], -2.0); // zero byte -> all code 0 -> value -1*scale
+    }
+
+    #[test]
+    fn test_q2_0_repack_roundtrip() {
+        // random-ish row of 2 blocks, m=128, n=1
+        let m = 128;
+        let mut row = vec![0u8; 36];
+        for (i, b) in row.iter_mut().enumerate() {
+            *b = (i * 37 + 11) as u8;
+        }
+        let orig = dequantize_q2_0(&row, m).unwrap();
+        let packed = repack_q2_0(&row, m, 1).unwrap();
+        // simulate shader lane mapping: lane t, iter i covers elems i*512+4t..+3
+        // (here i=0 only, t = e/4)
+        let words: Vec<u32> = packed
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let bpr = m / 64;
+        let row_w = 0usize;
+        let mut out = vec![0.0f32; m];
+        for t in 0..32usize {
+            let b = t / 16;
+            let byte_p = t % 16;
+            let cw_j = byte_p / 4;
+            let cw_sh = (byte_p % 4) * 8;
+            let sw = words[row_w + bpr * 4 + b / 2];
+            let h = ((sw >> ((b & 1) * 16)) & 0xFFFF) as u16;
+            let d = fp16_to_f32(h);
+            let cb = (words[row_w + cw_j * bpr + b] >> cw_sh) & 0xFF;
+            for c in 0..4usize {
+                let e = 4 * t + c;
+                let code = (cb >> (2 * c)) & 3;
+                out[e] = (code as i32 - 1) as f32 * d;
+            }
+        }
+        assert_eq!(out, orig);
     }
 
     #[test]
@@ -125,6 +205,6 @@ mod tests {
         let x: Vec<f32> = (0..64).map(|i| i as f32).collect();
         let mut out = [0.0f32; 1];
         gemv_q2_0(&row, 64, 1, &x, &mut out).unwrap();
-        assert_eq!(out[0], -(0.0f32..64.0).sum::<f32>());
+        assert_eq!(out[0], -x.iter().sum::<f32>());
     }
 }

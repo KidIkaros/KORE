@@ -217,7 +217,6 @@ pub struct AttnState {
 
 pub struct Qwen35Model {
     pub cfg: Qwen35Config,
-    gg: Arc<MiniGguf>,
     emb: Q2W,
     layers: Vec<Layer>,
     out_norm: Vec<f32>,
@@ -355,7 +354,6 @@ impl Qwen35Model {
 
         Ok(Self {
             cfg,
-            gg,
             emb,
             layers,
             out_norm,
@@ -778,7 +776,7 @@ enum GpuLayer {
 /// Mutable per-layer device state.
 pub enum GpuState {
     Delta { hist: Tensor, state: Tensor },
-    Full { kc: Tensor, vc: Tensor, len: usize },
+    Full { kc: Tensor, vc: Tensor, k_scales: Tensor, v_scales: Tensor, len: usize },
 }
 
 /// Qwen3.5 with all weights device-resident; single-token decode via the
@@ -817,7 +815,7 @@ impl Qwen35Gpu {
                 .map_err(|e| err(&format!("upload: {e}")))
         };
         let up_q2 = |w: &Q2W| -> Result<Tensor> {
-            let bytes = w.bytes().to_vec();
+            let bytes = kore_kernels::q2_0::repack_q2_0(w.bytes(), w.m, w.n)?;
             let n = bytes.len();
             let s = Storage::from_bytes(DType::U8, n, bytes)?;
             Tensor::from_storage(s, &[n])
@@ -861,7 +859,7 @@ impl Qwen35Gpu {
         }
 
         let emb = {
-            let bytes = cpu.emb.bytes().to_vec();
+            let bytes = kore_kernels::q2_0::repack_q2_0(cpu.emb.bytes(), cpu.emb.m, cpu.emb.n)?;
             let n = bytes.len();
             let s = Storage::from_bytes(DType::U8, n, bytes)?;
             Tensor::from_storage(s, &[n])
@@ -906,12 +904,18 @@ impl Qwen35Gpu {
                     .map_err(|e| err(&format!("state: {e}")))?,
                 }),
                 GpuLayer::Full(_) => out.push(GpuState::Full {
-                    kc: Tensor::zeros(&[max_ctx, kv_dim], DType::F32)
+                    kc: Tensor::zeros(&[max_ctx, kv_dim], DType::U8)
                         .to(self.device)
                         .map_err(|e| err(&format!("kc: {e}")))?,
-                    vc: Tensor::zeros(&[max_ctx, kv_dim], DType::F32)
+                    vc: Tensor::zeros(&[max_ctx, kv_dim], DType::U8)
                         .to(self.device)
                         .map_err(|e| err(&format!("vc: {e}")))?,
+                    k_scales: Tensor::zeros(&[max_ctx], DType::F32)
+                        .to(self.device)
+                        .map_err(|e| err(&format!("k_scales: {e}")))?,
+                    v_scales: Tensor::zeros(&[max_ctx], DType::F32)
+                        .to(self.device)
+                        .map_err(|e| err(&format!("v_scales: {e}")))?,
                     len: 0,
                 }),
             }
@@ -978,7 +982,7 @@ impl Qwen35Gpu {
                     x = b.add(&x, &proj)?;
                     x = self.ffn_gpu(&x, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
                 }
-                (GpuLayer::Full(l), GpuState::Full { kc, vc, len }) => {
+                (GpuLayer::Full(l), GpuState::Full { kc, vc, k_scales, v_scales, len }) => {
                     let h = b.rms_norm(&x, &l.attn_norm, cfg.eps)?;
                     let ht = self.had_fwd(&h)?;
                     let qg = b.gemv_q2_0(&ht, &l.wq, 2 * cfg.n_heads * cfg.head_dim, hidden)?;
@@ -989,11 +993,27 @@ impl Qwen35Gpu {
                         cfg.n_heads, cfg.n_kv, cfg.head_dim, cfg.rope_dim,
                         pos, cfg.theta, cfg.eps,
                     )?;
-                    let (kv, vv2) = b.kv_cache_append_pair(kc, vc, &k, &vv, *len)?;
-                    *len += 1;
-                    let attn = b.fused_attention_decode_gqa(
-                        &q, &kv, &vv2, cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
+
+                    // ---- Q8 (INT8) KV-cache path ----
+                    // Quantize K/V **on the GPU** (no host round-trip, unlike the
+                    // previous per-token CPU quantization which cost two device
+                    // syncs per full-attention layer) and append to the INT8 cache.
+                    // Decode then reads 4x less VRAM than F32.
+                    let (k_q8_t, k_scale_new) = b.quantize_q8_rows(&k)?;
+                    let (v_q8_t, v_scale_new) = b.quantize_q8_rows(&vv)?;
+
+                    let (kv_q8, vv_q8) = b.kv_cache_append_q8(
+                        kc, vc, k_scales, v_scales,
+                        &k_q8_t, &v_q8_t, &k_scale_new, &v_scale_new, *len,
                     )?;
+                    *len += 1;
+
+                    let attn = b.fused_attention_decode_gqa_q8(
+                        &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
+                        cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
+                    )?;
+                    // ---- end Q8 path ----------------------------------------------
+
                     let attn = b.sigmoid_mul(&attn, &g)?;
                     let ot = self.had_fwd(&attn)?;
                     let proj = b.gemv_q2_0(&ot, &l.wo, hidden, hidden)?;

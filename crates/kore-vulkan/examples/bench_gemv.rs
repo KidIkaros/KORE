@@ -6,6 +6,7 @@ fn bench(b: &VulkanBackend, name: &str, q: &str, n: usize, k: usize, m: usize) {
     let (row_bytes, w, is_f32) = match q {
         "q4k" => (k / 256 * 144, vec![0x55u8; n * (k / 256) * 144], false),
         "q6k" => (k / 256 * 210, vec![0x55u8; n * (k / 256) * 210], false),
+        "q20" => (k / 64 * 18, vec![0x55u8; n * (k / 64) * 18], false),
         "f32" => (k * 4, vec![0x55u8; n * k * 4], true),
         _ => unreachable!(),
     };
@@ -22,6 +23,7 @@ fn bench(b: &VulkanBackend, name: &str, q: &str, n: usize, k: usize, m: usize) {
     let f = |x: &Tensor, w: &Tensor| match q {
         "q4k" => b.gemv_q4_k(x, w, n, k).unwrap(),
         "q6k" => b.gemv_q6_k(x, w, n, k).unwrap(),
+        "q20" => b.gemv_q2_0(x, w, n, k).unwrap(),
         "f32" => b.matmul(x, w).unwrap(),
         _ => unreachable!(),
     };
@@ -66,4 +68,10 @@ fn main() {
     for m in [1usize, 2, 4] {
         bench(&b, "ffn_gate_up", "q4k", 12288, 2048, m);
     }
+    // q2_0 shapes from Bonsai-2B
+    bench(&b, "emb_head_q4k", "q4k", 248320, 2048, 1);
+    bench(&b, "emb_head", "q20", 248320, 2048, 1);
+    bench(&b, "qkv", "q20", 6144, 2048, 1);
+    bench(&b, "ffn_down", "q20", 2048, 6144, 1);
+    bench(&b, "attn_out", "q20", 2048, 2048, 1);
 }
