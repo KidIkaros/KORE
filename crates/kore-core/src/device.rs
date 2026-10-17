@@ -257,6 +257,18 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Copy every element of `src` into `dst`, in place on device.
+    ///
+    /// Needed because some states are updated *in place* (the DeltaNet
+    /// recurrence writes its `state` buffer directly), so a caller that has to
+    /// rewind a batch needs a real copy of the value before it is overwritten.
+    fn copy_buffer(&self, _dst: &crate::Tensor, _src: &crate::Tensor) -> crate::Result<()> {
+        Err(crate::KoreError::StorageError(format!(
+            "copy_buffer not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Append `new_rows` (`[num_new, cols]`) into preallocated `cache_buf` (`[max_rows, cols]`)
     /// at `row_offset`, returning a tensor view of shape `[row_offset + num_new, cols]`.
     fn kv_cache_append(

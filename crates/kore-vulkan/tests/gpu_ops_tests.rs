@@ -1378,3 +1378,40 @@ fn test_vulkan_scatter_row_is_inverse_of_slice_rows() {
         "slice/scatter round trip is not bit-exact"
     );
 }
+
+/// `copy_buffer` is a plain device memcpy, and it has to be a *real* copy: the
+/// DeltaNet recurrence updates its state buffer in place, so the only way to
+/// rewind a rejected verify batch is to have kept the bytes from before it.
+/// That means writing to `dst` must not touch `src`, however the driver has
+/// aliased the two allocations.
+#[test]
+fn test_vulkan_copy_buffer_is_a_real_copy() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+    // Deliberately not a multiple of the 256-element workgroup for the tail.
+    let n = 1000usize;
+    let src_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.11).sin() * 7.0).collect();
+
+    let src = Tensor::from_f32(&src_data, &[n]).to(dev).unwrap();
+    let dst = Tensor::zeros(&[n], kore_core::DType::F32).to(dev).unwrap();
+    backend.copy_buffer(&dst, &src).expect("copy_buffer");
+
+    let got = dst.to(kore_core::Device::Cpu).unwrap();
+    assert_eq!(got.as_f32_slice().unwrap(), src_data.as_slice());
+
+    // Clear `dst` on device and copy again -- if the first copy had aliased the
+    // two storages, `src` would have been clobbered by this point.
+    let zeros = Tensor::zeros(&[n], kore_core::DType::F32).to(dev).unwrap();
+    backend.copy_buffer(&dst, &zeros).expect("copy_buffer zeros");
+    backend.copy_buffer(&dst, &src).expect("copy_buffer again");
+
+    let got2 = dst.to(kore_core::Device::Cpu).unwrap();
+    assert_eq!(got2.as_f32_slice().unwrap(), src_data.as_slice());
+
+    // A mismatched length is a caller bug, not a silent partial copy.
+    let short = Tensor::zeros(&[n - 1], kore_core::DType::F32).to(dev).unwrap();
+    assert!(backend.copy_buffer(&dst, &short).is_err());
+}

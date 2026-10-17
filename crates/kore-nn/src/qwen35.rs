@@ -89,8 +89,12 @@ enum Head {
     Every,
 }
 
+/// The widest batch any pass can feed the ternary GEMV: its accumulator keeps
+/// four columns live per workgroup (`grid.y = ceil(m / 4)`).
+pub const MAX_BATCH_COLS: usize = 4;
+
 /// Prefill chunk width: the ternary GEMV's four-column accumulator.
-const PREFILL_CHUNK: usize = 4;
+const PREFILL_CHUNK: usize = MAX_BATCH_COLS;
 
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
@@ -840,6 +844,65 @@ pub enum GpuState {
     Full { kc: Tensor, vc: Tensor, k_scales: Tensor, v_scales: Tensor, len: usize },
 }
 
+/// The recurrent state a batched pass passed through, one slot per column.
+///
+/// A verify batch advances `m` positions in one go, and it cannot know until
+/// its last projection how many of the tokens it was fed were the ones the
+/// model would have chosen. Cutting that batch short needs two different
+/// things:
+///
+/// * The KV cache rewinds with an integer. It is append-only and every read
+///   stays inside `[0, len)`, so the bytes above the restored `len` are stale
+///   and are simply overwritten by the next append.
+/// * The DeltaNet state cannot be rewound at all: `gdn_step` updates it *in
+///   place*, and a recurrent state that has consumed a token cannot un-consume
+///   it. It has to have been copied.
+///
+/// So this is a copy of `(state, hist)` after each column of the last batched
+/// pass. Slot `r` holds the state after exactly `r + 1` columns, for
+/// `r = 0 .. cols - 2`; the state after all `cols` columns is the live one, so
+/// it is not duplicated. [`Qwen35Gpu::forward_verify`] fills it and
+/// [`Qwen35Gpu::rewind`] consumes it.
+pub struct Rewind {
+    /// `rows[layer][r]`, in layer order; empty for full-attention layers.
+    rows: Vec<Vec<(Tensor, Tensor)>>,
+    /// Position of column 0 of the pass these slots came from.
+    pos0: usize,
+    /// How many columns that pass advanced.
+    cols: usize,
+}
+
+impl Rewind {
+    /// Keep the state as it is after column `row` of a `cols`-column pass.
+    fn capture(
+        &mut self,
+        b: &Arc<dyn DeviceBackend>,
+        layer: usize,
+        row: usize,
+        hist: &Tensor,
+        state: &Tensor,
+        pos0: usize,
+        cols: usize,
+    ) -> Result<()> {
+        self.pos0 = pos0;
+        self.cols = cols;
+        if row + 1 >= cols {
+            // The last column: the live state already *is* the post-state.
+            return Ok(());
+        }
+        let pair = self
+            .rows
+            .get_mut(layer)
+            .and_then(|r| r.get_mut(row))
+            .ok_or_else(|| err("rewind arena is too small for this batch"))?;
+        b.copy_buffer(&pair.0, state)
+            .map_err(|e| err(&format!("rewind state copy: {e}")))?;
+        b.copy_buffer(&pair.1, hist)
+            .map_err(|e| err(&format!("rewind hist copy: {e}")))?;
+        Ok(())
+    }
+}
+
 /// Qwen3.5 with all weights device-resident; single-token decode via the
 /// fused Vulkan kernels. Requires `n_k == n_v` and `d_k == d_v` (true for
 /// Bonsai-2B) plus head_dim == 256.
@@ -1162,7 +1225,7 @@ impl Qwen35Gpu {
         pos0: usize,
         states: &mut [GpuState],
     ) -> Result<Vec<u32>> {
-        self.forward_pass(cpu, tokens, pos0, states, Head::Every)
+        self.forward_pass(cpu, tokens, pos0, states, Head::Every, None)
     }
 
     /// Prefill: consume the whole of `prompt` and return the greedy token that
@@ -1192,9 +1255,92 @@ impl Qwen35Gpu {
         let mut out = Vec::new();
         for (i, chunk) in prompt.chunks(PREFILL_CHUNK).enumerate() {
             let head = if i + 1 == n_chunks { Head::Last } else { Head::Skip };
-            out = self.forward_pass(cpu, chunk, pos0 + i * PREFILL_CHUNK, states, head)?;
+            out = self.forward_pass(cpu, chunk, pos0 + i * PREFILL_CHUNK, states, head, None)?;
         }
         out.pop().ok_or_else(|| err("prefill produced no token"))
+    }
+
+    /// Allocate the arena a verify pass fills: one `(state, hist)` pair per
+    /// DeltaNet layer per column, minus the last one (see [`Rewind`]). At
+    /// Bonsai-2B's shapes that is 18 layers x 3 slots x ~1.05 MB ~= 57 MB.
+    pub fn new_rewind(&self) -> Result<Rewind> {
+        let cfg = &self.cfg;
+        let conv_dim = cfg.ssm_inner + 2 * cfg.ssm_groups * cfg.ssm_state;
+        let mut rows = Vec::with_capacity(self.layers.len());
+        for layer in &self.layers {
+            let mut per_row = Vec::new();
+            if matches!(layer, GpuLayer::Delta(_)) {
+                for _ in 0..MAX_BATCH_COLS - 1 {
+                    let state = Tensor::zeros(
+                        &[cfg.ssm_dt_rank * cfg.ssm_state * cfg.ssm_state],
+                        DType::F32,
+                    )
+                    .to(self.device)
+                    .map_err(|e| err(&format!("rewind state: {e}")))?;
+                    let hist = Tensor::zeros(&[conv_dim * (cfg.ssm_conv - 1)], DType::F32)
+                        .to(self.device)
+                        .map_err(|e| err(&format!("rewind hist: {e}")))?;
+                    per_row.push((state, hist));
+                }
+            }
+            rows.push(per_row);
+        }
+        Ok(Rewind { rows, pos0: 0, cols: 0 })
+    }
+
+    /// A verify pass: exactly [`Self::forward_batch`], but with each column's
+    /// recurrent state copied aside so [`Self::rewind`] can cut the batch short.
+    ///
+    /// The extra copies are the whole cost of the feature -- the arithmetic is
+    /// bit-identical to a plain batch, which is what makes it safe to accept a
+    /// draft: every accepted column ran the same reduction the sequential path
+    /// would have run.
+    pub fn forward_verify(
+        &self,
+        cpu: &Qwen35Model,
+        tokens: &[u32],
+        pos0: usize,
+        states: &mut [GpuState],
+        rewind: &mut Rewind,
+    ) -> Result<Vec<u32>> {
+        if rewind.rows.len() != self.layers.len() {
+            return Err(err("rewind arena was built for a different model"));
+        }
+        self.forward_pass(cpu, tokens, pos0, states, Head::Every, Some(rewind))
+    }
+
+    /// Unwind the last verify pass so only its first `keep` columns stand.
+    ///
+    /// `keep` is a column count: `1` undoes the whole batch and `cols` is a
+    /// no-op. Full-attention layers are truncated by setting `len` back (their
+    /// cache is append-only, so the stale bytes above it are simply overwritten
+    /// by the next append); DeltaNet layers are restored from the copies
+    /// [`Self::forward_verify`] took.
+    pub fn rewind(&self, states: &mut [GpuState], arena: &Rewind, keep: usize) -> Result<()> {
+        if arena.cols == 0 || keep == 0 || keep > arena.cols {
+            return Err(err(&format!("rewind: keep {keep} out of 1..={}", arena.cols)));
+        }
+        if keep == arena.cols {
+            return Ok(());
+        }
+        let b = &self.backend;
+        for (i, st) in states.iter_mut().enumerate() {
+            match st {
+                GpuState::Delta { hist, state } => {
+                    let pair = arena
+                        .rows
+                        .get(i)
+                        .and_then(|r| r.get(keep - 1))
+                        .ok_or_else(|| err("rewind arena is too small for this keep"))?;
+                    b.copy_buffer(state, &pair.0)
+                        .map_err(|e| err(&format!("rewind state copy: {e}")))?;
+                    b.copy_buffer(hist, &pair.1)
+                        .map_err(|e| err(&format!("rewind hist copy: {e}")))?;
+                }
+                GpuState::Full { len, .. } => *len = arena.pos0 + keep,
+            }
+        }
+        Ok(())
     }
 
     /// Shared core of [`Self::forward_batch`] and [`Self::prefill`]. `head` says
@@ -1206,6 +1352,7 @@ impl Qwen35Gpu {
         pos0: usize,
         states: &mut [GpuState],
         head: Head,
+        mut rewind: Option<&mut Rewind>,
     ) -> Result<Vec<u32>> {
         let b = &self.backend;
         let cfg = &self.cfg;
@@ -1213,10 +1360,10 @@ impl Qwen35Gpu {
         if m == 0 {
             return Ok(Vec::new());
         }
-        if m > 4 {
-            return Err(err(
-                "forward_batch supports at most 4 columns (gemv_q2_0 accumulator width)",
-            ));
+        if m > MAX_BATCH_COLS {
+            return Err(err(&format!(
+                "a pass supports at most {MAX_BATCH_COLS} columns (gemv_q2_0 accumulator width)"
+            )));
         }
         let hidden = cfg.hidden;
         let ffn = cfg.ffn;
@@ -1256,7 +1403,7 @@ impl Qwen35Gpu {
 
         let signs_h = self.signs_t(hidden)?;
 
-        for (layer, st) in self.layers.iter().zip(states.iter_mut()) {
+        for (li, (layer, st)) in self.layers.iter().zip(states.iter_mut()).enumerate() {
             match (layer, st) {
                 (GpuLayer::Delta(l), GpuState::Delta { hist, state }) => {
                     let (x_r, h, ht) = b.had_pre(0, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
@@ -1290,6 +1437,11 @@ impl Qwen35Gpu {
                             cfg.eps,
                         )?;
                         b.scatter_row(&o, r, &o_r)?;
+                        // Column `r`'s post-state, kept so a verify batch can be
+                        // cut short after it. Free for an ordinary pass.
+                        if let Some(rw) = rewind.as_mut() {
+                            rw.capture(b, li, r, hist, state, pos0, m)?;
+                        }
                     }
 
                     // Batched tail: the readout Hadamard and the FFN stream the

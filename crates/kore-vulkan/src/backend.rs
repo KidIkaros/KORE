@@ -1716,6 +1716,59 @@ impl VulkanBackend {
         Ok(())
     }
 
+    /// Copy every element of `src` into `dst`, in place, on the GPU.
+    ///
+    /// A full-tensor memcpy -- the same elementwise `copy_offset` dispatch
+    /// [`Self::scatter_row`] uses, with both offsets at zero. It exists because a
+    /// recurrent state (`gdn_step`) is updated **in place**, so a caller that
+    /// needs to keep the value it had before a batch has to take a real copy.
+    pub fn copy_buffer(&self, dst: &Tensor, src: &Tensor) -> Result<()> {
+        let numel = dst.numel();
+        if src.numel() != numel {
+            return Err(VulkanError::ShapeMismatch {
+                op: "copy_buffer".into(),
+                lhs: vec![numel],
+                rhs: vec![src.numel()],
+            });
+        }
+        if numel == 0 {
+            return Ok(());
+        }
+        if numel > u32::MAX as usize {
+            return Err(VulkanError::UnsupportedOperation(
+                "copy_buffer: numel exceeds the u32 index space".into(),
+            ));
+        }
+        let dst_buf =
+            KoreVulkanBuffer::from_storage(dst.storage_ref(), dst.shape().dims(), &self.device, &self.queue)?;
+        let src_buf =
+            KoreVulkanBuffer::from_storage(src.storage_ref(), src.shape().dims(), &self.device, &self.queue)?;
+
+        let uniforms = ElementwiseUniforms {
+            numel: numel as u32,
+            op_type: 8,
+            scalar: 0.0,
+            a_numel: numel as u32,
+            b_numel: numel as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let workgroups = (numel as u32).div_ceil(256);
+        self.record_dispatch(
+            &self.elementwise_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[
+                src_buf.arc_buffer(),
+                src_buf.arc_buffer(),
+                dst_buf.arc_buffer(),
+            ],
+            (workgroups, 1, 1),
+            "copy_buffer_pass",
+        );
+        Ok(())
+    }
+
     /// Append `new_rows` (`[num_new, cols]`) into preallocated `cache_buf` (`[max_rows, cols]`)
     /// at `row_offset` on GPU, returning a zero-copy view of shape `[row_offset + num_new, cols]`.
     pub fn kv_cache_append(
@@ -3453,6 +3506,11 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         src: &Tensor,
     ) -> kore_core::Result<()> {
         self.scatter_row(dst, row, src)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn copy_buffer(&self, dst: &Tensor, src: &Tensor) -> kore_core::Result<()> {
+        self.copy_buffer(dst, src)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
