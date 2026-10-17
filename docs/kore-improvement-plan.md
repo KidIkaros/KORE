@@ -468,23 +468,81 @@ than one kernel), then `m=4`, then the drafter and the acceptance loop, then the
 optimisations — with `bench_spec` as the per-shader instrument because it needs
 no forward to measure a kernel change.
 
-**A bigger, un-batched lead fell out of the same measurement.** At short context
-the step is ~8.8 ms (`bonsai`, marginal cost of 16→64→128 new tokens: 7.75 then
-8.79 ms), of which the isolated GEMV list is 4.62 ms — **52%**. The other 194
-dispatches (79 `had_pre`, 54 GDN, 18 Hadamard, 12 KV-quantise, 6 QK-norm/rope,
-18 KV-append, 6 attention, 1 argmax) therefore account for ~4.2 ms, i.e. ~22 µs
-each. The only one of them ever probed in isolation is `had_pre`, at 6.7 µs
-*independent* in `bench_chain` — a 3× gap that is not explained by arithmetic,
-since these ops do almost none. That is ~48% of a decode step, it needs no
-batching to improve, and it is the last lever that acts on what ships *today*.
+**Where a step actually goes, measured.** `KORE_SKIP_OPS` (`b262115`) abandons
+this adapter's lack of GPU timestamps by ablating a dispatch group and
+re-measuring the step; the chain still runs with the same shapes and the same
+dependencies, on stale data. At ctx ~200, 200 steps, two interleaved rounds
+against a same-round baseline of 8.45/8.82 ms:
 
-Caveat: the census reports 10.98 ms/step at ctx 5 against the 8.8 ms above, which
-is a 2.2 ms disagreement between two harnesses (the census instruments every pass
-and does not sync between steps). Resolving *that* is the first hour of the
-investigation, not a footnote — the 3× per-op gap could be part instrument and
-part dependency. But the direction is unambiguous: at 114 GB/s effective on a
-384 GB/s card, and with half the step spent on dispatches that do no arithmetic,
-this engine is not short of a bandwidth ceiling, it is short of overlap.
+| dropped | step ms | delta | share |
+|---|---|---|---|
+| `all` | 0.26 | −8.2 | — |
+| `gemv_q2_0` | 3.53 | −5.0 | 59% |
+| `had_pre` | 6.84 | −1.6 | 19% |
+| `gdn_step` | 7.64 | −0.85 | 10% |
+| anything else | 8.36…8.78 | ±0.3 | noise |
+
+Three corrections come out of this, two of them to earlier notes in this file.
+
+**The host is a non-issue.** `all` is 0.26 ms/step: 345 dispatches, 529 buffer
+draws, the uniform ring and ~7 submissions cost a quarter of a millisecond
+between them. Nothing about the submission path is worth touching.
+
+**"194 small dispatches at ~22 µs each" was arithmetic on a subtraction, not a
+measurement** — and it is wrong. There is no uniform small-op tax. There are two
+kernels: `had_pre` (79 dispatches, 20 µs each in-chain against 6.7 µs probed in
+isolation) and `gdn_step` (18 dispatches, 47 µs each). Everything else — the
+Hadamards, the KV quantise/append, QK-norm, attention, argmax, all 194 minus
+these 97 — sums to under 0.7 ms. Several groups even show a *negative* delta,
+which is the method's noise floor: removing an op can shorten a neighbour's
+stall, so only deltas well above ±0.3 ms mean anything.
+
+**The census's 10.98 ms/step was a warmup artifact.** The same harness at 200
+and 400 steps reports 8.89 and 8.69 ms with the census off, 8.55 ms with it on
+— instrumentation is free, and 3 steps was too short for the clocks to settle.
+The earlier caveat asking which harness to believe is therefore resolved: ~8.6
+ms, which matches the `bonsai` marginal cost.
+
+**What is left, in order of size.** The GEMV half (59%) is the already-tuned
+kernel, priced per op by `bench_spec`: `token_embd` alone is 1.04 ms (n=248320,
+137 GB/s), the FFN trio 2.15 ms, attention projections 0.75 ms. The narrow ops
+(`attn_k`/`attn_v`, n=512 → 32 workgroups against 36 SMs) run at 33 GB/s against
+the wide ops' 100–137, which is the same "too few workgroups" disease split-KV
+cured at long context — but they are 1% of the step, so it is a curiosity, not a
+lever. The ceiling is uniform wherever there is work to do, which points at the
+load stream rather than at occupancy.
+
+Then `had_pre` (19%) and `gdn_step` (10%). Neither is a fusion problem: the
+fusion of those same 79 dispatches was measured exactly neutral above, because
+removing a dispatch while keeping its work saves nothing. They are not the same
+kind of problem either.
+
+`had_pre` modes 0/1 recompute the whole-row sum of squares in every 512-block
+workgroup — 4× redundant at h=2048, 12× at h=6144. Widening it to carry more
+rows per dispatch makes those barriers serve several rows instead of one, which
+is the multi-column forward again, and it is where this lever and the
+spec-decode lever converge.
+
+`gdn_step` has no row dimension to widen. It launches `n_v = 16` workgroups of
+128 threads, one thread per state column, so the whole kernel is 2048 threads —
+**64 warps on a 36-SM part, about two warps per SM**. It is latency-bound for
+want of threads, and the only place to get more is inside each column's
+`i = 0..127` reduction, which changes the summation order. Same gate.
+
+**A fix that looked obvious and is refuted.** The `i`-walks read
+`state[j*dv + i]`, so at a fixed `i` a warp's 32 threads are 512 bytes apart —
+32 cache lines per load instruction, textbook uncoalesced, and it reads as the
+reason for the 47 µs. Transposing the state to `state[i*dv + j]` makes each
+instruction one line. The state tensor is zeroed at allocation and bound to
+nothing else, so the transposition is pure address arithmetic — same values,
+same summation order, verified bit-identical (`bonsai` token ids unchanged) —
+and it is **4.1% slower**: 9.38 vs 9.01 ms/step, median of 5 alternating rounds
+of two saved binaries. The stride is not the bug. Each 128-byte line serves 32
+consecutive iterations of one thread in the row-major form — maximal per-line
+reuse — and transposing trades that reuse for a fresh line every instruction.
+The pattern that looks wrong on a coalescing diagram is the one that is right,
+which is why it was A/B'd rather than rewritten. Recorded here so it is not
+re-attempted.
 
 ### 3. Small-op fusion/parallelisation (~25% of the token)
 
@@ -674,17 +732,23 @@ conditions — compare within a run, never across.
 cost that the census was built to find (that turned out to be buffer creation,
 and it is now fixed):
 
-1. **The row-wide reduction inside the small ops (~20% of the token).**
-   `had_pre` is 79 dispatches/step and now the largest non-GEMV cost
-   (`bench_chain`: 20.0 µs dependent at h=2048, 31.2 µs at h=6144). Modes 0/1
-   recompute the whole-row sum of squares **in every 512-block workgroup**, so
-   the cost grows with `h` while the Hadamard part does not. Two cheaper fixes
-   were tried and **refuted by measurement** (see the closed-out list). What is
-   left is to stop computing the same row sum 4× (h=2048) or 12× (h=6144) — but
-   any restructuring that changes the summation order forfeits the
-   byte-identical-token gate, so it needs a numeric-equivalence reference first.
-   **Gate:** fewer exposed µs in `bench_chain` *and* an explicit tolerance
-   argument, not a token-id diff.
+1. **The row-wide reduction inside the small ops (~29% of the token, measured
+   two ways).** `had_pre` is 79 dispatches/step and the largest non-GEMV cost:
+   1.6 ms by dispatch ablation (19% of an 8.5 ms step), against `bench_chain`'s
+   20.0 µs dependent at h=2048 and 31.2 µs at h=6144. Modes 0/1 recompute the
+   whole-row sum of squares **in every 512-block workgroup**, so the cost grows
+   with `h` while the Hadamard part does not. Two cheaper fixes were tried and
+   **refuted by measurement** (see the closed-out list). `gdn_step` is another
+   0.85–1.5 ms (10–17%) and the same *kind* of problem for a different reason:
+   16 workgroups × 128 threads is 64 warps in total, ~2 per SM, so it is
+   latency-bound for want of threads. What is left in both cases is to stop
+   doing the reduction the long way round — deduplicating the row sum, or
+   splitting a column's `i = 0..127` walk across threads — and either restructures
+   the summation order, which forfeits the byte-identical-token gate. So it needs
+   a numeric-equivalence reference first. **Gate:** fewer exposed µs in
+   `bench_chain` *and* an explicit tolerance argument, not a token-id diff.
+   (Related negative result, now recorded so it is not re-attempted: transposing
+   the GDN state for coalescing is bit-identical and **4.1% slower**.)
 2. **Chunked/batched prefill (the usability lever).** Prefill is token-at-a-time,
    so a 4096-token prompt costs the same 57.8 tok/s as decode. Needs a chunked
    parallel scan for the 18 DeltaNet/GDN layers plus batched GEMVs for the 6
@@ -729,8 +793,8 @@ Also closed, and worth naming because it looks like a win:
 - **`unpack4xU8` for the 2-bit code extraction** — ~8% faster on `emb_head` but
   produces wrong values on this naga (≈26× off). Rejected as a correctness and
   portability hazard; the explicit mask/shift/subtract form is used instead.
-- **`had_pre` barrier-count reduction** — refuted by A/B on `bench_chain`.
-  Replacing the 8-barrier 256→1 sum-of-squares tree with a single thread running
+- **`had_pre` barrier-count reduction** — refuted by A/B on `bench_chain`. Replacing
+  the 8-barrier 256→1 sum-of-squares tree with a single thread running
   it serially (2 barriers, same pairing and order, hence bit-identical) made
   `had_pre` mode 0 **much worse**: 25.0 → 42.3 µs dependent at h=2048 and
   36.8 → 52.7 at h=6144. 255 dependent shared-memory reads cost far more than
@@ -739,6 +803,16 @@ Also closed, and worth naming because it looks like a win:
   bundled into that same revert, so their effect is unmeasured — they pair only
   a thread's own four elements, so they are bit-exact and remain an untaken
   micro-win.)
+- **`gdn_step` state transpose for coalescing** — the `i`-walks read
+  `state[j*dv + i]`, so at fixed `i` a warp's 32 threads are 512 bytes apart:
+  32 cache lines per load instruction, which reads as the reason for the
+  kernel's 47 µs. Transposing to `state[i*dv + j]` makes it one line per
+  instruction. The state is zeroed at allocation and bound to nothing else, so
+  it is pure address arithmetic — bit-identical, `bonsai` token ids unchanged —
+  and **4.1% slower** (9.38 vs 9.01 ms/step, median of 5 alternating rounds of
+  two saved binaries). The 128-byte line serves 32 consecutive iterations of a
+  single thread in the row-major form, i.e. maximal reuse of every line
+  fetched; transposing trades that for a fresh line every instruction. Reverted.
 - **"Per-dispatch latency is the small-op cost"** — only half right. The *only*
   way to see it is to separate the enqueue (independent) from the dependent
   chain in `bench_chain`; the latency of a 3-output op tracks its **output
