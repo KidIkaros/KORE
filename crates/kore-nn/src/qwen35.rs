@@ -935,17 +935,34 @@ impl Qwen35Gpu {
         self.backend.hadamard_signed(x, self.signs_t(x.numel())?, 512, 0)
     }
 
-    /// Shared FFN: x += down(swiglu(gate, up) after hadamard) style block.
-    fn ffn_gpu(&self, x: &Tensor, post_norm: &Tensor, g: &Tensor, u: &Tensor, d: &Tensor, ffn: usize, hidden: usize) -> Result<Tensor> {
+    /// Shared FFN block with the *incoming* residual folded into its post-norm.
+    ///
+    /// Returns `(x_r, down)` where `x_r = x + res` is the residual stream *before*
+    /// the FFN output. The caller carries `down` forward as the pending residual,
+    /// so the trailing `x += down` add is absorbed into the next layer's norm
+    /// instead of costing its own dispatch.
+    #[allow(clippy::too_many_arguments)]
+    fn ffn_gpu(
+        &self,
+        x: &Tensor,
+        res: &Tensor,
+        post_norm: &Tensor,
+        g: &Tensor,
+        u: &Tensor,
+        d: &Tensor,
+        ffn: usize,
+        hidden: usize,
+    ) -> Result<(Tensor, Tensor)> {
         let b = &self.backend;
-        let h = b.rms_norm(x, post_norm, self.cfg.eps)?;
-        let ht = self.had_fwd(&h)?;
+        // Fused residual-add + RMSNorm + Hadamard: one dispatch instead of two.
+        let (x_r, _h, ht) = b.had_pre(0, x, res, post_norm, self.signs_t(x.numel())?, self.cfg.eps)?;
         let gv = b.gemv_q2_0(&ht, g, ffn, hidden)?;
         let uv = b.gemv_q2_0(&ht, u, ffn, hidden)?;
-        let act = b.swiglu(&gv, &uv)?;
-        let actt = self.had_fwd(&act)?;
+        // Fused SwiGLU + Hadamard (the second half of the FFN's activation pair).
+        let signs_ffn = self.signs_t(ffn)?;
+        let (_gv, _uv, actt) = b.had_pre(2, &gv, &uv, signs_ffn, signs_ffn, self.cfg.eps)?;
         let down = b.gemv_q2_0(&actt, d, hidden, ffn)?;
-        b.add(x, &down)
+        Ok((x_r, down))
     }
 
     /// One decode step; returns the next greedy token.
@@ -963,15 +980,23 @@ impl Qwen35Gpu {
 
         // embed on CPU (row dequant + restore), upload
         let e = cpu.embed(token)?;
-        let mut x = Tensor::from_f32(&e, &[1, hidden])
+        let x0 = Tensor::from_f32(&e, &[1, hidden])
             .to(self.device)
             .map_err(|e2| err(&format!("embed upload: {e2}")))?;
+
+        // The residual stream and the projection still to be added to it. Starting
+        // with a zero pending lets every block use the same fused add+rms_norm
+        // (`x + 0` is exact), avoiding a special case for layer 0.
+        let mut x = x0;
+        let mut pending = Tensor::from_f32(&vec![0.0f32; hidden], &[1, hidden])
+            .to(self.device)
+            .map_err(|e2| err(&format!("zero residual upload: {e2}")))?;
 
         for (layer, st) in self.layers.iter().zip(states.iter_mut()) {
             match (layer, st) {
                 (GpuLayer::Delta(l), GpuState::Delta { hist, state }) => {
-                    let h = b.rms_norm(&x, &l.attn_norm, cfg.eps)?;
-                    let ht = self.had_fwd(&h)?;
+                    // Fold the pending residual in, normalize and rotate in one dispatch.
+                    let (x_r, h, ht) = b.had_pre(0, &x, &pending, &l.attn_norm, self.signs_t(hidden)?, cfg.eps)?;
                     let qkv = b.gemv_q2_0(&ht, &l.qkv, conv_dim, hidden)?;
                     let z = b.gemv_q2_0(&ht, &l.z, hidden, hidden)?;
                     let (beta, gate) = b.gdn_gates(&h, &l.alpha_w, &l.beta_w, &l.dt_bias, &l.a, hidden, n_v)?;
@@ -979,12 +1004,12 @@ impl Qwen35Gpu {
                     let o = b.gdn_step(&conv_out, &z, state, &beta, &gate, &l.ssm_norm, n_v, d_k, d_v, cfg.eps)?;
                     let ot = self.had_fwd(&o)?;
                     let proj = b.gemv_q2_0(&ot, &l.out, hidden, hidden)?;
-                    x = b.add(&x, &proj)?;
-                    x = self.ffn_gpu(&x, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
+                    let (x_next, down) = self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
+                    x = x_next;
+                    pending = down;
                 }
                 (GpuLayer::Full(l), GpuState::Full { kc, vc, k_scales, v_scales, len }) => {
-                    let h = b.rms_norm(&x, &l.attn_norm, cfg.eps)?;
-                    let ht = self.had_fwd(&h)?;
+                    let (x_r, _h, ht) = b.had_pre(0, &x, &pending, &l.attn_norm, self.signs_t(hidden)?, cfg.eps)?;
                     let qg = b.gemv_q2_0(&ht, &l.wq, 2 * cfg.n_heads * cfg.head_dim, hidden)?;
                     let kk = b.gemv_q2_0(&ht, &l.wk, kv_dim, hidden)?;
                     let vv = b.gemv_q2_0(&ht, &l.wv, kv_dim, hidden)?;
@@ -1014,18 +1039,17 @@ impl Qwen35Gpu {
                     )?;
                     // ---- end Q8 path ----------------------------------------------
 
-                    let attn = b.sigmoid_mul(&attn, &g)?;
-                    let ot = self.had_fwd(&attn)?;
+                    let (_a, _bv, ot) = b.had_pre(3, &attn, &g, self.signs_t(hidden)?, self.signs_t(hidden)?, cfg.eps)?;
                     let proj = b.gemv_q2_0(&ot, &l.wo, hidden, hidden)?;
-                    x = b.add(&x, &proj)?;
-                    x = self.ffn_gpu(&x, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
+                    let (x_next, down) = self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
+                    x = x_next;
+                    pending = down;
                 }
                 _ => return Err(err("gpu state/layer mismatch")),
             }
         }
 
-        let h = b.rms_norm(&x, &self.out_norm, cfg.eps)?;
-        let ht = self.had_fwd(&h)?;
+        let (_r, _h, ht) = b.had_pre(0, &x, &pending, &self.out_norm, self.signs_t(hidden)?, cfg.eps)?;
         let logits = b.gemv_q2_0(&ht, &self.emb, cfg.vocab, self.emb_m)?;
         let toks = b.argmax_last_dim(&logits)?;
         Ok(toks[0])

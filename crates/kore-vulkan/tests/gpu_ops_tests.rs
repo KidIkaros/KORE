@@ -1,3 +1,4 @@
+use kore_core::device::DeviceBackend;
 use kore_core::Tensor;
 use kore_vulkan::VulkanBackend;
 
@@ -714,3 +715,90 @@ fn test_vulkan_gemv_q2_0_matches_cpu_reference() {
 }
 
 
+/// `had_pre` must be *bit-identical* to running the standalone kernels in
+/// sequence, so the fused decode path can't perturb token selection.
+#[test]
+fn test_vulkan_had_pre_matches_standalone_kernels() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+    let eps = 1e-5f32;
+
+    let cols = 2048usize;
+    let phase = |i: usize| (i as f32 * 0.017).sin();
+    let a_data: Vec<f32> = (0..cols).map(|i| phase(i) * 1.7).collect();
+    let b_data: Vec<f32> = (0..cols).map(|i| phase(i + 13) * 0.4).collect();
+    let w_data: Vec<f32> = (0..cols).map(|i| 0.5 + phase(i + 5) * 0.5).collect();
+    // Random-ish deterministic ±1 sign table.
+    let signs_data: Vec<f32> = (0..cols)
+        .map(|i| if (i * 2654435761usize) % 3 == 0 { -1.0 } else { 1.0 })
+        .collect();
+
+    let a = Tensor::from_f32(&a_data, &[1, cols]).to(dev).unwrap();
+    let b = Tensor::from_f32(&b_data, &[1, cols]).to(dev).unwrap();
+    let w = Tensor::from_f32(&w_data, &[cols]).to(dev).unwrap();
+    let signs = Tensor::from_f32(&signs_data, &[cols]).to(dev).unwrap();
+
+    let to_cpu = |t: &Tensor| {
+        t.to(kore_core::Device::Cpu)
+            .unwrap()
+            .as_f32_slice()
+            .unwrap()
+            .to_vec()
+    };
+
+    // ---- mode 0: add + rms_norm + hadamard ----
+    let (res, norm, had) = backend.had_pre(0, &a, &b, &w, &signs, eps).expect("had_pre 0");
+    let (ref_res, ref_norm) = backend.add_rms_norm(&a, &b, &w, eps).expect("add_rms_norm");
+    let ref_had = backend
+        .hadamard_signed(&ref_norm, &signs, 512, 0)
+        .expect("hadamard_signed");
+
+    assert_eq!(to_cpu(&res), to_cpu(&ref_res), "mode 0 residual differs");
+    assert_eq!(to_cpu(&norm), to_cpu(&ref_norm), "mode 0 normed differs");
+    assert_eq!(to_cpu(&had), to_cpu(&ref_had), "mode 0 hadamard differs");
+
+    // ---- mode 2: swiglu + hadamard ----
+    let (_r, _n, had2) = backend.had_pre(2, &a, &b, &signs, &signs, eps).expect("had_pre 2");
+    let act = backend.swiglu(&a, &b).expect("swiglu");
+    let ref_had2 = backend.hadamard_signed(&act, &signs, 512, 0).expect("had2");
+    assert_eq!(to_cpu(&had2), to_cpu(&ref_had2), "mode 2 hadamard differs");
+
+    // ---- mode 3: sigmoid_mul + hadamard ----
+    let (_r, _n, had3) = backend.had_pre(3, &a, &b, &signs, &signs, eps).expect("had_pre 3");
+    let gated = backend.sigmoid_mul(&a, &b).expect("sigmoid_mul");
+    let ref_had3 = backend.hadamard_signed(&gated, &signs, 512, 0).expect("had3");
+    assert_eq!(to_cpu(&had3), to_cpu(&ref_had3), "mode 3 hadamard differs");
+
+    // ---- multi-row: the grid is one workgroup per (row, 512-block), and each
+    // workgroup must use *its own* row's residual stream and sign table. The
+    // decode path only ever runs one row, so this covers a latent path. ----
+    let rows = 3usize;
+    let rcols = 1024usize; // 2 blocks per row
+    let n = rows * rcols;
+    let ra: Vec<f32> = (0..n).map(|i| phase(i) * 1.3).collect();
+    let rb: Vec<f32> = (0..n).map(|i| phase(i + 7) * 0.6).collect();
+    let rs: Vec<f32> = (0..n)
+        .map(|i| if (i * 40503usize) % 2 == 0 { -1.0 } else { 1.0 })
+        .collect();
+    let ra = Tensor::from_f32(&ra, &[rows, rcols]).to(dev).unwrap();
+    let rb = Tensor::from_f32(&rb, &[rows, rcols]).to(dev).unwrap();
+    let rs = Tensor::from_f32(&rs, &[rows, rcols]).to(dev).unwrap();
+    let rw: Vec<f32> = (0..rcols).map(|i| 0.5 + phase(i + 5) * 0.5).collect();
+    let rw = Tensor::from_f32(&rw, &[rcols]).to(dev).unwrap();
+
+    let (mres, mnorm, mhad) = backend
+        .had_pre(0, &ra, &rb, &rw, &rs, eps)
+        .expect("had_pre multi-row");
+    let (rres, rnorm) = backend
+        .add_rms_norm(&ra, &rb, &rw, eps)
+        .expect("add_rms_norm multi-row");
+    let rhad = backend
+        .hadamard_signed(&rnorm, &rs, 512, 0)
+        .expect("hadamard multi-row");
+    assert_eq!(to_cpu(&mres), to_cpu(&rres), "multi-row residual differs");
+    assert_eq!(to_cpu(&mnorm), to_cpu(&rnorm), "multi-row normed differs");
+    assert_eq!(to_cpu(&mhad), to_cpu(&rhad), "multi-row hadamard differs");
+}

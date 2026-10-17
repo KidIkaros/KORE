@@ -491,6 +491,25 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Fused "pre-op + 512-point signed Hadamard" decode kernel.
+    /// `mode`: 0 = add+rms_norm+had, 1 = rms_norm+had, 2 = swiglu+had, 3 = sigmoid_mul+had.
+    /// Returns `(out_res, out_norm, out_had)`; unused outputs are uninitialized.
+    /// `weight` is only read for modes 0/1 (pass `signs` for modes 2/3).
+    fn had_pre(
+        &self,
+        _mode: u32,
+        _a: &crate::Tensor,
+        _b: &crate::Tensor,
+        _weight: &crate::Tensor,
+        _signs: &crate::Tensor,
+        _eps: f32,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor, crate::Tensor)> {
+        Err(crate::KoreError::StorageError(format!(
+            "had_pre not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Argmax along the last dimension of a 2D `[rows, cols]` tensor on device, returning `rows` token IDs.
     fn argmax_last_dim(&self, _input: &crate::Tensor) -> crate::Result<Vec<u32>> {
         Err(crate::KoreError::StorageError(format!(

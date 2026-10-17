@@ -244,6 +244,19 @@ struct HadamardSignedUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct HadPreUniforms {
+    rows: u32,
+    cols: u32,
+    blocks: u32,
+    mode: u32,
+    eps: f32,
+    scale: f32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GdnConvUniforms {
     conv_dim: u32,
     conv_k: u32,
@@ -354,6 +367,7 @@ pub struct VulkanBackend {
     add_rms_norm_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q2_0_pipeline: Arc<wgpu::ComputePipeline>,
     hadamard_signed_pipeline: Arc<wgpu::ComputePipeline>,
+    had_pre_pipeline: Arc<wgpu::ComputePipeline>,
     gdn_conv_pipeline: Arc<wgpu::ComputePipeline>,
     gdn_gates_pipeline: Arc<wgpu::ComputePipeline>,
     gdn_step_pipeline: Arc<wgpu::ComputePipeline>,
@@ -791,6 +805,21 @@ impl VulkanBackend {
             },
         ));
 
+        let had_pre_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_had_pre_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/had_pre.wgsl").into()),
+        });
+        let had_pre_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_had_pre_pipeline"),
+                layout: None,
+                module: &had_pre_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
         let gdn_conv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kore_gdn_conv_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gdn_conv.wgsl").into()),
@@ -888,6 +917,7 @@ impl VulkanBackend {
             add_rms_norm_pipeline,
             gemv_q2_0_pipeline,
             hadamard_signed_pipeline,
+            had_pre_pipeline,
             gdn_conv_pipeline,
             gdn_gates_pipeline,
             gdn_step_pipeline,
@@ -2568,6 +2598,119 @@ impl VulkanBackend {
         Ok(self.make_tensor(KoreVulkanBuffer::new(out, DType::F32, vec![numel]), &[numel]))
     }
 
+    /// Fused "pre-op + 512-point signed Hadamard" decode kernel.
+    ///
+    /// Every decode layer does `norm -> hadamard -> mat-vec` back to back, and in
+    /// the strictly serial decode chain each extra dispatch costs a full exposed
+    /// dependency latency. This merges the pair into a single kernel.
+    ///
+    /// `mode`:
+    /// * `0` — `add` + `rms_norm` + `hadamard` (residual add folded into the norm)
+    /// * `1` — `rms_norm` + `hadamard`
+    /// * `2` — `swiglu` + `hadamard`
+    /// * `3` — `sigmoid_mul` + `hadamard`
+    ///
+    /// Returns `(out_res, out_norm, out_had)`:
+    /// * mode 0: all three (`a + b`, `rms_norm(a+b) * weight`, `WHT(signs * norm)`)
+    /// * mode 1: `out_norm`, `out_had` (`out_res` is uninitialized)
+    /// * mode 2/3: `out_had` only
+    ///
+    /// `weight` is only read for modes 0/1 (pass `signs` for modes 2/3).
+    #[allow(clippy::too_many_arguments)]
+    pub fn had_pre(
+        &self,
+        mode: u32,
+        a: &Tensor,
+        b: &Tensor,
+        weight: &Tensor,
+        signs: &Tensor,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        let shape = a.shape().dims();
+        let numel = a.numel();
+        if mode > 3 {
+            return Err(VulkanError::UnsupportedOperation(format!(
+                "had_pre mode {mode} (expected 0..=3)"
+            )));
+        }
+        if b.numel() != numel || numel == 0 {
+            return Err(VulkanError::ShapeMismatch {
+                op: "had_pre".into(),
+                lhs: shape.to_vec(),
+                rhs: b.shape().dims().to_vec(),
+            });
+        }
+        let (rows, cols) = if shape.len() == 2 {
+            (shape[0], shape[1])
+        } else {
+            (1, numel)
+        };
+        if cols % 512 != 0 {
+            return Err(VulkanError::ShapeMismatch {
+                op: "had_pre".into(),
+                lhs: vec![cols],
+                rhs: vec![cols.next_multiple_of(512)],
+            });
+        }
+        if mode <= 1 && weight.numel() != cols {
+            return Err(VulkanError::ShapeMismatch {
+                op: "had_pre".into(),
+                lhs: vec![cols],
+                rhs: vec![weight.numel()],
+            });
+        }
+        if signs.numel() < numel {
+            return Err(VulkanError::ShapeMismatch {
+                op: "had_pre".into(),
+                lhs: vec![numel],
+                rhs: vec![signs.numel()],
+            });
+        }
+
+        let a_buf = KoreVulkanBuffer::from_storage(a.storage_ref(), shape, &self.device, &self.queue)?;
+        let b_buf = KoreVulkanBuffer::from_storage(b.storage_ref(), shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(weight.storage_ref(), weight.shape().dims(), &self.device, &self.queue)?;
+        let s_buf = KoreVulkanBuffer::from_storage(signs.storage_ref(), signs.shape().dims(), &self.device, &self.queue)?;
+
+        let out_bytes = (numel * 4).max(4);
+        let res_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_res");
+        let norm_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_norm");
+        let had_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_had");
+
+        let blocks = cols / 512;
+        let uniforms = HadPreUniforms {
+            rows: rows as u32,
+            cols: cols as u32,
+            blocks: blocks as u32,
+            mode,
+            eps,
+            scale: 512f32.sqrt().recip(),
+            _pad0: 0,
+            _pad1: 0,
+        };
+        self.record_dispatch(
+            &self.had_pre_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[
+                a_buf.arc_buffer(),
+                b_buf.arc_buffer(),
+                w_buf.arc_buffer(),
+                s_buf.arc_buffer(),
+                &res_buf,
+                &norm_buf,
+                &had_buf,
+            ],
+            ((rows * blocks) as u32, 1, 1),
+            "had_pre_pass",
+        );
+
+        Ok((
+            self.make_tensor(KoreVulkanBuffer::new(res_buf, DType::F32, shape.to_vec()), shape),
+            self.make_tensor(KoreVulkanBuffer::new(norm_buf, DType::F32, shape.to_vec()), shape),
+            self.make_tensor(KoreVulkanBuffer::new(had_buf, DType::F32, shape.to_vec()), shape),
+        ))
+    }
+
     /// Gated-DeltaNet depthwise causal conv + SiLU with in-place rolling history.
     /// x [conv_dim], w [conv_dim, conv_k], hist [conv_dim, conv_k-1] mutated.
     pub fn gdn_conv(
@@ -3071,6 +3214,19 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         mode: u32,
     ) -> kore_core::Result<Tensor> {
         self.hadamard_signed(x, signs, block_size, mode)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn had_pre(
+        &self,
+        mode: u32,
+        a: &Tensor,
+        b: &Tensor,
+        weight: &Tensor,
+        signs: &Tensor,
+        eps: f32,
+    ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
+        self.had_pre(mode, a, b, weight, signs, eps)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
