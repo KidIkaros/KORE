@@ -1118,6 +1118,217 @@ impl Qwen35Gpu {
         Ok(toks[0])
     }
 
+    /// Multi-column decode: advance `tokens.len()` positions in one pass and
+    /// return one greedy token per column.
+    ///
+    /// Everything whose cost is the *weight stream* — both Hadamards, every
+    /// projection matvec, the FFN, attention — runs once over all columns, which
+    /// amortises the read that dominates a decode step. The two ops whose state
+    /// carries across columns (the DeltaNet conv history and recurrent state) run
+    /// one column at a time; that is bit-identical to that many single-token
+    /// steps by construction, so a verification pass can accept a draft on
+    /// exactly the logits a sequential decode would have produced.
+    ///
+    /// `pos0` is the position of column 0. Columns form a causal chunk: column
+    /// `r` attends to every KV row up to and including its own.
+    ///
+    /// `m` is capped at 4 by the ternary GEMV kernel, whose accumulator keeps
+    /// four columns live per workgroup; beyond that the weight matrix is re-read
+    /// per group of four instead of being amortised further.
+    pub fn forward_batch(
+        &self,
+        cpu: &Qwen35Model,
+        tokens: &[u32],
+        pos0: usize,
+        states: &mut [GpuState],
+    ) -> Result<Vec<u32>> {
+        let b = &self.backend;
+        let cfg = &self.cfg;
+        let m = tokens.len();
+        if m == 0 {
+            return Ok(Vec::new());
+        }
+        if m > 4 {
+            return Err(err(
+                "forward_batch supports at most 4 columns (gemv_q2_0 accumulator width)",
+            ));
+        }
+        let hidden = cfg.hidden;
+        let ffn = cfg.ffn;
+        let n_v = cfg.ssm_dt_rank;
+        let d_k = cfg.ssm_state;
+        let d_v = cfg.ssm_inner / n_v;
+        let conv_dim = cfg.ssm_inner + 2 * cfg.ssm_groups * cfg.ssm_state;
+        let kv_dim = cfg.n_kv * cfg.head_dim;
+        let scale = 1.0 / (cfg.head_dim as f32).sqrt();
+
+        // Embed every column on the CPU (row dequant + restore), upload as one block.
+        let mut e = Vec::with_capacity(m * hidden);
+        for &t in tokens {
+            e.extend_from_slice(&cpu.embed(t)?);
+        }
+        let x0 = Tensor::from_f32(&e, &[m, hidden])
+            .to(self.device)
+            .map_err(|e2| err(&format!("embed upload: {e2}")))?;
+
+        // `x + pending` with a zero pending keeps every block on the same fused
+        // add+rms_norm path (`x + 0` is exact), exactly as the single-token path.
+        let mut x = x0;
+        let mut pending = Tensor::from_f32(&vec![0.0f32; m * hidden], &[m, hidden])
+            .to(self.device)
+            .map_err(|e2| err(&format!("zero residual upload: {e2}")))?;
+
+        // Staging for the per-column DeltaNet readouts. Every row is rewritten on
+        // every Delta layer, so a single allocation serves the whole pass.
+        let o = Tensor::zeros(&[m, cfg.ssm_inner], DType::F32)
+            .to(self.device)
+            .map_err(|e2| err(&format!("readout staging: {e2}")))?;
+
+        let signs_h = self.signs_t(hidden)?;
+
+        for (layer, st) in self.layers.iter().zip(states.iter_mut()) {
+            match (layer, st) {
+                (GpuLayer::Delta(l), GpuState::Delta { hist, state }) => {
+                    let (x_r, h, ht) = b.had_pre(0, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
+                    let qkv = b.gemv_q2_0(&ht, &l.qkv, conv_dim, hidden)?;
+                    let z = b.gemv_q2_0(&ht, &l.z, hidden, hidden)?;
+
+                    // The recurrent scan: conv history and DeltaNet state carry
+                    // row to row, so the columns are strictly sequential here.
+                    for r in 0..m {
+                        let (beta, gate) = b.gdn_gates(
+                            &h.slice_rows(r, 1)?,
+                            &l.alpha_w,
+                            &l.beta_w,
+                            &l.dt_bias,
+                            &l.a,
+                            hidden,
+                            n_v,
+                        )?;
+                        let conv_out =
+                            b.gdn_conv(&qkv.slice_rows(r, 1)?, &l.conv, hist, conv_dim, cfg.ssm_conv)?;
+                        let o_r = b.gdn_step(
+                            &conv_out,
+                            &z.slice_rows(r, 1)?,
+                            state,
+                            &beta,
+                            &gate,
+                            &l.ssm_norm,
+                            n_v,
+                            d_k,
+                            d_v,
+                            cfg.eps,
+                        )?;
+                        b.scatter_row(&o, r, &o_r)?;
+                    }
+
+                    // Batched tail: the readout Hadamard and the FFN stream the
+                    // weight once for all columns.
+                    let ot = self.had_fwd(&o)?;
+                    let proj = b.gemv_q2_0(&ot, &l.out, hidden, hidden)?;
+                    let (x_next, down) = self.ffn_gpu(
+                        &x_r,
+                        &proj,
+                        &l.post_norm,
+                        &l.ffn_gate,
+                        &l.ffn_up,
+                        &l.ffn_down,
+                        ffn,
+                        hidden,
+                    )?;
+                    x = x_next;
+                    pending = down;
+                }
+                (GpuLayer::Full(l), GpuState::Full { kc, vc, k_scales, v_scales, len }) => {
+                    let (x_r, _h, ht) = b.had_pre(0, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
+                    let qg = b.gemv_q2_0(&ht, &l.wq, 2 * cfg.n_heads * cfg.head_dim, hidden)?;
+                    let kk = b.gemv_q2_0(&ht, &l.wk, kv_dim, hidden)?;
+                    let vv = b.gemv_q2_0(&ht, &l.wv, kv_dim, hidden)?;
+                    let (q, k, g) = b.qknorm_rope(
+                        &qg,
+                        &kk,
+                        &l.q_norm,
+                        &l.k_norm,
+                        cfg.n_heads,
+                        cfg.n_kv,
+                        cfg.head_dim,
+                        cfg.rope_dim,
+                        pos0,
+                        cfg.theta,
+                        cfg.eps,
+                    )?;
+
+                    let (k_q8_t, k_scale_new) = b.quantize_q8_rows(&k)?;
+                    let (v_q8_t, v_scale_new) = b.quantize_q8_rows(&vv)?;
+                    let (kv_q8, vv_q8) = b.kv_cache_append_q8(
+                        kc,
+                        vc,
+                        k_scales,
+                        v_scales,
+                        &k_q8_t,
+                        &v_q8_t,
+                        &k_scale_new,
+                        &v_scale_new,
+                        *len,
+                    )?;
+                    *len += m;
+
+                    // `seq_q > 1` selects the causal-chunk path inside the kernel.
+                    // The split-KV kernel is `seq_q == 1` only, so a batch runs the
+                    // single-group kernel; a sharded multi-column variant is a
+                    // separate optimisation and not needed for correctness.
+                    let attn = if m == 1 && attn_can_shard(cfg, *len) {
+                        let n_splits = attn_shard_count(*len);
+                        b.fused_attention_decode_gqa_q8_split(
+                            &q,
+                            &kv_q8,
+                            &vv_q8,
+                            &k_scales,
+                            &v_scales,
+                            cfg.n_heads,
+                            cfg.n_kv,
+                            cfg.head_dim,
+                            scale,
+                            n_splits,
+                        )?
+                    } else {
+                        b.fused_attention_decode_gqa_q8(
+                            &q,
+                            &kv_q8,
+                            &vv_q8,
+                            &k_scales,
+                            &v_scales,
+                            cfg.n_heads,
+                            cfg.n_kv,
+                            cfg.head_dim,
+                            scale,
+                        )?
+                    };
+
+                    let (_a, _bv, ot) = b.had_pre(3, &attn, &g, signs_h, signs_h, cfg.eps)?;
+                    let proj = b.gemv_q2_0(&ot, &l.wo, hidden, hidden)?;
+                    let (x_next, down) = self.ffn_gpu(
+                        &x_r,
+                        &proj,
+                        &l.post_norm,
+                        &l.ffn_gate,
+                        &l.ffn_up,
+                        &l.ffn_down,
+                        ffn,
+                        hidden,
+                    )?;
+                    x = x_next;
+                    pending = down;
+                }
+                _ => return Err(err("gpu state/layer mismatch")),
+            }
+        }
+
+        let (_r, _h, ht) = b.had_pre(0, &x, &pending, &self.out_norm, signs_h, cfg.eps)?;
+        let logits = b.gemv_q2_0(&ht, &self.emb, cfg.vocab, self.emb_m)?;
+        b.argmax_last_dim(&logits)
+    }
+
     /// Greedy generation on GPU; returns generated tokens.
     pub fn generate_greedy(
         &self,

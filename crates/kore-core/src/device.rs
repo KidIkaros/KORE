@@ -243,6 +243,20 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Write the single row `src` (`[cols]`) into row `row` of the 2-D `dst`
+    /// (`[rows, cols]`), in place: the inverse of [`Self::slice_rows`].
+    fn scatter_row(
+        &self,
+        _dst: &crate::Tensor,
+        _row: usize,
+        _src: &crate::Tensor,
+    ) -> crate::Result<()> {
+        Err(crate::KoreError::StorageError(format!(
+            "scatter_row not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Append `new_rows` (`[num_new, cols]`) into preallocated `cache_buf` (`[max_rows, cols]`)
     /// at `row_offset`, returning a tensor view of shape `[row_offset + num_new, cols]`.
     fn kv_cache_append(

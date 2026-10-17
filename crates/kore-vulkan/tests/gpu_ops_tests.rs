@@ -1325,3 +1325,54 @@ fn test_vulkan_kv_cache_append_q8_multi_row_bit_identical() {
         "appended K window does not hold the source rows"
     );
 }
+
+/// `scatter_row` is the inverse of `slice_rows`, and the multi-column forward's
+/// only new host↔device plumbing: the DeltaNet scan has to run one row at a time
+/// (its state carries across rows) but everything downstream of it is batched, so
+/// the per-row outputs are written back into an `[m, cols]` staging tensor rather
+/// than copied to the host and back. Out-of-order writes must land in the right
+/// rows, and a slice-then-scatter round trip must be bit-exact.
+#[test]
+fn test_vulkan_scatter_row_is_inverse_of_slice_rows() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+    let (rows, cols) = (5usize, 96usize);
+    let phase = |i: usize| (i as f32 * 0.07).sin() * 3.5;
+
+    // Deliberately not in row order.
+    let dst = Tensor::zeros(&[rows, cols], kore_core::DType::F32)
+        .to(dev)
+        .unwrap();
+    let mut want = vec![0.0f32; rows * cols];
+    for r in [3usize, 1, 4, 0, 2] {
+        let row_data: Vec<f32> = (0..cols).map(|c| phase(r * cols + c) + r as f32).collect();
+        let src = Tensor::from_f32(&row_data, &[cols]).to(dev).unwrap();
+        backend.scatter_row(&dst, r, &src).expect("scatter_row");
+        want[r * cols..(r + 1) * cols].copy_from_slice(&row_data);
+    }
+    let got = dst.to(kore_core::Device::Cpu).unwrap();
+    assert_eq!(
+        got.as_f32_slice().unwrap(),
+        want.as_slice(),
+        "scatter_row placed rows in the wrong slots"
+    );
+
+    // Round trip through `slice_rows` into a fresh tensor, which is the shape the
+    // forward actually uses (slice returns `[1, cols]`).
+    let dst2 = Tensor::zeros(&[rows, cols], kore_core::DType::F32)
+        .to(dev)
+        .unwrap();
+    for r in 0..rows {
+        let row = backend.slice_rows(&dst, r, 1).expect("slice_rows");
+        backend.scatter_row(&dst2, r, &row).expect("scatter_row");
+    }
+    let rt = dst2.to(kore_core::Device::Cpu).unwrap();
+    assert_eq!(
+        rt.as_f32_slice().unwrap(),
+        want.as_slice(),
+        "slice/scatter round trip is not bit-exact"
+    );
+}

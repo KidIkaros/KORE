@@ -1660,6 +1660,62 @@ impl VulkanBackend {
         Ok(self.make_tensor(out_kore_buf, &[num_rows, cols]))
     }
 
+    /// Write the single row `src` (`[cols]`) into row `row` of the 2-D `dst`
+    /// (`[rows, cols]`), in place, on the GPU.
+    ///
+    /// The inverse of [`Self::slice_rows`]. A batched op that has to be fed one
+    /// row at a time -- the DeltaNet recurrent scan, whose state carries across
+    /// rows -- uses this to reassemble its per-row outputs into the `[rows, cols]`
+    /// layout the batched ops downstream expect, without a host round-trip.
+    pub fn scatter_row(&self, dst: &Tensor, row: usize, src: &Tensor) -> Result<()> {
+        let shape = dst.shape().dims();
+        if shape.len() != 2 {
+            return Err(VulkanError::UnsupportedOperation(
+                "scatter_row expects a 2D destination".into(),
+            ));
+        }
+        let (rows, cols) = (shape[0], shape[1]);
+        if row >= rows || src.numel() != cols {
+            return Err(VulkanError::ShapeMismatch {
+                op: "scatter_row".into(),
+                lhs: vec![rows, cols],
+                rhs: vec![row, src.numel()],
+            });
+        }
+        let dst_buf =
+            KoreVulkanBuffer::from_storage(dst.storage_ref(), shape, &self.device, &self.queue)?;
+        let src_buf = KoreVulkanBuffer::from_storage(
+            src.storage_ref(),
+            src.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+
+        let uniforms = ElementwiseUniforms {
+            numel: cols as u32,
+            op_type: 8,
+            scalar: 0.0,
+            a_numel: cols as u32,
+            b_numel: cols as u32,
+            _pad0: (row * cols) as u32,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let workgroups = (cols as u32).div_ceil(256).max(1);
+        self.record_dispatch(
+            &self.elementwise_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[
+                src_buf.arc_buffer(),
+                src_buf.arc_buffer(),
+                dst_buf.arc_buffer(),
+            ],
+            (workgroups, 1, 1),
+            "scatter_row_pass",
+        );
+        Ok(())
+    }
+
     /// Append `new_rows` (`[num_new, cols]`) into preallocated `cache_buf` (`[max_rows, cols]`)
     /// at `row_offset` on GPU, returning a zero-copy view of shape `[row_offset + num_new, cols]`.
     pub fn kv_cache_append(
@@ -2907,7 +2963,10 @@ impl VulkanBackend {
             ((numel / block_size) as u32, 1, 1),
             "hadamard_signed_pass",
         );
-        Ok(self.make_tensor(KoreVulkanBuffer::new(out, DType::F32, vec![numel]), &[numel]))
+        // Preserve the input's rank: the transform is per row, so an `[rows, cols]`
+        // input yields `[rows, cols]` and the downstream matvecs see the same `m`
+        // the caller passed. At `rows = 1` this is the old `[numel]`.
+        Ok(self.make_tensor(KoreVulkanBuffer::new(out, DType::F32, shape.to_vec()), shape))
     }
 
     /// Fused "pre-op + 512-point signed Hadamard" decode kernel.
@@ -3363,6 +3422,16 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         num_rows: usize,
     ) -> kore_core::Result<Tensor> {
         self.slice_rows(input, start_row, num_rows)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn scatter_row(
+        &self,
+        dst: &Tensor,
+        row: usize,
+        src: &Tensor,
+    ) -> kore_core::Result<()> {
+        self.scatter_row(dst, row, src)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
