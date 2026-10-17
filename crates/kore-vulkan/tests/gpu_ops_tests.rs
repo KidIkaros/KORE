@@ -940,3 +940,111 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     assert_eq!(to_cpu(&mnorm), to_cpu(&rnorm), "multi-row normed differs");
     assert_eq!(to_cpu(&mhad), to_cpu(&rhad), "multi-row hadamard differs");
 }
+
+/// The wide Q2_0 path walks one code word (16 elements) per lane per row, so a
+/// warp covers an 8-block group per k-iteration: `bpr/8` iterations, plus a
+/// partial group if `bpr` is not a multiple of 8. The host requires
+/// `k % 512 == 0` (so `bpr` is always a multiple of 8 here), which means the
+/// partial group is reachable only through `DeviceBackend` implementations that
+/// skip that guard -- the shader still has to be correct for it. Sweep `k` over
+/// the legal multiples of 512 and `n` across the 16-row workgroup tile, its
+/// remainder, and multiple workgroups.
+#[test]
+fn test_vulkan_gemv_q2_0_wide_path_sweep() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+
+    for &k in &[512usize, 1024, 1536, 2048, 2560, 4096, 6144] {
+        let bpr = k / 64;
+        let row_bytes = bpr * 18;
+        for &n in &[1usize, 7, 16, 17, 33, 64, 65] {
+            let mut w = vec![0u8; n * row_bytes];
+            for r in 0..n {
+                for b in 0..bpr {
+                    let off = r * row_bytes + b * 18;
+                    w[off] = 0x00;
+                    w[off + 1] = 0x34; // fp16 scale 0.25
+                    for i in 0..16 {
+                        w[off + 2 + i] = ((r * 7 + b * 31 + i * 17 + 3) % 256) as u8;
+                    }
+                }
+            }
+            let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.13 - 3.7).sin()).collect();
+
+            let mut want = vec![0.0f32; n];
+            kore_kernels::q2_0::gemv_q2_0(&w, k, n, &x, &mut want).unwrap();
+
+            let packed = kore_kernels::q2_0::repack_q2_0(&w, k, n).unwrap();
+            let nb = packed.len();
+            let ws = kore_core::Storage::from_bytes(kore_core::DType::U8, nb, packed).unwrap();
+            let wt = Tensor::from_storage(ws, &[nb]).to(dev).unwrap();
+            let xt = Tensor::from_f32(&x, &[1, k]).to(dev).unwrap();
+
+            let got = backend.gemv_q2_0(&xt, &wt, n, k).expect("gemv_q2_0");
+            let got_cpu = got.to(kore_core::Device::Cpu).unwrap();
+            let g = got_cpu.as_f32_slice().unwrap();
+            for i in 0..n {
+                assert!(
+                    (g[i] - want[i]).abs() <= 1e-3 * (1.0 + want[i].abs()),
+                    "k={k} n={n} out[{i}]: gpu {} cpu {}",
+                    g[i],
+                    want[i]
+                );
+            }
+        }
+    }
+}
+
+/// A Q2_0 output row must be bit-identical whether it is evaluated at m=1 or
+/// inside a batched call. That is what makes batched spec-decode verification
+/// lossless, so assert equality rather than a tolerance.
+#[test]
+fn test_vulkan_gemv_q2_0_batch_invariance() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+
+    let k = 1024usize;
+    let n = 19usize;
+    let m = 4usize;
+    let bpr = k / 64;
+    let row_bytes = bpr * 18;
+    let mut w = vec![0u8; n * row_bytes];
+    for r in 0..n {
+        for b in 0..bpr {
+            let off = r * row_bytes + b * 18;
+            w[off] = 0x00;
+            w[off + 1] = 0x34;
+            for i in 0..16 {
+                w[off + 2 + i] = ((r * 11 + b * 7 + i * 29 + 5) % 256) as u8;
+            }
+        }
+    }
+    let packed = kore_kernels::q2_0::repack_q2_0(&w, k, n).unwrap();
+    let nb = packed.len();
+    let ws = kore_core::Storage::from_bytes(kore_core::DType::U8, nb, packed).unwrap();
+    let wt = Tensor::from_storage(ws, &[nb]).to(dev).unwrap();
+
+    let x: Vec<f32> = (0..(m * k)).map(|i| (i as f32 * 0.23 - 1.1).cos()).collect();
+    let xm = Tensor::from_f32(&x, &[m, k]).to(dev).unwrap();
+    let wide = backend.gemv_q2_0(&xm, &wt, n, k).expect("m=4");
+    let wide_cpu = wide.to(kore_core::Device::Cpu).unwrap();
+    let wv = wide_cpu.as_f32_slice().unwrap();
+
+    for row in 0..m {
+        let x1 = Tensor::from_f32(&x[row * k..(row + 1) * k], &[1, k]).to(dev).unwrap();
+        let single = backend.gemv_q2_0(&x1, &wt, n, k).expect("m=1");
+        let sc = single.to(kore_core::Device::Cpu).unwrap();
+        let sv = sc.as_f32_slice().unwrap();
+        assert_eq!(
+            &wv[row * n..(row + 1) * n],
+            sv,
+            "row {row}: m={m} differs from m=1"
+        );
+    }
+}
