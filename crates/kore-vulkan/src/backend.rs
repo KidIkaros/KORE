@@ -8,6 +8,52 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 static BACKENDS: OnceLock<Mutex<HashMap<usize, VulkanBackend>>> = OnceLock::new();
 
+/// Opt-in per-op dispatch census, enabled by `KORE_OP_COUNT=1`.
+///
+/// A decode step is a strict dependency chain of ~300 dispatches, so the cost
+/// is `count x exposed-latency` per op. Counting the dispatches by label is what
+/// turns "the small ops are a quarter of the token" into a target list, without
+/// needing GPU timestamp queries (which this adapter does not expose). The
+/// counter is off unless the env var is set; when off the cost is one
+/// `OnceLock` read per dispatch.
+static OP_COUNTS: OnceLock<Mutex<Vec<(&'static str, u64)>>> = OnceLock::new();
+static OP_COUNT_ON: OnceLock<bool> = OnceLock::new();
+
+fn op_counts_mut() -> std::sync::MutexGuard<'static, Vec<(&'static str, u64)>> {
+    OP_COUNTS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn op_count_enabled() -> bool {
+    *OP_COUNT_ON.get_or_init(|| {
+        std::env::var("KORE_OP_COUNT")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Dispatch counts by label, most frequent first. Empty unless `KORE_OP_COUNT=1`.
+pub fn op_counts() -> Vec<(&'static str, u64)> {
+    let mut v = op_counts_mut().clone();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v
+}
+
+/// Clear the dispatch census (e.g. after warmup, before the measured steps).
+pub fn reset_op_counts() {
+    op_counts_mut().clear();
+}
+
+fn bump_op_count(label: &'static str) {
+    let mut v = op_counts_mut();
+    match v.iter_mut().find(|(l, _)| *l == label) {
+        Some(e) => e.1 += 1,
+        None => v.push((label, 1)),
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GemmUniforms {
@@ -1000,10 +1046,13 @@ impl VulkanBackend {
         label: &'static str,
     ) {
         const RING_SIZE: usize = 2048;
+        if op_count_enabled() {
+            bump_op_count(label);
+        }
         let mut batch = self.batch.lock();
         if batch.dispatches.len() >= 48 {
             if let Some(enc) = batch.take_encoder(&self.device) {
-                self.queue.submit(std::iter::once(enc.finish()));
+                crate::buffer::submit_with_reclaim(&self.queue, enc);
             }
         }
 
@@ -1075,7 +1124,7 @@ impl VulkanBackend {
     pub fn flush(&self) {
         let mut batch = self.batch.lock();
         if let Some(enc) = batch.take_encoder(&self.device) {
-            self.queue.submit(std::iter::once(enc.finish()));
+            crate::buffer::submit_with_reclaim(&self.queue, enc);
         }
     }
 
@@ -1083,7 +1132,7 @@ impl VulkanBackend {
     pub fn sync(&self) {
         let mut batch = self.batch.lock();
         if let Some(enc) = batch.take_encoder(&self.device) {
-            self.queue.submit(std::iter::once(enc.finish()));
+            crate::buffer::submit_with_reclaim(&self.queue, enc);
         }
         batch.uniform_cursor = 0;
         drop(batch);

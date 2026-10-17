@@ -34,8 +34,8 @@ pub mod buffer;
 pub mod error;
 pub mod ops;
 
-pub use backend::{register_vulkan_backend, VulkanBackend};
-pub use buffer::{KoreVulkanBuffer, ToVulkanBuffer};
+pub use backend::{op_counts, register_vulkan_backend, reset_op_counts, VulkanBackend};
+pub use buffer::{buffer_alloc_stats, KoreVulkanBuffer, ToVulkanBuffer};
 pub use error::{Result, VulkanError};
 
 #[cfg(test)]

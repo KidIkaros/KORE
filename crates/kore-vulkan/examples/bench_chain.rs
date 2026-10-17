@@ -104,6 +104,21 @@ fn main() {
                 },
                 &x,
             );
+            // The actual decode kernel: add + rms_norm + hadamard in one
+            // dispatch (the two-dispatch row above is the unfused control).
+            p.time(
+                &format!("had_pre m0     h={h}"),
+                h,
+                |c| p.b.had_pre(0, c, &zero, &w, &signs, eps).unwrap().2,
+                &x,
+            );
+            // swiglu + hadamard, the FFN activation (no reduction).
+            p.time(
+                &format!("had_pre m2     h={h}"),
+                h,
+                |c| p.b.had_pre(2, c, c, &w, &signs, eps).unwrap().2,
+                &x,
+            );
         }
     }
 }

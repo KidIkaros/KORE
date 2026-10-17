@@ -3,22 +3,41 @@
 use crate::error::{Result, VulkanError};
 use kore_core::{DType, Device, Storage};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 struct BufferPool {
     /// Buffers ready for immediate reuse, keyed by buffer byte size.
     free: HashMap<u64, Vec<Arc<wgpu::Buffer>>>,
-    /// Buffers dropped during the current GPU batch; moved to `free` after `device.poll(Wait)`.
-    in_flight: Vec<Arc<wgpu::Buffer>>,
+    /// Buffers dropped since the last `Queue::submit`. They may still be read by
+    /// a command buffer that has not finished, so they are parked here and only
+    /// returned to `free` once that submission completes.
+    pending: Vec<Arc<wgpu::Buffer>>,
 }
 
 static STORAGE_BUFFER_POOL: OnceLock<parking_lot::Mutex<BufferPool>> = OnceLock::new();
+
+static ALLOC_HITS: AtomicU64 = AtomicU64::new(0);
+static ALLOC_MISSES: AtomicU64 = AtomicU64::new(0);
+
+/// `(reused, freshly created)` storage buffers since process start.
+///
+/// A decode step is a long chain of small ops, each of which allocates its
+/// output; if this shows misses growing ~1:1 with dispatches, the pool is not
+/// being refilled fast enough and the token is paying GPU buffer creation on
+/// every op.
+pub fn buffer_alloc_stats() -> (u64, u64) {
+    (
+        ALLOC_HITS.load(Ordering::Relaxed),
+        ALLOC_MISSES.load(Ordering::Relaxed),
+    )
+}
 
 fn get_buffer_pool() -> &'static parking_lot::Mutex<BufferPool> {
     STORAGE_BUFFER_POOL.get_or_init(|| {
         parking_lot::Mutex::new(BufferPool {
             free: HashMap::new(),
-            in_flight: Vec::with_capacity(64),
+            pending: Vec::with_capacity(64),
         })
     })
 }
@@ -34,10 +53,12 @@ pub fn alloc_storage_buffer(
         let mut pool = get_buffer_pool().lock();
         if let Some(list) = pool.free.get_mut(&aligned_size) {
             if let Some(buf) = list.pop() {
+                ALLOC_HITS.fetch_add(1, Ordering::Relaxed);
                 return buf;
             }
         }
     }
+    ALLOC_MISSES.fetch_add(1, Ordering::Relaxed);
 
     Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
@@ -49,17 +70,42 @@ pub fn alloc_storage_buffer(
     }))
 }
 
-/// Move all in-flight dropped buffers into the free pool after GPU synchronization.
-pub fn reclaim_in_flight_buffers() {
+fn recycle(buffers: Vec<Arc<wgpu::Buffer>>) {
+    if buffers.is_empty() {
+        return;
+    }
     let mut pool = get_buffer_pool().lock();
-    let in_flight = std::mem::take(&mut pool.in_flight);
-    for buf in in_flight {
+    for buf in buffers {
         let size = buf.size();
         let list = pool.free.entry(size).or_default();
-        if list.len() < 64 {
+        if list.len() < 4096 {
             list.push(buf);
         }
     }
+}
+
+/// Submit `encoder`, then return every buffer dropped so far to the pool once
+/// that submission has completed.
+///
+/// This is the difference between a decode step that recycles its intermediates
+/// and one that calls `create_buffer` for each of the ~500 tensors it makes.
+/// `Drop` cannot hand a buffer straight back: the encoder being built still
+/// references it. Snapshotting the dropped list at submit time ties the
+/// recycling to the completion of the submission that last used them, which is
+/// exactly when they become safe to overwrite.
+pub fn submit_with_reclaim(queue: &wgpu::Queue, encoder: wgpu::CommandEncoder) {
+    let pending = std::mem::take(&mut get_buffer_pool().lock().pending);
+    queue.submit(std::iter::once(encoder.finish()));
+    if !pending.is_empty() {
+        // Fires on a later submit/poll, i.e. roughly one command buffer later.
+        queue.on_submitted_work_done(move || recycle(pending));
+    }
+}
+
+/// Move all dropped buffers into the free pool after GPU synchronization.
+pub fn reclaim_in_flight_buffers() {
+    let pending = std::mem::take(&mut get_buffer_pool().lock().pending);
+    recycle(pending);
 }
 
 /// Wraps a GPU buffer with a KORE-compatible interface.
@@ -74,8 +120,8 @@ impl Drop for KoreVulkanBuffer {
     fn drop(&mut self) {
         if Arc::strong_count(&self.buffer) == 1 {
             let mut pool = get_buffer_pool().lock();
-            if pool.in_flight.len() < 256 {
-                pool.in_flight.push(Arc::clone(&self.buffer));
+            if pool.pending.len() < 8192 {
+                pool.pending.push(Arc::clone(&self.buffer));
             }
         }
     }
