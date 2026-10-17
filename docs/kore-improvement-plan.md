@@ -516,19 +516,30 @@ values). So the table measures the **residency engine**, not a model — a real
 checkpoint will have its own hit rates and its own per-token activation cost.
 And **no real MoE model has run through this end-to-end**: there is no MoE
 checkpoint on this machine, and `gguf_min.rs` has no writer, so a synthetic-MoE
-GGUF cannot even be built here. The kernel path is exercised for real; the
-model path is not.
+GGUF cannot even be built here. The loader now exists and is tested where it can
+be — the metadata rules against synthetic keys, the expert-bank cut against
+synthetic banks, and the "this layer is dense" path against the real Bonsai
+checkpoint — but the seam that decides *per layer* whether to call it is
+deliberately unwired. The kernel path is exercised for real; the model path is
+not.
 
 **Next for this lever (in dependency order).**
 
-1. **GGUF MoE reading** — `expert_count`, `expert_used_count`,
-   `expert_weights_norm` metadata and the stacked
-   `ffn_gate_exps.weight` / `ffn_up_exps.weight` / `ffn_down_exps.weight`
-   tensors (`ne = [n_embd, n_ff, n_expert]`, contiguous per expert). This is
-   what turns the engine into a capability for "any model within reason from
-   HuggingFace".
+1. **GGUF MoE reading — DONE; the model half is one wiring step away.** The
+   loader reads the routing keys (`expert_count`, `expert_used_count`,
+   `expert_feed_forward_length`, `expert_weights_norm`), the three stacked
+   `ffn_*_exps.weight` tensors and the `ffn_gate_inp.weight` router, and cuts the
+   banks into per-expert weights. It is exact by construction rather than by
+   tolerance: the GGUF layout is `ne = [n_embd, n_ff, n_expert]` with `ne[0]`
+   the fastest-varying index, so the expert index is *outermost* and an expert is
+   a contiguous slab, not a gather. What remains is the caller — a layer loop
+   that asks `MoeLayer::from_gguf` instead of building a dense FFN — which is
+   deliberately deferred rather than written blind: there is no MoE checkpoint on
+   this machine to test the seam against. Absent expert keys return `None` rather
+   than an error, which is how a mixed dense/MoE model is walked.
 2. **Shared experts** (DeepSeek-V3/Qwen style) — `MoeExpert::resident`, never
-   evicted; the planner already models this.
+   evicted; the planner already models this, and a `ffn_{gate,down}_shexp.weight`
+   read is the missing piece. Also a router bias, which some checkpoints carry.
 3. **Device-side router** — the current router runs on the host from the
    unrotated post-norm activation, one small readback + sync per MoE layer. Fine
    for `n_expert × hidden` (cheap), but it sits on the critical path between
