@@ -61,10 +61,14 @@ fn byte_deltas(ww: u32, j: u32) -> vec4<f32> {
     );
 }
 
-// Dot of one code word (16 elements) against their 16 x values.
-fn dot_wide(ww: u32, xa: vec4<f32>, xb: vec4<f32>, xc: vec4<f32>, xd: vec4<f32>) -> f32 {
-    let p = byte_deltas(ww, 0u) * xa + byte_deltas(ww, 1u) * xb
-        + byte_deltas(ww, 2u) * xc + byte_deltas(ww, 3u) * xd;
+// Dot of one code word (16 elements) against their 16 x values, given the
+// word's four code deltas. The deltas depend on the weight alone, so taking
+// them as arguments lets a wider batch dequantise each word once instead of
+// once per column. The arithmetic is the same sequence it always was, so an
+// output row is bit-identical whatever `m` is.
+fn dot_wide(d0: vec4<f32>, d1: vec4<f32>, d2: vec4<f32>, d3: vec4<f32>,
+            xa: vec4<f32>, xb: vec4<f32>, xc: vec4<f32>, xd: vec4<f32>) -> f32 {
+    let p = d0 * xa + d1 * xb + d2 * xc + d3 * xd;
     return p.x + p.y + p.z + p.w;
 }
 
@@ -154,45 +158,65 @@ fn main(
             dd3 = unpack2x16float(w[rw + swo] >> sw_sh).x;
         }
 
+        // Code deltas for the lane's four rows, taken once per block iteration
+        // rather than once per column. Rows outside `n_len` left `ww` at 0 and
+        // their accumulations are guarded, so those deltas are never used.
+        let d00 = byte_deltas(ww0, 0u);
+        let d01 = byte_deltas(ww0, 1u);
+        let d02 = byte_deltas(ww0, 2u);
+        let d03 = byte_deltas(ww0, 3u);
+        let d10 = byte_deltas(ww1, 0u);
+        let d11 = byte_deltas(ww1, 1u);
+        let d12 = byte_deltas(ww1, 2u);
+        let d13 = byte_deltas(ww1, 3u);
+        let d20 = byte_deltas(ww2, 0u);
+        let d21 = byte_deltas(ww2, 1u);
+        let d22 = byte_deltas(ww2, 2u);
+        let d23 = byte_deltas(ww2, 3u);
+        let d30 = byte_deltas(ww3, 0u);
+        let d31 = byte_deltas(ww3, 1u);
+        let d32 = byte_deltas(ww3, 2u);
+        let d33 = byte_deltas(ww3, 3u);
+
         // Column 0.
         let xa0 = x[xi];
         let xb0 = x[xi + 1u];
         let xc0 = x[xi + 2u];
         let xd0 = x[xi + 3u];
-        if (row0 < n_len) { acc0.x += dd0 * dot_wide(ww0, xa0, xb0, xc0, xd0); }
-        if (row1 < n_len) { acc1.x += dd1 * dot_wide(ww1, xa0, xb0, xc0, xd0); }
-        if (row2 < n_len) { acc2.x += dd2 * dot_wide(ww2, xa0, xb0, xc0, xd0); }
-        if (row3 < n_len) { acc3.x += dd3 * dot_wide(ww3, xa0, xb0, xc0, xd0); }
+        if (row0 < n_len) { acc0.x += dd0 * dot_wide(d00, d01, d02, d03, xa0, xb0, xc0, xd0); }
+        if (row1 < n_len) { acc1.x += dd1 * dot_wide(d10, d11, d12, d13, xa0, xb0, xc0, xd0); }
+        if (row2 < n_len) { acc2.x += dd2 * dot_wide(d20, d21, d22, d23, xa0, xb0, xc0, xd0); }
+        if (row3 < n_len) { acc3.x += dd3 * dot_wide(d30, d31, d32, d33, xa0, xb0, xc0, xd0); }
 
         if (m_rem > 1u) {
             let xa1 = x[xi + kv];
             let xb1 = x[xi + kv + 1u];
             let xc1 = x[xi + kv + 2u];
             let xd1 = x[xi + kv + 3u];
-            if (row0 < n_len) { acc0.y += dd0 * dot_wide(ww0, xa1, xb1, xc1, xd1); }
-            if (row1 < n_len) { acc1.y += dd1 * dot_wide(ww1, xa1, xb1, xc1, xd1); }
-            if (row2 < n_len) { acc2.y += dd2 * dot_wide(ww2, xa1, xb1, xc1, xd1); }
-            if (row3 < n_len) { acc3.y += dd3 * dot_wide(ww3, xa1, xb1, xc1, xd1); }
+            if (row0 < n_len) { acc0.y += dd0 * dot_wide(d00, d01, d02, d03, xa1, xb1, xc1, xd1); }
+            if (row1 < n_len) { acc1.y += dd1 * dot_wide(d10, d11, d12, d13, xa1, xb1, xc1, xd1); }
+            if (row2 < n_len) { acc2.y += dd2 * dot_wide(d20, d21, d22, d23, xa1, xb1, xc1, xd1); }
+            if (row3 < n_len) { acc3.y += dd3 * dot_wide(d30, d31, d32, d33, xa1, xb1, xc1, xd1); }
         }
         if (m_rem > 2u) {
             let xa2 = x[xi + 2u * kv];
             let xb2 = x[xi + 2u * kv + 1u];
             let xc2 = x[xi + 2u * kv + 2u];
             let xd2 = x[xi + 2u * kv + 3u];
-            if (row0 < n_len) { acc0.z += dd0 * dot_wide(ww0, xa2, xb2, xc2, xd2); }
-            if (row1 < n_len) { acc1.z += dd1 * dot_wide(ww1, xa2, xb2, xc2, xd2); }
-            if (row2 < n_len) { acc2.z += dd2 * dot_wide(ww2, xa2, xb2, xc2, xd2); }
-            if (row3 < n_len) { acc3.z += dd3 * dot_wide(ww3, xa2, xb2, xc2, xd2); }
+            if (row0 < n_len) { acc0.z += dd0 * dot_wide(d00, d01, d02, d03, xa2, xb2, xc2, xd2); }
+            if (row1 < n_len) { acc1.z += dd1 * dot_wide(d10, d11, d12, d13, xa2, xb2, xc2, xd2); }
+            if (row2 < n_len) { acc2.z += dd2 * dot_wide(d20, d21, d22, d23, xa2, xb2, xc2, xd2); }
+            if (row3 < n_len) { acc3.z += dd3 * dot_wide(d30, d31, d32, d33, xa2, xb2, xc2, xd2); }
         }
         if (m_rem > 3u) {
             let xa3 = x[xi + 3u * kv];
             let xb3 = x[xi + 3u * kv + 1u];
             let xc3 = x[xi + 3u * kv + 2u];
             let xd3 = x[xi + 3u * kv + 3u];
-            if (row0 < n_len) { acc0.w += dd0 * dot_wide(ww0, xa3, xb3, xc3, xd3); }
-            if (row1 < n_len) { acc1.w += dd1 * dot_wide(ww1, xa3, xb3, xc3, xd3); }
-            if (row2 < n_len) { acc2.w += dd2 * dot_wide(ww2, xa3, xb3, xc3, xd3); }
-            if (row3 < n_len) { acc3.w += dd3 * dot_wide(ww3, xa3, xb3, xc3, xd3); }
+            if (row0 < n_len) { acc0.w += dd0 * dot_wide(d00, d01, d02, d03, xa3, xb3, xc3, xd3); }
+            if (row1 < n_len) { acc1.w += dd1 * dot_wide(d10, d11, d12, d13, xa3, xb3, xc3, xd3); }
+            if (row2 < n_len) { acc2.w += dd2 * dot_wide(d20, d21, d22, d23, xa3, xb3, xc3, xd3); }
+            if (row3 < n_len) { acc3.w += dd3 * dot_wide(d30, d31, d32, d33, xa3, xb3, xc3, xd3); }
         }
     }
 
