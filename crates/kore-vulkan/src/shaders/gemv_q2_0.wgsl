@@ -25,21 +25,6 @@ var<workgroup> lut: array<vec4<f32>, 256>;
 // i.e. block (2i + t/16) and code byte (t%16). x is read as a vec4 at index
 // i*32 + t (fully coalesced).
 
-fn fp16_to_f32(h: u32) -> f32 {
-    let sign = (h >> 15u) & 1u;
-    let exp = (h >> 10u) & 0x1Fu;
-    let mant = h & 0x3FFu;
-    var f: f32;
-    if (exp == 0u) {
-        f = f32(mant) * 0x1p-24;
-    } else if (exp == 31u) {
-        f = select(1e30, 0.0, mant != 0u);
-    } else {
-        f = (1024.0 + f32(mant)) * exp2(f32(i32(exp) - 25));
-    }
-    return select(f, -f, sign == 1u);
-}
-
 @compute @workgroup_size(128)
 fn main(
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
@@ -91,8 +76,7 @@ fn main(
                 break;
             }
             let sw = w[row_w + bpr * 4u + (b >> 1u)];
-            let h = (sw >> ((b & 1u) * 16u)) & 0xFFFFu;
-            let d = fp16_to_f32(h);
+            let d = unpack2x16float(sw >> ((b & 1u) * 16u)).x;
             let cb = (w[row_w + b * 4u + cw_j] >> cw_sh) & 0xFFu;
             let lv = lut[cb];
             let xi = i * 32u + tid;
