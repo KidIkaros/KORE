@@ -391,10 +391,11 @@ struct QkNormRopeUniforms {
     n_kv: u32,
     head_dim: u32,
     rope_dim: u32,
+    /// Position of row 0; row `r` uses `pos + r`.
     pos: u32,
     theta: f32,
     eps: f32,
-    _pad: u32,
+    rows: u32,
 }
 
 struct QueuedDispatch {
@@ -3157,9 +3158,18 @@ impl VulkanBackend {
         let kk_buf = KoreVulkanBuffer::from_storage(kk.storage_ref(), kk.shape().dims(), &self.device, &self.queue)?;
         let qn_buf = KoreVulkanBuffer::from_storage(q_norm.storage_ref(), q_norm.shape().dims(), &self.device, &self.queue)?;
         let kn_buf = KoreVulkanBuffer::from_storage(k_norm.storage_ref(), k_norm.shape().dims(), &self.device, &self.queue)?;
-        let q_out = crate::buffer::alloc_storage_buffer(&self.device, (n_heads * head_dim * 4).max(4), "kore_qknr_q");
-        let k_out = crate::buffer::alloc_storage_buffer(&self.device, (n_kv * head_dim * 4).max(4), "kore_qknr_k");
-        let g_out = crate::buffer::alloc_storage_buffer(&self.device, (n_heads * head_dim * 4).max(4), "kore_qknr_g");
+        // `rows` comes from the input shape, so a [1, ...] caller is unchanged
+        // and a [m, ...] caller gets per-row positions `pos + row` for free.
+        let rows = qg
+            .shape()
+            .dims()
+            .first()
+            .copied()
+            .filter(|&r| r > 0)
+            .unwrap_or(1);
+        let q_out = crate::buffer::alloc_storage_buffer(&self.device, (rows * n_heads * head_dim * 4).max(4), "kore_qknr_q");
+        let k_out = crate::buffer::alloc_storage_buffer(&self.device, (rows * n_kv * head_dim * 4).max(4), "kore_qknr_k");
+        let g_out = crate::buffer::alloc_storage_buffer(&self.device, (rows * n_heads * head_dim * 4).max(4), "kore_qknr_g");
 
         let uniforms = QkNormRopeUniforms {
             n_heads: n_heads as u32,
@@ -3169,7 +3179,7 @@ impl VulkanBackend {
             pos: pos as u32,
             theta,
             eps,
-            _pad: 0,
+            rows: rows as u32,
         };
         self.record_dispatch(
             &self.qknorm_rope_pipeline,
@@ -3183,13 +3193,13 @@ impl VulkanBackend {
                 &k_out,
                 &g_out,
             ],
-            ((n_heads + n_kv) as u32, 1, 1),
+            ((n_heads + n_kv) as u32, rows as u32, 1),
             "qknorm_rope_pass",
         );
         Ok((
-            self.make_tensor(KoreVulkanBuffer::new(q_out, DType::F32, vec![1, n_heads * head_dim]), &[1, n_heads * head_dim]),
-            self.make_tensor(KoreVulkanBuffer::new(k_out, DType::F32, vec![1, n_kv * head_dim]), &[1, n_kv * head_dim]),
-            self.make_tensor(KoreVulkanBuffer::new(g_out, DType::F32, vec![1, n_heads * head_dim]), &[1, n_heads * head_dim]),
+            self.make_tensor(KoreVulkanBuffer::new(q_out, DType::F32, vec![rows, n_heads * head_dim]), &[rows, n_heads * head_dim]),
+            self.make_tensor(KoreVulkanBuffer::new(k_out, DType::F32, vec![rows, n_kv * head_dim]), &[rows, n_kv * head_dim]),
+            self.make_tensor(KoreVulkanBuffer::new(g_out, DType::F32, vec![rows, n_heads * head_dim]), &[rows, n_heads * head_dim]),
         ))
     }
 

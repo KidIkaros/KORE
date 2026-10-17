@@ -1048,3 +1048,96 @@ fn test_vulkan_gemv_q2_0_batch_invariance() {
         );
     }
 }
+
+/// The multi-column forward's first kernel gate.
+///
+/// `qknorm_rope` with `rows = m` must be *bit-identical* to `m` separate
+/// single-row calls, each at its own position. RoPE is position-dependent, so
+/// this is the one op in a decode batch where "batched" and "m single steps"
+/// have to agree exactly rather than approximately: a verify pass that wants to
+/// accept a draft on identical logits cannot tolerate a reassociated rotation.
+#[test]
+fn test_vulkan_qknorm_rope_per_row_positions_bit_identical() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+    let (n_heads, n_kv, head_dim, rope_dim) = (8usize, 2usize, 256usize, 64usize);
+    let (theta, eps) = (1e7f32, 1e-5f32);
+    let rows = 3usize;
+    let pos0 = 1234usize;
+    let phase = |i: usize| (i as f32 * 0.037).sin();
+
+    let qg_dim = 2 * n_heads * head_dim;
+    let kk_dim = n_kv * head_dim;
+    let qg_data: Vec<f32> = (0..rows * qg_dim).map(|i| phase(i) * 1.3).collect();
+    let kk_data: Vec<f32> = (0..rows * kk_dim).map(|i| phase(i + 91) * 0.7).collect();
+    let qn_data: Vec<f32> = (0..head_dim).map(|i| 0.5 + phase(i + 3) * 0.5).collect();
+    let kn_data: Vec<f32> = (0..head_dim).map(|i| 0.5 + phase(i + 7) * 0.5).collect();
+
+    let qn = Tensor::from_f32(&qn_data, &[head_dim]).to(dev).unwrap();
+    let kn = Tensor::from_f32(&kn_data, &[head_dim]).to(dev).unwrap();
+
+    let to_cpu = |t: &Tensor| {
+        t.to(kore_core::Device::Cpu)
+            .unwrap()
+            .as_f32_slice()
+            .unwrap()
+            .to_vec()
+    };
+
+    // Batched: one dispatch, `rows` columns, positions pos0 .. pos0 + rows - 1.
+    let qg = Tensor::from_f32(&qg_data, &[rows, qg_dim]).to(dev).unwrap();
+    let kk = Tensor::from_f32(&kk_data, &[rows, kk_dim]).to(dev).unwrap();
+    let (q_b, k_b, g_b) = backend
+        .qknorm_rope(&qg, &kk, &qn, &kn, n_heads, n_kv, head_dim, rope_dim, pos0, theta, eps)
+        .expect("rows = 3");
+    let (q_b, k_b, g_b) = (to_cpu(&q_b), to_cpu(&k_b), to_cpu(&g_b));
+
+    // Reference: the same rows one at a time, each with its own position. A
+    // strided slice of the batch output must equal the standalone row exactly.
+    let q_stride = n_heads * head_dim;
+    let k_stride = n_kv * head_dim;
+    for r in 0..rows {
+        let qg1 = Tensor::from_f32(&qg_data[r * qg_dim..(r + 1) * qg_dim], &[1, qg_dim])
+            .to(dev)
+            .unwrap();
+        let kk1 = Tensor::from_f32(&kk_data[r * kk_dim..(r + 1) * kk_dim], &[1, kk_dim])
+            .to(dev)
+            .unwrap();
+        let (q1, k1, g1) = backend
+            .qknorm_rope(
+                &qg1,
+                &kk1,
+                &qn,
+                &kn,
+                n_heads,
+                n_kv,
+                head_dim,
+                rope_dim,
+                pos0 + r,
+                theta,
+                eps,
+            )
+            .expect("rows = 1");
+        assert_eq!(
+            &q_b[r * q_stride..(r + 1) * q_stride],
+            to_cpu(&q1).as_slice(),
+            "q row {r} differs from the standalone call at pos {}",
+            pos0 + r
+        );
+        assert_eq!(
+            &k_b[r * k_stride..(r + 1) * k_stride],
+            to_cpu(&k1).as_slice(),
+            "k row {r} differs from the standalone call at pos {}",
+            pos0 + r
+        );
+        assert_eq!(
+            &g_b[r * q_stride..(r + 1) * q_stride],
+            to_cpu(&g1).as_slice(),
+            "gate row {r} differs from the standalone call at pos {}",
+            pos0 + r
+        );
+    }
+}
