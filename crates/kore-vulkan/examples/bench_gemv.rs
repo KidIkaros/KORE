@@ -74,4 +74,7 @@ fn main() {
     bench(&b, "qkv", "q20", 6144, 2048, 1);
     bench(&b, "ffn_down", "q20", 2048, 6144, 1);
     bench(&b, "attn_out", "q20", 2048, 2048, 1);
+    // Is Q2_0's low bandwidth shape-dependent? Same big-k shape as the q4k case.
+    bench(&b, "big_k_q20", "q20", 16384, 8192, 1);
+    bench(&b, "mid_q20", "q20", 65536, 2048, 1);
 }
