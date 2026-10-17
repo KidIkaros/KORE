@@ -34,7 +34,7 @@
 use std::collections::VecDeque;
 
 use kore_core::device::DeviceBackend;
-use kore_core::{DType, Device, KoreError, Result, Storage, Tensor};
+use kore_core::{Device, KoreError, Result, Tensor};
 use kore_kernels::q2_0::gemv_q2_0;
 
 /// Routing configuration for one MoE layer.
@@ -226,6 +226,17 @@ impl ExpertCache {
 /// so `out[n] = sum_m w[m, n] * x[m]`. In production the bytes are a slice of
 /// the mmap'd checkpoint; here they are owned so a synthetic model can be built
 /// without a file.
+///
+/// The GPU kernels consume the *repacked* layout, not the GGUF one, and
+/// repacking is a byte-level permutation on the host CPU. Doing it inside
+/// `to_device` on every promotion put a per-byte CPU cost on the hottest path
+/// in an offloading engine -- the miss -- where the GPU should be the only
+/// thing that matters. So the repacked form is computed once and retained;
+/// repeated promotions of the same expert then cost a plain copy. The RAM this
+/// spends is bounded by the experts that have ever been promoted, which is the
+/// same order as the bank itself, and the production answer is to prepack on
+/// disk at convert time so the bank *is* the GPU layout and nothing is ever
+/// repacked in the process at all.
 #[derive(Clone)]
 pub struct HostMat {
     pub bytes: Vec<u8>,
@@ -233,6 +244,8 @@ pub struct HostMat {
     pub m: usize,
     /// Output dimension (rows).
     pub n: usize,
+    /// Cached GPU-layout form, populated on first promotion.
+    repacked: Option<Vec<u8>>,
 }
 
 impl HostMat {
@@ -250,7 +263,12 @@ impl HostMat {
                 bytes.len()
             )));
         }
-        Ok(Self { bytes, m, n })
+        Ok(Self {
+            bytes,
+            m,
+            n,
+            repacked: None,
+        })
     }
 
     /// CPU mat-vec against this matrix (the RAM-side twin of `gemv_q2_0`).
@@ -267,12 +285,33 @@ impl HostMat {
         Ok(out)
     }
 
-    /// Repack into the GPU layout and upload. Byte count is preserved.
-    pub fn to_device(&self, device: Device) -> Result<Tensor> {
-        let repacked = kore_kernels::q2_0::repack_q2_0(&self.bytes, self.m, self.n)?;
-        let len = repacked.len();
-        let s = Storage::from_bytes(DType::U8, len, repacked)?;
-        Tensor::from_storage(s, &[len]).to(device)
+    /// Whether the GPU-layout form has already been computed.
+    pub fn is_prepared(&self) -> bool {
+        self.repacked.is_some()
+    }
+
+    /// The GPU-layout bytes, computing and retaining them on first use.
+    fn repacked(&mut self) -> Result<&[u8]> {
+        if self.repacked.is_none() {
+            self.repacked = Some(kore_kernels::q2_0::repack_q2_0(
+                &self.bytes,
+                self.m,
+                self.n,
+            )?);
+        }
+        Ok(self.repacked.as_deref().expect("just populated"))
+    }
+
+    /// Upload to the device, repacking on first use. Byte count is preserved.
+    ///
+    /// The upload reads straight from the retained repacked bytes, so a miss
+    /// costs one repack (once ever, per projection) and one device write -- no
+    /// intermediate host copy, and no fresh allocation behind it.
+    pub fn to_device(&mut self, backend: &dyn DeviceBackend, device: Device) -> Result<Tensor> {
+        let bytes = self.repacked()?;
+        let len = bytes.len();
+        let storage = backend.upload_u8(bytes, device)?;
+        Ok(Tensor::from_storage(storage, &[len]))
     }
 }
 
@@ -325,6 +364,8 @@ pub struct MoeStats {
     pub misses: u64,
     pub uploads: u64,
     pub evictions: u64,
+    /// Matrix repacks on the host CPU (one per projection, first use only).
+    pub repacks: u64,
 }
 
 /// A router matrix stored as plain f32 `[n_expert, hidden]`.
@@ -412,18 +453,31 @@ impl MoeLayer {
             * self.cfg.expert_bytes(self.hidden)
     }
 
-    fn promote(&mut self, expert: usize, device: Device) -> Result<()> {
+    fn promote(
+        &mut self,
+        backend: &dyn DeviceBackend,
+        expert: usize,
+        device: Device,
+    ) -> Result<()> {
         if self.experts[expert].device.is_some() {
             return Ok(());
         }
         let (gate, up, down) = {
-            let host = self.experts[expert].host.as_ref().ok_or_else(|| {
+            let host = self.experts[expert].host.as_mut().ok_or_else(|| {
                 KoreError::StorageError(format!("moe: expert {expert} has no host source"))
             })?;
+            // Reuse the retained GPU-layout bytes, so only the first promotion
+            // of an expert pays the CPU repack.
+            let repacks = [
+                !host.gate.is_prepared(),
+                !host.up.is_prepared(),
+                !host.down.is_prepared(),
+            ];
+            self.stats.repacks += repacks.iter().filter(|p| **p).count() as u64;
             (
-                host.gate.to_device(device)?,
-                host.up.to_device(device)?,
-                host.down.to_device(device)?,
+                host.gate.to_device(backend, device)?,
+                host.up.to_device(backend, device)?,
+                host.down.to_device(backend, device)?,
             )
         };
         self.experts[expert].device = Some(ExpertMatsDev { gate, up, down });
@@ -458,16 +512,47 @@ impl MoeLayer {
             )));
         }
         let routing = route(&self.router.logits(x_norm), &self.cfg);
+        self.forward_routed(backend, device, &routing.experts, &routing.weights, x_rot)
+    }
+
+    /// Run an explicit expert set, with the routing decision supplied by the
+    /// caller.
+    ///
+    /// This is the same execution path `forward` uses; it is split out because
+    /// the decision and the execution have different owners. A graph that has
+    /// already routed (or a benchmark that wants to control the pattern) can
+    /// drive the planner directly, and nothing else has to change.
+    pub fn forward_routed(
+        &mut self,
+        backend: &dyn DeviceBackend,
+        device: Device,
+        experts: &[usize],
+        weights: &[f32],
+        x_rot: &Tensor,
+    ) -> Result<Tensor> {
+        if experts.is_empty() || experts.len() != weights.len() {
+            return Err(KoreError::StorageError(format!(
+                "moe: {} experts with {} weights",
+                experts.len(),
+                weights.len()
+            )));
+        }
+        if let Some(&bad) = experts.iter().find(|&&e| e >= self.cfg.n_expert) {
+            return Err(KoreError::StorageError(format!(
+                "moe: expert {bad} out of range for {}",
+                self.cfg.n_expert
+            )));
+        }
 
         let mut acc: Option<Tensor> = None;
-        for (&expert, &weight) in routing.experts.iter().zip(routing.weights.iter()) {
+        for (&expert, &weight) in experts.iter().zip(weights.iter()) {
             match self.cache.acquire(expert) {
                 CacheOutcome::Hit => {}
                 CacheOutcome::Miss { evicted } => {
                     if let Some(victim) = evicted {
                         self.release(victim);
                     }
-                    self.promote(expert, device)?;
+                    self.promote(backend, expert, device)?;
                 }
             }
             let mats = self.experts[expert].device.as_ref().ok_or_else(|| {
@@ -769,6 +854,76 @@ mod tests {
             w[e * hidden + e] = 1.0;
         }
         RouterMat::new(w, n_expert, hidden).unwrap()
+    }
+
+    #[test]
+    fn explicit_routing_matches_the_router_path() {
+        let Some((backend, device)) = vulkan() else {
+            eprintln!("skipping: no Vulkan backend");
+            return;
+        };
+        let (mut routed, x) = synth_layer(4);
+        let (mut explicit, _) = synth_layer(4);
+        let x_rot = Tensor::from_f32(&x, &[1, 512]).to(device).unwrap();
+
+        let a = to_vec(
+            &routed
+                .forward(backend.as_ref(), device, &x, &x_rot)
+                .unwrap(),
+        );
+        let r = route(&explicit.router.logits(&x), &explicit.cfg);
+        let b = to_vec(
+            &explicit
+                .forward_routed(backend.as_ref(), device, &r.experts, &r.weights, &x_rot)
+                .unwrap(),
+        );
+        // Same experts, same order, same kernels: not merely close.
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn promotion_repacks_each_projection_once() {
+        let Some((backend, device)) = vulkan() else {
+            eprintln!("skipping: no Vulkan backend");
+            return;
+        };
+        // One slot: the second routed expert always evicts the first.
+        let (mut layer, x) = synth_layer(1);
+        let x_rot = Tensor::from_f32(&x, &[1, 512]).to(device).unwrap();
+        let r = route(&layer.router.logits(&x), &layer.cfg);
+
+        layer
+            .forward_routed(backend.as_ref(), device, &r.experts, &r.weights, &x_rot)
+            .unwrap();
+        let first = layer.stats.repacks;
+        assert_eq!(first, 6, "two experts x three projections");
+
+        // Re-promoting the same experts must not touch the CPU repack again.
+        layer
+            .forward_routed(backend.as_ref(), device, &r.experts, &r.weights, &x_rot)
+            .unwrap();
+        assert!(layer.stats.uploads > 2, "one slot must re-promote");
+        assert_eq!(layer.stats.repacks, first);
+    }
+
+    #[test]
+    fn explicit_routing_rejects_bad_argument_lists() {
+        let Some((backend, device)) = vulkan() else {
+            eprintln!("skipping: no Vulkan backend");
+            return;
+        };
+        let (mut layer, x) = synth_layer(4);
+        let x_rot = Tensor::from_f32(&x, &[1, 512]).to(device).unwrap();
+        // Out of range, mismatched lengths, and empty all fail before any work.
+        assert!(layer
+            .forward_routed(backend.as_ref(), device, &[9], &[1.0], &x_rot)
+            .is_err());
+        assert!(layer
+            .forward_routed(backend.as_ref(), device, &[0, 1], &[1.0], &x_rot)
+            .is_err());
+        assert!(layer
+            .forward_routed(backend.as_ref(), device, &[], &[], &x_rot)
+            .is_err());
     }
 
     #[test]

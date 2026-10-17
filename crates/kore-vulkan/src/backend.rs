@@ -3188,6 +3188,31 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         ))
     }
 
+    /// Upload a host slice straight into a device buffer.
+    ///
+    /// `copy_to_device` would work, but it forces the caller to hand over an
+    /// owned `Vec` first -- a full-size copy and allocation on a path that an
+    /// offloading engine walks on every expert miss.
+    fn upload_u8(
+        &self,
+        bytes: &[u8],
+        _target: Device,
+    ) -> kore_core::Result<kore_core::Storage> {
+        let buf = KoreVulkanBuffer::from_slice(
+            bytes,
+            DType::U8,
+            &[bytes.len()],
+            &self.device,
+            &self.queue,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))?;
+        Ok(kore_core::Storage::from_device(
+            DType::U8,
+            bytes.len(),
+            Arc::new(buf),
+        ))
+    }
+
     fn copy_to_cpu(&self, storage: &kore_core::Storage) -> kore_core::Result<kore_core::Storage> {
         let dev_storage = storage.device_storage().ok_or_else(|| {
             kore_core::KoreError::StorageError("Storage is not a device storage".into())

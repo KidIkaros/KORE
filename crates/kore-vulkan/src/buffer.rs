@@ -191,6 +191,36 @@ impl KoreVulkanBuffer {
         })
     }
 
+    /// Create from a host byte slice, writing straight into the device buffer.
+    ///
+    /// The same result as `from_storage`, minus the owned `Storage` in between.
+    /// See `DeviceBackend::upload_u8` for why that matters when the bytes are
+    /// weights being streamed in on a cache miss.
+    pub fn from_slice(
+        data: &[u8],
+        dtype: DType,
+        shape: &[usize],
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<Self> {
+        let buffer = alloc_storage_buffer(device, data.len(), "kore_vulkan_upload_buffer");
+        if !data.is_empty() {
+            if data.len().is_multiple_of(4) {
+                queue.write_buffer(&buffer, 0, data);
+            } else {
+                let aligned_len = (data.len() + 3) & !3;
+                let mut padded = vec![0u8; aligned_len];
+                padded[..data.len()].copy_from_slice(data);
+                queue.write_buffer(&buffer, 0, &padded);
+            }
+        }
+        Ok(Self {
+            buffer,
+            dtype,
+            shape: shape.to_vec(),
+        })
+    }
+
     /// Download data back to CPU storage, optionally flushing a pending CommandEncoder in the same submission.
     pub fn to_storage_with_encoder(
         &self,

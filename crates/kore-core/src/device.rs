@@ -130,6 +130,21 @@ pub trait DeviceBackend: Send + Sync {
     /// Copy storage from this device back to CPU.
     fn copy_to_cpu(&self, storage: &crate::Storage) -> crate::Result<crate::Storage>;
 
+    /// Upload a host byte slice to `target` without first materialising an owned
+    /// CPU `Storage`.
+    ///
+    /// The default implementation is the honest two-step -- own the bytes, then
+    /// `copy_to_device` -- which every backend already supports. A backend whose
+    /// upload path can read straight from the caller's slice should override it.
+    /// This matters for weight streaming: an offloading engine re-uploads whole
+    /// matrices on every cache miss, and at that rate the extra full-size copy,
+    /// plus the fresh allocation behind it, stops being free. Measured at ~20%
+    /// of the step in a miss-heavy MoE configuration.
+    fn upload_u8(&self, bytes: &[u8], target: crate::Device) -> crate::Result<crate::Storage> {
+        let storage = crate::Storage::from_bytes(crate::DType::U8, bytes.len(), bytes.to_vec())?;
+        self.copy_to_device(&storage, target)
+    }
+
     /// Matrix multiplication on device: C = A @ B
     fn matmul(&self, _a: &crate::Tensor, _b: &crate::Tensor) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
