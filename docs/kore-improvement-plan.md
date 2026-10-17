@@ -26,9 +26,12 @@
 > all 9 paired rounds favouring the pooled arm and tokens byte-identical.
 >
 > The large levers that remain are **chunked prefill** (prefill still runs one
-> token at a time), **MoE expert offload** (the capability goal; not verifiable
-> on this 15 GB-RAM machine) and the **per-block row-wide reduction in
-> `had_pre`** modes 0/1. See *Next decision (gated)* at the end.
+> token at a time) and the **per-block row-wide reduction in `had_pre`** modes
+> 0/1. The **MoE expert-offload engine now exists and is verified at synthetic
+> scale** (byte-identical under thrashing; the miss path is ~1.5–1.6× faster
+> after removing two host-side copies) but could not be validated end-to-end on a
+> real MoE checkpoint on this 15 GB-RAM machine — see *Phase 3* and *Next
+> decision (gated)*.
 
 ---
 
@@ -419,6 +422,124 @@ Takeaways from the original audit, for the record:
 
 ---
 
+## Phase 3 status: MoE expert offload — the engine SHIPPED and is byte-exact
+
+**What "punching above the weight class" actually means here.** A dense 27B
+ternary (M1) needs ~7.6 GB of weights and will not fit on this 8 GB card. An MoE
+of comparable total size can, because an MoE's experts are a large,
+*sparsely-used* weight bank: the model is huge, the working set per token is
+not. That is the one shape where a big model runs on a small card. Dense models
+have no such slack.
+
+Shipped in `5a4c936` and `2ad5581`:
+
+- `crates/kore-nn/src/moe.rs` — the layer: `MoeConfig` (with
+  `capacity_for(hidden, budget_bytes)`), `route` (softmax → top-k), `ExpertCache`
+  (LRU over expert VRAM slots), `HostMat` (RAM-resident packed Q2_0 + upload),
+  `MoeLayer::forward` / `forward_routed`.
+- `DeviceBackend::upload_u8` + `KoreVulkanBuffer::from_slice` — upload a host
+  slice straight into a device buffer (`crates/kore-core`, `crates/kore-vulkan`).
+- `crates/kore-cli/examples/bench_moe.rs` — the residency/offload benchmark.
+
+**The design decision that makes this legal.** There were two ways to serve a
+cache miss:
+
+| policy | what the miss costs | exactness |
+|---|---|---|
+| **promote to VRAM, compute on GPU** (chosen) | a copy of the expert's bytes | **bit-identical by construction** — same kernel, same packed bytes, same order |
+| compute on the host CPU, overlap with GPU (Strata's approach) | CPU GEMV, no transfer | *not* bit-identical — the CPU twin sums a row in a different order |
+
+The engine's rule is that a capability is done only when the output is
+byte-identical across the shapes actually used, so residency may change *where*
+the weights live and never *what* the arithmetic is. The tests assert exactly
+that: `resident_and_starved_runs_are_bit_identical` compares a fully-resident
+layer against a single-slot layer that thrashes on every route with `assert_eq!`
+on the f32 output — no tolerance. The host twin is still used, but only as an
+independent reference to pin the device maths
+(`device_path_numerically_matches_the_dequantised_reference`), never on the hot
+path. CPU-compute-on-miss remains the right choice when the CPU is idle and the
+expert is big enough that uploading costs more than computing — it just isn't
+this engine's contract.
+
+**Measured cost curve.** `bench_moe`, 4 layers × 32 experts, top-2, hidden 1024 /
+ffn 2048 (a 216 MiB expert bank), 256 decode steps per run after a warmup that
+touches every expert. Cache size is experts resident *per layer*:
+
+| resident / 32 | uniform routing | Zipf s=1 routing | hit% (uniform) | MiB streamed/token |
+|---|---|---|---|---|
+| 2 (6%) | 314.8 tok/s | 335.2 tok/s | 4.5% | 12.89 |
+| 4 (12.5%) | 338.3 | 382.1 | 11.9% | 11.89 |
+| 8 (25%) | 378.3 | 475.4 | 24.5% | 10.19 |
+| 16 (50%) | 496.3 | 685.9 | 49.6% | 6.80 |
+| **32 (all)** | **1617.5** | **1402.8** | 100% | 0.00 |
+
+The honest reading: **the offload tax is the streaming, and it is proportional to
+the miss rate, not to the bank size.** A 216 MiB bank served from a 13 MiB cache
+loses ~4.8× against the same bank fully resident — because at a 12% hit rate
+~12 MiB/token crosses the bus. There is no free lunch in the offload itself;
+what the design buys is that a model 16× larger than the cache still *runs*, at a
+predictable fraction of the speed, and produces the identical tokens.
+
+**Two host-side costs sat on the miss path, and both were removed.**
+A miss re-uploads an expert's three projection matrices, so the *host* work
+around that transfer is what a thrashing layer actually pays for:
+
+1. `HostMat::to_device` repacked the GGUF layout into the GPU layout **on every
+   promotion** — a per-byte host permutation, on the operation an offloading
+   engine performs most. Now repacked once and retained (`stats.repacks`; test
+   `promotion_repacks_each_projection_once`).
+2. The upload went through `Storage::from_bytes`, which takes an owned `Vec` — a
+   full-size copy *and* a fresh allocation per miss, purely because
+   `Tensor::to(device)` needed something to own. `queue.write_buffer` takes a
+   slice, so the intermediate was pure overhead. `upload_u8` now uploads from a
+   borrowed slice (default impl keeps the old two-step, so no backend changes).
+
+Paired, interleaved A/B, 256 steps, 8 runs per configuration, all rounds
+favouring the new path:
+
+| resident / 32 | original | now | ratio |
+|---|---|---|---|
+| 2 | 198.0 tok/s | 317.2 | **1.60×** |
+| 4 | 214.2 | 337.8 | **1.58×** |
+| 8 | 247.0 | 377.6 | **1.53×** |
+| 16 | 338.3 | 494.0 | **1.46×** |
+
+The all-resident configuration is unaffected — with no misses there is nothing on
+this path to pay for. That is the check that says the win is where it is claimed
+to be, and the reason the paired design matters: the *noise floor* on these
+short runs is ±20% (measured by A/B-ing two builds that differ only in a
+redundant clone), so only within-run paired comparisons mean anything.
+
+**What this is not.** The weights are synthetic (real packed Q2_0, real
+`repack_q2_0`, real `gemv_q2_0`/`swiglu`, real KV-free MoE arithmetic; random
+values). So the table measures the **residency engine**, not a model — a real
+checkpoint will have its own hit rates and its own per-token activation cost.
+And **no real MoE model has run through this end-to-end**: there is no MoE
+checkpoint on this machine, and `gguf_min.rs` has no writer, so a synthetic-MoE
+GGUF cannot even be built here. The kernel path is exercised for real; the
+model path is not.
+
+**Next for this lever (in dependency order).**
+
+1. **GGUF MoE reading** — `expert_count`, `expert_used_count`,
+   `expert_weights_norm` metadata and the stacked
+   `ffn_gate_exps.weight` / `ffn_up_exps.weight` / `ffn_down_exps.weight`
+   tensors (`ne = [n_embd, n_ff, n_expert]`, contiguous per expert). This is
+   what turns the engine into a capability for "any model within reason from
+   HuggingFace".
+2. **Shared experts** (DeepSeek-V3/Qwen style) — `MoeExpert::resident`, never
+   evicted; the planner already models this.
+3. **Device-side router** — the current router runs on the host from the
+   unrotated post-norm activation, one small readback + sync per MoE layer. Fine
+   for `n_expert × hidden` (cheap), but it sits on the critical path between
+   layers. The zero-sync form is routing ids in a storage buffer and a shader
+   that indexes a stacked expert tensor.
+4. **Prepack on disk** — the retained GPU-layout copy is an in-process stand-in
+   for a converted checkpoint whose bank already *is* the GPU layout; that
+   removes the repack and the extra RAM entirely.
+
+---
+
 ## Rollback policy (no parallel systems)
 
 - **Gates are no-regression *ratios* under identical conditions, not absolute
@@ -473,12 +594,17 @@ and it is now fixed):
    parallel scan for the 18 DeltaNet/GDN layers plus batched GEMVs for the 6
    full-attention layers. The `m = 2..4` GEMV path is now bit-invariant, which is
    the precondition for verifying a batched prefill against the scalar path.
-3. **MoE expert offload (the capability lever).** Weights ≫ VRAM streamed from
-   system RAM while the GPU computes hot experts. This is the only shape that
-   "punches above the weight class" on an 8 GB card: a 27B dense ternary (M1)
-   cannot fit, but a ~30 B MoE with 2–3 B active params can run at 40–60 tok/s.
-   **Not buildable on this machine** (15 GB RAM, no model > 1.5 GB), so it is
-   unverifiable here and belongs on a bigger box.
+3. **MoE expert offload (the capability lever) — engine SHIPPED, model path
+   BLOCKED.** Weights ≫ VRAM streamed from system RAM while the GPU computes hot
+   experts. This is the only shape that "punches above the weight class" on an
+   8 GB card: a 27B dense ternary (M1) cannot fit, but a ~30 B MoE with 2–3 B
+   active params can run at 40–60 tok/s. The engine is in-tree and verified at
+   synthetic scale (**Phase 3** above): promotion is a byte copy, so losing the
+   cache changes residency and not a single bit of the output, and the host
+   costs that used to sit on the miss path are gone. What is missing is the
+   *model* half — reading stacked expert tensors and MoE metadata out of a GGUF
+   — which needs a real MoE checkpoint to be worth anything, so it is deferred
+   rather than faked here.
 
 **Note on the retired gate.** The "≥ 80 tok/s" short-context floor appears
 throughout the phases below but does **not** reproduce on this machine: HEAD
