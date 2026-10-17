@@ -301,8 +301,8 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
-
     /// Fused GQA decode attention (quantized; K/V are INT8 + per-token scales).
+    #[allow(clippy::too_many_arguments)]
     fn fused_attention_decode_gqa_q8(
         &self,
         _q: &crate::Tensor,
@@ -316,12 +316,14 @@ pub trait DeviceBackend: Send + Sync {
         _scale: f32,
     ) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
-            "fused_attention_decode_gqa_q8 not implemented for backend '{}'", self.device_name()
+            "fused_attention_decode_gqa_q8 not implemented for backend '{}'",
+            self.device_name()
         )))
     }
 
     /// Copy quantized INT8 K/V + per-token INT8 scales into the quantized KV cache
     /// and the parallel scale buffers.
+    #[allow(clippy::too_many_arguments)]
     fn kv_cache_append_q8(
         &self,
         _k_cache_buf: &crate::Tensor,
@@ -335,7 +337,8 @@ pub trait DeviceBackend: Send + Sync {
         _row_offset: usize,
     ) -> crate::Result<(crate::Tensor, crate::Tensor)> {
         Err(crate::KoreError::StorageError(format!(
-            "kv_cache_append_q8 not implemented for backend '{}'", self.device_name()
+            "kv_cache_append_q8 not implemented for backend '{}'",
+            self.device_name()
         )))
     }
 

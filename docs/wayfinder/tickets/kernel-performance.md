@@ -38,6 +38,33 @@ under identical conditions: ctx5 **33.7 -> 41.2**, ctx1024 **28.7 -> 37.3**,
 ctx2048 **21.0 -> 25.9** tok/s (+22-30%), with GPU output byte-identical to the
 F32 reference.
 
+### Follow-up (2026-10-17): the Q2_0 GEMV is now close to the practical limit
+
+The GEMV was then optimised directly (commits `ed5a38d`, `983d620`, `b45e4ad`):
+the branchy hand-rolled fp16 scale decode became `unpack2x16float`; the
+256-entry shared-memory code LUT was dropped for arithmetic extraction; and each
+warp now reuses one x load across 4 output rows.
+
+Re-measured (median of 7, ctx 5): **41.2 -> 59.4 tok/s** — +44% over the P0
+baseline and +76% over `HEAD` (33.7), token ids still exact.
+
+Two findings that matter for planning:
+
+- "22-36 GB/s of weight bytes" was never the right figure of merit: the Q2_0
+  kernel reads 14x fewer bytes per weight than F32, so it is not
+  bandwidth-bound. It now runs at **145-200 Gweights/s**, within ~15% of
+  llama.cpp's `mul_mat_vec_q` on comparable hardware with the same
+  warp-per-row design. **Do not expect another large win from this kernel.**
+- Cutting x-read traffic 4x (the 4-rows-per-warp change) made the LM head ~20%
+  faster but left short-context decode unchanged within noise, so x reads are
+  cache-served and traffic was not the bottleneck.
+
+The corrected split of a 16.8 ms token (ctx 5) is **~11 ms Q2_0 GEMV + ~5.6 ms
+of ~300 small dispatches** (rms_norm, hadamard, swiglu, elementwise, argmax,
+attention/SSM). Decode is GPU-bound (90-92% utilisation at the 80 W limit), so
+the next short-context lever is **fusing those small dispatches**, and the
+long-context lever remains the O(seq_k) KV re-read above.
+
 ## Claimed by
 
 (unassigned)

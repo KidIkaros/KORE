@@ -37,23 +37,52 @@ Shipped in commit `0d49fe7`:
 - A/B vs HEAD (identical conditions): ctx5 33.7→41.2, ctx1024 28.7→37.3,
   ctx2048 21.0→25.9 tok/s (+22–30%).
 
-## Phase 0.5 status: MEASURED — Q2_0 GEMV is the dominant, inefficient cost
+## Phase 0.5 status: GEMV OPTIMISED — the remainder is ~300 small dispatches
 
-`bench_gemv` (commit `0d49fe7`) shows the Q2_0 GEMV moving weight bytes at
-**~22–36 GB/s**, versus **~287–318 GB/s** for the F32 GEMV on the same card. A
-10× drop in byte-throughput despite reading 14× fewer bytes per weight means the
-Q2_0 kernel is **not** bandwidth-bound — the limiter is the access pattern
-(the repack interleaves code words as `j*bpr + b`, so a warp's code reads are
-scattered/broadcast rather than coalesced) and/or the per-element ALU/LUT work.
-Decode is therefore bottlenecked here, not on FLOPs or dispatch count:
-reconstructing a token from per-shape GEMV latency gives ~18 ms of Q2_0 weight
-reads per token (of ~24 ms total), with the Q2_0 LM head (`n=248320`) alone at
-**3.9 ms** (~16%).
+Phase 0.5 was originally opened because `bench_gemv` showed the Q2_0 GEMV
+moving weight bytes at ~22–36 GB/s against ~287–318 GB/s for the F32 GEMV. That
+number is a red herring: the Q2_0 kernel reads 14x fewer bytes per weight, so
+"byte throughput" is not its ceiling and the kernel was never bandwidth-bound.
 
-**Implication:** raising tok/s (and making M1's 27B target reachable) is gated on
-fixing the Q2_0 GEMV (coalesced code layout + drop the shared-memory LUT) and/or
-the LM head. This is the highest-leverage kernel work and should precede the
-paged-KV work in Phase 1.
+What actually shipped (`ed5a38d`, `983d620`, `b45e4ad`):
+
+- **`unpack2x16float` for the block scales** (`ed5a38d`). The fp16 scale was
+  decoded by a branchy hand-rolled `fp16_to_f32`, executed redundantly by all 32
+  lanes on every k-iteration. One instruction replaces it.
+- **Drop the shared-memory LUT** (`983d620`). The 256-entry vec4 code table was
+  read on the critical path every iteration (4-way bank conflicts) and its 4 KiB
+  plus init barrier cost occupancy. The four 2-bit deltas are now extracted
+  arithmetically.
+- **Coalesced code layout** (`f136cd5`) and **4 output rows per warp**
+  (`b45e4ad`), which cuts the kernel's x-read traffic 4x.
+
+Result: short-context decode **41.2 → 59.4 tok/s** (median of 7; cumulative
++44% over the P0 baseline, +76% over HEAD), with byte-identical token ids and
+13/13 GPU tests green.
+
+**The corrected cost model** (Bonsai-2 2B, ctx 5, 16.8 ms/token):
+
+| component | time | notes |
+|---|---|---|
+| Q2_0 GEMV (all shapes) | ~11 ms | 1.78 B weights at ~145–200 Gweights/s |
+| — of which LM head | ~2.5 ms | n=248320, the largest single shape |
+| everything else | ~5.6 ms | ~300 dispatches: rms_norm, hadamard, swiglu, elementwise, argmax, attention/SSM |
+
+- The GEMV now runs at **145–200 Gweights/s**, i.e. within ~15% of what
+  llama.cpp's `mul_mat_vec_q` achieves with the same warp-per-row design on
+  comparable hardware. Further micro-tuning here has low headroom.
+- The 4-rows-per-warp change cut x traffic 4x and made the LM head ~20% faster,
+  but left short-context decode **unchanged within noise**: x reads are largely
+  cache-served, so traffic was not the bottleneck. It is kept for the
+  bandwidth-bound offload case the engine is being built for.
+- Decode runs at **90–92% GPU utilisation at the 80 W power limit**, so it is
+  GPU-bound, not dispatch-bound: the win must come from doing fewer
+  instructions, and the remaining lever is the ~300 small kernels, not the GEMV.
+
+**Implication:** Phase 1 (paged KV) still matters for long context, but for
+short-context tok/s the next lever is **fusing the small latency-bound
+dispatches** (e.g. rms_norm+hadamard, and epilogue folds into the GEMV), not
+further Q2_0 GEMV work.
 
 
 ---
@@ -117,4 +146,28 @@ Takeaways:
 
 ## Next decision (gated)
 
-Phase 0 is the immediate blocker (3 build errors) AND the highest-leverage contained fix. Propose: **finish Phase 0** (get the Q8 path green + regression-tested), then run the Phase 1 paged-KV + INT8 decode on the 8 GB card, and present the before/after numbers. This directly answers the audit's "what do we do."
+**Where we are.** Phase 0 is PASSED and Phase 0.5's GEMV work is done: short
+context is **59.4 tok/s** (median of 7) against 33.7 for HEAD, with byte-identical
+tokens. The GEMV is now within ~15% of llama.cpp's efficiency for this shape, so
+the remaining short-context lever is the **~5.6 ms/token of ~300 small
+latency-bound dispatches**, and the remaining long-context lever is still
+Phase 1 (paged KV).
+
+**Note on the retired gate.** The "≥ 80 tok/s" short-context floor appears
+throughout the phases below but does **not** reproduce on this machine: HEAD
+itself measures 33.7 tok/s @ctx5. It is retired as an absolute gate — gates must
+be expressed as no-regression *ratios* measured under identical conditions
+(same prompt, 1 warmup + 6 timed runs, clocks recorded), because the pinned
+curve was taken under different power/thermal conditions.
+
+Proposed order:
+
+1. **Fuse the small dispatches** (short-context tok/s). Start with
+   `rms_norm` + `hadamard_signed` (they run back to back ~24x/token on the same
+   2048-vector) and fold the residual `add` into the GEMV epilogue. Target: cut
+   the ~5.6 ms non-GEMV share by a third without touching numerics.
+2. **Phase 1 (paged KV)** — the long-context bottleneck (F1–F4): decode reads
+   grow as O(seq_k), which is what takes 4096-context from ~59 to ~18.7 tok/s.
+3. **M1** (27B ternary + lean MTP graft) and **M2** (MoE expert offload) as
+   planned.
+
