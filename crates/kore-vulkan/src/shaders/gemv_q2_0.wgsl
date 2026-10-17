@@ -11,8 +11,6 @@ struct Q2Uniforms {
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
 
 var<workgroup> sdata: array<vec4<f32>, 128>;
-// lut[byte] = vec4 of code deltas (c_i - 1) for the 4 elems that byte encodes.
-var<workgroup> lut: array<vec4<f32>, 256>;
 
 // Repacked Q2_0 row layout (u32-aligned, same byte count):
 //   codes:  block b's 16 code bytes at word offset b*4 (elems 16b..16b+15 are
@@ -31,16 +29,6 @@ fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>
 ) {
     let lx = local_id.x;
-
-    for (var e = lx; e < 256u; e = e + 128u) {
-        lut[e] = vec4<f32>(
-            f32(i32(e & 3u) - 1),
-            f32(i32((e >> 2u) & 3u) - 1),
-            f32(i32((e >> 4u) & 3u) - 1),
-            f32(i32((e >> 6u) & 3u) - 1),
-        );
-    }
-    workgroupBarrier();
 
     let sub_warp = lx / 32u;
     let tid = lx % 32u;
@@ -78,7 +66,12 @@ fn main(
             let sw = w[row_w + bpr * 4u + (b >> 1u)];
             let d = unpack2x16float(sw >> ((b & 1u) * 16u)).x;
             let cb = (w[row_w + b * 4u + cw_j] >> cw_sh) & 0xFFu;
-            let lv = lut[cb];
+            let lv = vec4<f32>(
+                f32(i32(cb & 3u) - 1),
+                f32(i32((cb >> 2u) & 3u) - 1),
+                f32(i32((cb >> 4u) & 3u) - 1),
+                f32(i32((cb >> 6u) & 3u) - 1),
+            );
             let xi = i * 32u + tid;
 
             var a = lv * x[xi];
