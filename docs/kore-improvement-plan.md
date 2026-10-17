@@ -393,13 +393,19 @@ is now much closer to the unpack-ALU wall — ~5 ops per 2-bit weight, of which
 ~3.5 is the mask/convert/subtract extraction. `emb_head` is still 18% of the
 token, so a further 1.3× there is worth ~1.05× end-to-end.
 
-### 2. Batched/chunked prefill (the usability lever)
+### 2. Batched/chunked prefill (the usability lever) — LANDED at 2.13×
 
-Needs a chunked parallel scan for the 18 DeltaNet/GDN layers plus batched GEMVs
-for the 6 full-attention layers — a large project, not a quick win. The GEMV
-kernel already supports `m = 2..4` *and* is now bit-invariant across `m`, which
-is a precondition for verifying a batched prefill against the token-at-a-time
-path.
+A chunked parallel scan for the 18 DeltaNet/GDN layers was the plan; it turned
+out the *batching* half of the win needs no scan at all, because `forward_batch`
+already produces the same state as token-at-a-time decode (it runs the three GDN
+ops in a host-side per-row loop for exactly that reason). Prefill is `n`
+consecutive positions of one sequence, so it is the causal chunk the
+multi-column pass was built for, and it is the one consumer of it that needs no
+draft to be accepted. See §2d.
+
+What is still open from the original framing: the host-side per-row loop is
+exactly 4× the m=1 cost of those three ops, and a chunked *parallel* scan would
+collapse it back to ~1× — worth roughly 10% of a chunk, not another 1.6×.
 
 #### 2b. What a verify pass costs — MEASURED, and the premise was wrong
 
@@ -644,6 +650,60 @@ ablation. And `bench_multi` (one state built from ctx 0, no cooling) is valid
 only for short-context *ratios*: it reports 41.1 ms/token at ctx 1024, a
 heat-saturated die, where the cooled figure is 8.6.
 
+#### 2d. Chunked prefill — LANDED, and the head is skipped on every chunk but the last
+
+`forward_batch` landed in §2c but nothing called it, so the multi-column pass
+bought nothing a *user* could see: a single stream has one token to give at a
+time, and prefill itself was token-at-a-time, so it cost the same per token as
+decode. Prefill is where the batch is free — no draft, no acceptance, 100% of
+the work is real.
+
+`Qwen35Gpu::prefill(prompt, pos0, states)` consumes the whole prompt in chunks of
+the GEMV's four-column width and returns the greedy token that follows it. The
+shared pass core grew a `Head` mode because prefill needs the vocabulary
+projection at **one** position, not at every one:
+
+- `Head::Skip` — advance state, produce no token (every chunk but the last);
+- `Head::Last` — project the final column only;
+- `Head::Every` — the old behaviour `forward_batch` still wants for a verify pass.
+
+The head is a `vocab × hidden` matvec, about a fifth of a step's weight stream on
+Bonsai-2, and on the chunked path it now runs once per four positions instead of
+four times. Two properties make that safe rather than merely faster: the head
+does not feed the recurrent state (it reads the last position's normalized hidden
+and nothing else), and it is row-independent, so projecting the last row alone is
+the same arithmetic as reading it out of the full `[m, vocab]` result.
+
+**Measurement.** `bench_prefill` (new) is an interleaved ABBA A/B at a fixed
+prompt length: each arm runs from a fresh state, consumes the same token stream,
+and then takes one extra single-token step whose token both arms must agree on —
+a timing comparison between two states that disagree would not be a comparison of
+the same work. ctx 512, 3 rounds, median of 6, order flipped per round:
+
+| arm | seconds | tok/s |
+|---|---|---|
+| `forward` per token | 4.903 | 104.4 |
+| chunked `prefill` | 2.298 | **222.8** (2.13×) |
+
+Per-round spread was A 4.80–5.00 s and B 2.26–2.39 s, and the two arms' state
+probes agreed (token 793) in every round. 2.13× is *larger* than the 1.62× that
+`bench_multi_cool` reports for decode at `m = 4`, and it should be: decode at
+`m = 4` is verifying, so it runs the head for all four columns, while prefill now
+runs it once per chunk.
+
+**Gates.** `verify_m` grew a prefill leg — chunked prefill's returned token must
+equal the sequential one and the state it leaves must match under a probe. At
+`m = 1, 2, 4`: 325/325 positions bit-identical, state probe agrees, prefill
+agrees. `bonsai` (which now prefills its prompt through the new path) still emits
+the byte-identical token ids of the pre-change baseline. `generate_greedy`,
+`bonsai`, `bench_multi_cool` and `bench_context_cool` all prefill through it now.
+
+**What this is not.** The 18 DeltaNet layers still run the host-side per-row loop
+(that is what makes the pass bit-identical), so the three GDN ops cost 4× the
+m=1 figure inside a chunk. A chunked parallel scan would collapse that to ~1×,
+worth roughly 10% of a chunk. `GpuState` snapshot/restore is still the missing
+piece for a prefill that is *re-run*.
+
 ### 3. Small-op fusion/parallelisation (~25% of the token)
 
 ~150 latency-bound dispatches at ~4–7 µs of *exposed* latency each
@@ -832,8 +892,10 @@ conditions — compare within a run, never across.
 cooled die on Bonsai-2, one pass over `m` positions buys **1.37× per token at
 `m = 2` and 1.62–1.66× at `m = 4`**, unchanged from ctx 320 to ctx 2048, and
 byte-identical to that many single-token steps (`verify_m`, 325/325 at
-`m = 1, 2, 4`). That is the machinery spec decode and chunked prefill both
-need; the missing piece for either is `GpuState` snapshot/restore.
+`m = 1, 2, 4`). **Chunked prefill is the first real consumer of it, and it
+landed at 2.13×** (§2d) — prefill is the one place the batch is free, because
+there is no draft that has to be accepted. Spec decode is the other consumer,
+and it is the one still missing `GpuState` snapshot/restore.
 
 **What that leaves.** Three levers, none of them the *host-side* per-dispatch
 cost that the census was built to find (that turned out to be buffer creation,
@@ -857,13 +919,24 @@ and it is now fixed):
    explicit tolerance argument, not a token-id diff.
    (Related negative result, now recorded so it is not re-attempted: transposing
    the GDN state for coalescing is bit-identical and **4.1% slower**.)
-2. **Chunked/batched prefill (the usability lever).** Prefill is token-at-a-time,
-   so a 4096-token prompt costs the same 57.8 tok/s as decode. Needs a chunked
-   parallel scan for the 18 DeltaNet/GDN layers plus batched GEMVs for the 6
-   full-attention layers. The `m = 2..4` forward path is now bit-invariant
-   *end to end* (`verify_m`, 325/325), which is the precondition for verifying a
-   batched prefill against the scalar path; what is missing is the parallel scan
-   and, for a prefill that is re-run, `GpuState` snapshot/restore.
+2. **Chunked prefill — LANDED at 2.13×, and what is left of it is a parallel
+   scan.** Prefill used to be token-at-a-time, so the multi-column forward bought
+   nothing a *user* could see: a single stream has one token to give at a time,
+   and prefill cost the same per token as decode. A prompt is `n` consecutive
+   positions of one sequence, so it is exactly the causal chunk `forward_batch`
+   was built for. `prefill` now consumes the prompt in chunks of the GEMV's
+   four-column width; because it needs the vocabulary projection at one position
+   and not at every one, it also skips the head on every chunk but the last (the
+   head is ~a fifth of a step's weight stream on Bonsai-2, and it does not feed
+   the recurrent state, so skipping it is free). Measured interleaved ABBA at
+   ctx 512 — 6 samples, order flipped per round, both arms' state probes
+   agreeing: **104.4 → 222.8 tok/s, 2.13×**, byte-identical to the scalar path
+   (`verify_m` grew a prefill leg; the `bonsai` token-id witness is unchanged).
+   The 18 DeltaNet layers are still the host-side per-row loop that
+   `forward_batch` uses for correctness, and that loop is exactly 4× the m=1
+   cost of those three ops. A chunked *parallel* scan would collapse it back to
+   ~1× — worth roughly 10% of a chunk, not another 1.6×. `GpuState`
+   snapshot/restore is still the missing piece for a prefill that is *re-run*.
 3. **MoE expert offload (the capability lever) — engine SHIPPED, model path
    BLOCKED.** Weights ≫ VRAM streamed from system RAM while the GPU computes hot
    experts. This is the only shape that "punches above the weight class" on an
