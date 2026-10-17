@@ -517,11 +517,21 @@ fusion of those same 79 dispatches was measured exactly neutral above, because
 removing a dispatch while keeping its work saves nothing. They are not the same
 kind of problem either.
 
-`had_pre` modes 0/1 recompute the whole-row sum of squares in every 512-block
-workgroup — 4× redundant at h=2048, 12× at h=6144. Widening it to carry more
-rows per dispatch makes those barriers serve several rows instead of one, which
-is the multi-column forward again, and it is where this lever and the
-spec-decode lever converge.
+`had_pre` is *not* its row sum, which was worth knowing before rewriting it.
+Modes 0/1 recompute the whole-row sum of squares in every 512-block workgroup —
+4× redundant at h=2048, 12× at h=6144 — and the obvious dedup is to compute it
+once and share it. So that ceiling was measured directly, by deleting the sum
+outright (its reads *and* the 8-barrier tree) and re-running the step over five
+alternating rounds: **0.28 ms, 3.2%** (medians 8.84 → 8.58 ms; paired deltas
+0.26–0.37). The entire redundancy is worth a third of a millisecond, and a real
+dedup has to *add* a pass (plus its dispatch latency) to collect it. The 1.6 ms
+`had_pre` actually costs is the pre-op, the 9-stage barrier chain of the
+Hadamard, and above all a grid of **4 workgroups at h=2048 and 12 at h=6144**
+against 36 SMs. Every workgroup is on the critical path and the grid cannot fill
+the part, which is the same diagnosis as everywhere else in this section and the
+same fix: more rows per dispatch. The kernel header had already worked this out
+("keeps every workgroup on the same critical path instead of serialising the
+blocks inside one workgroup"); the measurement agrees with its author.
 
 `gdn_step` has no row dimension to widen. It launches `n_v = 16` workgroups of
 128 threads, one thread per state column, so the whole kernel is 2048 threads —
@@ -732,21 +742,22 @@ conditions — compare within a run, never across.
 cost that the census was built to find (that turned out to be buffer creation,
 and it is now fixed):
 
-1. **The row-wide reduction inside the small ops (~29% of the token, measured
-   two ways).** `had_pre` is 79 dispatches/step and the largest non-GEMV cost:
-   1.6 ms by dispatch ablation (19% of an 8.5 ms step), against `bench_chain`'s
-   20.0 µs dependent at h=2048 and 31.2 µs at h=6144. Modes 0/1 recompute the
-   whole-row sum of squares **in every 512-block workgroup**, so the cost grows
-   with `h` while the Hadamard part does not. Two cheaper fixes were tried and
-   **refuted by measurement** (see the closed-out list). `gdn_step` is another
-   0.85–1.5 ms (10–17%) and the same *kind* of problem for a different reason:
-   16 workgroups × 128 threads is 64 warps in total, ~2 per SM, so it is
-   latency-bound for want of threads. What is left in both cases is to stop
-   doing the reduction the long way round — deduplicating the row sum, or
-   splitting a column's `i = 0..127` walk across threads — and either restructures
-   the summation order, which forfeits the byte-identical-token gate. So it needs
-   a numeric-equivalence reference first. **Gate:** fewer exposed µs in
-   `bench_chain` *and* an explicit tolerance argument, not a token-id diff.
+1. **The small ops (~29% of the token) — and what is *not* the reason.**
+   `had_pre` is 79 dispatches/step and the largest non-GEMV cost: 1.6 ms by
+   dispatch ablation (19% of an 8.5 ms step), against `bench_chain`'s 20.0 µs
+   dependent at h=2048 and 31.2 µs at h=6144. The suspect was its row-wide sum
+   of squares, recomputed in every 512-block workgroup (4× redundant at h=2048,
+   12× at h=6144), and the suspect is **refuted**: deleting the sum outright —
+   reads and barrier tree — is worth **0.28 ms, 3.2%**. What is left is a
+   grid of 4 workgroups (h=2048) or 12 (h=6144) against 36 SMs, paying the
+   pre-op and a 9-stage barrier chain. That is amortised by *rows per dispatch*,
+   so it belongs to the multi-column forward, not to a dedup. `gdn_step` is the
+   other 0.85–1.5 ms (10–17%) and a different problem: 16 workgroups × 128
+   threads is 64 warps in total, ~2 per SM, so it is latency-bound for want of
+   threads, and the only place to get more is inside each column's `i = 0..127`
+   walk. That one does restructure a summation, so it still needs the gate.
+   **Gate (`gdn_step` only):** fewer exposed µs in `bench_chain` *and* an
+   explicit tolerance argument, not a token-id diff.
    (Related negative result, now recorded so it is not re-attempted: transposing
    the GDN state for coalescing is bit-identical and **4.1% slower**.)
 2. **Chunked/batched prefill (the usability lever).** Prefill is token-at-a-time,
@@ -803,6 +814,16 @@ Also closed, and worth naming because it looks like a win:
   bundled into that same revert, so their effect is unmeasured — they pair only
   a thread's own four elements, so they are bit-exact and remain an untaken
   micro-win.)
+- **Deduplicating `had_pre`'s row-wide sum of squares** — the redundancy is real
+  (4× at h=2048, 12× at h=6144) but it is not the cost. Skewing the shader so
+  the sum is skipped altogether — its whole-row reads *and* its 8-barrier tree —
+  moves the step by **0.28 ms / 3.2%** (medians 8.84 → 8.58 ms over 5
+  alternating rounds of two saved binaries; paired deltas 0.26–0.37). Since a
+  real dedup must *add* a pass to collect that, the net is under 3%. The
+  redundant copy is executed in parallel by workgroups that are idle anyway, so
+  it costs occupancy, not latency — which is what the kernel header said when it
+  chose the redundancy. The 1.6 ms is the pre-op, the 9-stage Hadamard barrier
+  chain, and a 4/12-workgroup grid on 36 SMs; rows per dispatch is the fix.
 - **`gdn_step` state transpose for coalescing** — the `i`-walks read
   `state[j*dv + i]`, so at fixed `i` a warp's 32 threads are 512 bytes apart:
   32 cache lines per load instruction, which reads as the reason for the
