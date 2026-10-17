@@ -170,9 +170,126 @@ Takeaways from the audit:
 
 ---
 
-## Phase 1 — paged KV + the information-flow fix (the highest leverage)
+## Phase 1a status: long-context decode FIXED by split-KV sharding (2026-10-17)
 
-**Goal:** break the reinforcing loop (F3). 4096-context decode moves from ~2 toward double-digit tok/s.
+The Phase 1 diagnosis below — that the contiguous KV tensor (F1) and the O(seq_k)
+read volume (F7) are the binding constraints — is **wrong**, and this section
+supersedes it. The KV representation was already fixed by the Q8 path; what was
+actually binding was **how few workgroups the decode kernel launched**.
+
+**Instrument.** `cargo run --release -p kore-vulkan --example bench_attn` times
+`fused_attention_decode_gqa_q8` against `seq_k` at Bonsai's full-attention shape
+(8 query heads, 2 KV heads, head_dim 256). All arms are warmed up and then timed
+in the *same* loop with the arm order rotated per repetition, and reported as
+medians.
+
+| seq_k | 256 | 512 | 1024 | 2048 | 4096 | 8192 |
+|---|---|---|---|---|---|---|
+| single-group ms | 0.338 | 0.606 | 1.117 | 1.232 | 2.778 | 6.369 |
+| effective GB/s | 0.8 | 0.9 | 0.9 | 1.7 | 1.5 | 1.3 |
+
+That is 1–1.7 GB/s on a memory system that does 130–160 GB/s in the GEMV. The
+kernel is **memory-latency-bound**, not bandwidth-bound: the F32 kernel reads 4x
+more bytes and is only 1.9x slower, which is the signature of a fixed latency
+dominating. The cause is structural: at decode the grid is
+`(num_heads x seq_q) = (8 x 1)` — **8 workgroups of 64 threads to cover the whole
+GPU**, each walking the entire window with no way to hide a ~500-cycle DRAM
+latency. (The K read is also only 8 bytes per cache line per instruction, but the
+grid is the dominant term.)
+
+**Fix.** Shard the KV window across `n_splits` workgroups per head and merge the
+shards log-sum-exp style:
+- `flash_decode_gqa_q8_split.wgsl` — grid `(num_heads, n_splits, 1)`. Each shard
+  computes its own (running max, sumexp, V accumulator) over its slice of
+  `[0, seq_k)`. Arithmetic per shard is identical to the single-group kernel; the
+  only change is that the running max is the shard's own max.
+- `flash_decode_gqa_q8_combine.wgsl` — one workgroup of 256 threads per head
+  rescales each shard by `exp(shard_max - global_max)` and normalizes.
+- `n_splits = ceil(seq_k / 64)`, capped at 64; below `seq_k = 256` the merge pass
+  costs more than the sharding saves, so the single-group kernel is kept
+  (`KORE_ATTN_SPLIT_MIN` overrides the threshold; set it above the context length
+  to disable sharding entirely — that switch is the A/B control). Sharding is an
+  optimisation only: `attn_can_shard()` falls back for shapes the shard kernel
+  cannot stage.
+
+**Result (bench_attn, same bytes, `max |diff|` vs the single-group kernel):**
+
+| seq_k | single ms | split ms | n_splits | speedup | GB/s | max \|diff\| |
+|---|---|---|---|---|---|---|
+| 512 | 0.606 | 0.132 | 32 | 4.6x | 4.0 | 4.5e-8 |
+| 2048 | 1.232 | 0.139 | 32 | 8.8x | 15.0 | 3.5e-8 |
+| 4096 | 2.778 | 0.192 | 64 | 14.5x | 21.9 | 3.3e-8 |
+| 8192 | 6.369 | 0.302 | 64 | 21.1x | 27.8 | 3.5e-8 |
+
+*Caveat on how this table was first produced:* the single-group numbers were
+originally taken from a separate timing pass earlier in the process, which
+under-measured them by 1.8x at small `seq_k` because an idle RTX 2070 sits at
+300 MHz and spends the first pass ramping to boost. The example now warms every
+arm and interleaves them in one loop.
+
+**End to end.** `bench_context` samples decode *immediately after* the prefill, so
+its ctx-5 arm runs on a cold die and its ctx-8192 arm on a heat-soaked one: it
+conflates context with heat. `crates/kore-cli/examples/bench_context_cool.rs`
+prefills, cools the die to a target temperature, runs 8 untimed forwards to
+escape the 300 MHz idle clock, then times a 40-token window:
+
+| decode ctx | 13 | 1032 | 2056 | 4104 | 8200 |
+|---|---|---|---|---|---|
+| sharded ms | 14.80 | 15.05 | 15.11 | 15.34 | 16.17 |
+| sharded tok/s | 67.6 | 66.4 | 66.2 | 65.2 | 61.9 |
+| unsharded ms | — | 19.29 | — | 33.48 | 52.63 |
+| unsharded tok/s | — | 51.8 | — | 29.9 | 19.0 |
+| **sharding speedup** | — | **1.28x** | — | **2.18x** | **3.26x** |
+
+Prefill goes through the same one-token-at-a-time path, so prompt throughput *is*
+decode throughput, and it gains the same way:
+
+| prefill ctx | 1024 | 2048 | 4096 | 8192 |
+|---|---|---|---|---|
+| sharded tok/s | 64.2 | 63.0 | 57.8 | 40.4 |
+| unsharded tok/s | 58.0 | — | 33.1 | 12.8 |
+| speedup | 1.11x | — | 1.75x | **3.15x** |
+
+The curve is now flat: 14.8 → 16.2 ms (+9%) from ctx 13 to 8200. On heat alone
+the old hot ctx-4104 reading was 1.22x the cool unsharded one (40.8 vs 33.5 ms),
+so the earlier "2.08x end to end" was a mix of the sharding win and that heat.
+
+**Token ids are byte-identical** between the sharded and unsharded arms and across
+contexts. The shard merge changes the softmax reduction order by ~3e-8, which
+does not perturb argmax.
+
+**What this means for the plan:**
+- Paged KV (F1) is still wanted, but for **memory management** — a soft `max_ctx`,
+  no full-length preallocation, offloadable blocks — not for tok/s. Do not
+  budget it as a decode-speed lever.
+- F7's "fuse the attention decode into the KV append to make the per-token read
+  O(1) per block" is **not** the win either; the reads were never the problem.
+- The remaining lever on this kernel is the read pattern itself (8 useful bytes
+  per cache line per instruction), worth up to ~6x more (28 GB/s → >100 GB/s) and
+  the thing that would matter at 32K–262K context. That is a KV *layout* change,
+  not a paging change.
+- **Measurement caveat.** All long-context numbers must be cool-die and
+  clock-ramped. A 4096-token prefill heat-soaks this GPU for minutes, and the
+  first forwards on a cooled die measure the 300 MHz → boost ramp (81 ms/token
+  for the first four vs 15.5 ms for the last four). Two earlier A/B attempts were
+  garbage because of this: arm readings swung 6.5–20 tok/s inside one run. Use
+  `bench_context_cool`.
+
+---
+
+## Phase 1 — paged KV + the information-flow fix — SUPERSEDED, see Phase 1a above
+
+**Kept for the record. Two of its three premises were measured and refuted; do not
+implement this as written.** (1) The contiguous F32 KV tensor was already replaced
+by the Q8 path and is not the constraint. (2) The read *volume* is not the
+constraint — the kernel was latency-bound on 8 workgroups, now fixed by sharding.
+(3) F7's "amortize the per-token read to O(1) per block" is not a win: the window
+must still be read every step. Paged KV remains worth doing for **memory
+management** only.
+
+**Goal (restated after Phase 1a):** decode at long context is no longer the
+problem — it is flat to ctx 8192. The remaining problem is that **prompt
+processing runs at decode speed** (see Phase 2).
 
 Takeaways from the audit:
 - **F1 (stock):** KC/VC as one contiguous F32 tensor is the binding constraint — replace with paged KV blocks (SOAR-style ring of fixed-size blocks, each block owned by one layer). This also makes the "max_ctx" a soft budget, not a hard OOM.
@@ -182,27 +299,54 @@ Takeaways from the audit:
 1. In `kore-vulkan`: introduce paged KV blocks (fixed-size `[block_ctx, kv_dim]` per layer, free-list allocator; `max_ctx` becomes the number of blocks × block_ctx).
 2. Rewrite `fused_attention_decode_gqa_q8` to: for the decode window, read only the current block's KC/VC (U8 + scales), dequantize per-thread, run the softmax + V-accumulate, and **return already-accumulated hidden states** so the next step's attention reads a bounded window (not the whole KV). Reuse the flash fuses so no extra passes.
 3. Keep `fused_attention_decode_gqa` (F32) as the slow path only while the transition is verified.
-4. **Verification gate:** bonsai at 4096 context (`4096 gpu`) — require decode to move from ~2 to double-digit tok/s (≥ ~10–20) while short-context (≥5 tok) stays ≥ 80 tok/s. A regression → short-context < 80, or a tile-boundary bug → wrong tokens.
+4. **Verification gate (rewritten after Phase 1a):** decode at ctx 4096 must not
+   regress against the split-KV path (65.2 tok/s sharded / 29.9 unsharded, cool
+   die), and token ids must stay byte-identical to the pre-change reference.
 
 ---
 
-## Phase 2 — throughput, only after Phase 1 is green
+## Phase 2 — throughput, only after Phase 1 is green — REVISED
 
-**Goal:** push the numbers with compute-friendly changes, now that the memory path is fixed.
+**Goal:** the measured bottleneck. Cold-die ctx-13 decode is **14.55 ms/token**, of
+which ~10–11 ms is the Q2_0 GEMVs and ~3.5–4 ms is ~150 small latency-bound
+dispatches. And **prefill is one token at a time**, so a 4096-token prompt takes
+71 s (57.8 tok/s) — the same speed as decode, which is the real usability limit.
 
-Takeaways:
-- **F9 (buffers):** add continuous/mtp batching so the decode reads the KV in a coalesced async pattern (already "in theory" for this workload; verify on the 8 GB card).
-- **F6/F7:** if the remaining decode steps are still compute-light, look at argmax fusion + KV pre-allocation reuse — but **only after Phase 1 is verified**, because that is where the bloom is.
+Measured decomposition (see the plan's P1b entry) and the levers, in order of
+confidence:
 
-1. Continuous batching / multi-token prefill decode.
-2. Async KV read pipeline (coalesce per-layer reads).
-3. `argmax` fusion in the decode loop.
+1. **GEMV inner loop (~70% of the token).** `bench_gemv` gives Q2_0 193 Gweights/s
+   on the big shapes against Q4_K's 240 on identical shapes *and* identical grids.
+   The GB/s gap (54 vs 135) is a mirage: Q2_0 reads half the bytes per weight.
+   The split-K/occupancy hypothesis is **refuted** — `emb_head` launches 62080
+   warps. The ~20% gap is unpack work per weight (4 weights/byte), so the fix is
+   fewer instructions per weight (a `dot()`-based unpack, a wider per-lane tile),
+   not more parallelism.
+2. **Batched/chunked prefill (the usability lever).** Needs a chunked parallel
+   scan for the 18 DeltaNet/GDN layers plus batched GEMVs for the 6 full-attention
+   layers — a large project, not a quick win. The GEMV kernel already supports
+   `m = 2..4`.
+3. **Continuous batching / multi-token decode** — note 2: the GDN recurrence is
+   what blocks batching across tokens.
+4. `argmax` fusion, KV pre-allocation reuse — small.
+
+Takeaways from the original audit, for the record:
+- **F9 (buffers):** continuous/mtp batching so the decode reads the KV in a
+  coalesced async pattern (already "in theory" for this workload; but see 2).
+- **F6/F7:** if the remaining decode steps are still compute-light, look at argmax
+  fusion + KV pre-allocation reuse.
 
 ---
 
 ## Rollback policy (no parallel systems)
 
-- If **any** phase regresses short-context below 80 tok/s, stop that phase and revert to the last green commit (the F32 decode path, which is verified at 72.20–81.82 tok/s).
+- **Gates are no-regression *ratios* under identical conditions, not absolute
+  tok/s.** The old "short-context ≥ 80 tok/s floor" is retired: on this laptop the
+  GPU is pinned to 30 W on battery (80 W on AC), boost clocks drift, and a
+  heat-soaked die reports the same binary 2x slower. A phase passes only if
+  `bench_context_cool` (cool die, clock-ramped, medians) or an interleaved
+  order-rotating A/B shows no regression, and tok/s at a fixed context does not
+  fall. Revert to the last green commit on any regression.
 - The map and tracker (`docs/wayfinder/`) are the source of truth for what is green vs. in-flight; log each gate as `PASSED / BLOCKED (reason)` with the measured numbers.
 - Do not commit a half-built representation (dependencies between `kore-nn`, `kore-vulkan`, and the `Qwen35Gpu` struct are tight but not yet verified) — finish Phase 0 first, then Phase 1.
 
