@@ -15,9 +15,11 @@ var<workgroup> sdata: array<vec4<f32>, 128>;
 var<workgroup> lut: array<vec4<f32>, 256>;
 
 // Repacked Q2_0 row layout (u32-aligned, same byte count):
-//   codes:  u32 at (j*bpr + b)   -> block b, code word j (elems 16j..16j+15)
+//   codes:  block b's 16 code bytes at word offset b*4 (elems 16b..16b+15 are
+//           bytes 0..15 of the block, i.e. word b*4 + 0..3)
 //   scales: u16 at byte bpr*16 + 2b -> u32 idx bpr*4 + b/2, half (b&1)*16
 //
+// Blocks are stored contiguously so a warp's code reads stay coalesced.
 // One warp (32 lanes) owns one output row. Per iteration the warp covers 2
 // blocks (128 contiguous elements): lane t owns elements i*128 + 4t .. +3,
 // i.e. block (2i + t/16) and code byte (t%16). x is read as a vec4 at index
@@ -91,7 +93,7 @@ fn main(
             let sw = w[row_w + bpr * 4u + (b >> 1u)];
             let h = (sw >> ((b & 1u) * 16u)) & 0xFFFFu;
             let d = fp16_to_f32(h);
-            let cb = (w[row_w + cw_j * bpr + b] >> cw_sh) & 0xFFu;
+            let cb = (w[row_w + b * 4u + cw_j] >> cw_sh) & 0xFFu;
             let lv = lut[cb];
             let xi = i * 32u + tid;
 

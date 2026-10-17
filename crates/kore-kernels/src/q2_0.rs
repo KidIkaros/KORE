@@ -100,9 +100,10 @@ pub fn q2_0_matvec(w: &[u8], m: usize, n: usize, x: &[f32]) -> Result<Tensor, Ko
 /// Repack a packed Q2_0 tensor into the GPU-friendly layout consumed by
 /// `gemv_q2_0.wgsl`. Same byte count, u32-aligned access:
 ///
-/// per row: [codes interleaved: u32 at (j*bpr + b) = block b code word j]
+/// per row: [codes: block b's 16 code bytes at byte offset b*16]
 ///          [scales: u16 at byte offset bpr*16 + 2*b]
 ///
+/// Storing the codes block-contiguously keeps a warp's code reads coalesced.
 /// `m` = in-dim (per-row elems), `n` = rows. `m` must be a multiple of 128
 /// so every row stays u32-aligned.
 pub fn repack_q2_0(src: &[u8], m: usize, n: usize) -> Result<Vec<u8>, KoreError> {
@@ -127,11 +128,9 @@ pub fn repack_q2_0(src: &[u8], m: usize, n: usize) -> Result<Vec<u8>, KoreError>
         let dst_row = &mut out[r * row_bytes..(r + 1) * row_bytes];
         for b in 0..bpr {
             let blk = &src_row[b * 18..];
-            // codes: 4 u32 words -> interleaved position (j*bpr + b)
-            for j in 0..4 {
-                let dst = (j * bpr + b) * 4;
-                dst_row[dst..dst + 4].copy_from_slice(&blk[2 + j * 4..2 + j * 4 + 4]);
-            }
+            // codes: this block's 16 code bytes, contiguous (u32-aligned)
+            let dst = b * 16;
+            dst_row[dst..dst + 16].copy_from_slice(&blk[2..18]);
             // scale u16 -> tail
             let so = codes_bytes + b * 2;
             dst_row[so..so + 2].copy_from_slice(&blk[0..2]);
@@ -186,7 +185,7 @@ mod tests {
             let sw = words[row_w + bpr * 4 + b / 2];
             let h = ((sw >> ((b & 1) * 16)) & 0xFFFF) as u16;
             let d = fp16_to_f32(h);
-            let cb = (words[row_w + cw_j * bpr + b] >> cw_sh) & 0xFF;
+            let cb = (words[row_w + b * 4 + cw_j] >> cw_sh) & 0xFF;
             for c in 0..4usize {
                 let e = 4 * t + c;
                 let code = (cb >> (2 * c)) & 3;
