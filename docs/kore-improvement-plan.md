@@ -468,6 +468,24 @@ than one kernel), then `m=4`, then the drafter and the acceptance loop, then the
 optimisations — with `bench_spec` as the per-shader instrument because it needs
 no forward to measure a kernel change.
 
+**A bigger, un-batched lead fell out of the same measurement.** At short context
+the step is ~8.8 ms (`bonsai`, marginal cost of 16→64→128 new tokens: 7.75 then
+8.79 ms), of which the isolated GEMV list is 4.62 ms — **52%**. The other 194
+dispatches (79 `had_pre`, 54 GDN, 18 Hadamard, 12 KV-quantise, 6 QK-norm/rope,
+18 KV-append, 6 attention, 1 argmax) therefore account for ~4.2 ms, i.e. ~22 µs
+each. The only one of them ever probed in isolation is `had_pre`, at 6.7 µs
+*independent* in `bench_chain` — a 3× gap that is not explained by arithmetic,
+since these ops do almost none. That is ~48% of a decode step, it needs no
+batching to improve, and it is the last lever that acts on what ships *today*.
+
+Caveat: the census reports 10.98 ms/step at ctx 5 against the 8.8 ms above, which
+is a 2.2 ms disagreement between two harnesses (the census instruments every pass
+and does not sync between steps). Resolving *that* is the first hour of the
+investigation, not a footnote — the 3× per-op gap could be part instrument and
+part dependency. But the direction is unambiguous: at 114 GB/s effective on a
+384 GB/s card, and with half the step spent on dispatches that do no arithmetic,
+this engine is not short of a bandwidth ceiling, it is short of overlap.
+
 ### 3. Small-op fusion/parallelisation (~25% of the token)
 
 ~150 latency-bound dispatches at ~4–7 µs of *exposed* latency each
