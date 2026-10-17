@@ -79,10 +79,74 @@ Result: short-context decode **41.2 → 59.4 tok/s** (median of 7; cumulative
   GPU-bound, not dispatch-bound: the win must come from doing fewer
   instructions, and the remaining lever is the ~300 small kernels, not the GEMV.
 
-**Implication:** Phase 1 (paged KV) still matters for long context, but for
-short-context tok/s the next lever is **fusing the small latency-bound
-dispatches** (e.g. rms_norm+hadamard, and epilogue folds into the GEMV), not
-further Q2_0 GEMV work.
+**Implication (superseded by the follow-up below):** Phase 1 (paged KV) still
+matters for long context, but for short-context tok/s the next lever was
+believed to be **fusing the small latency-bound dispatches** (e.g.
+rms_norm+hadamard, and epilogue folds into the GEMV), not further Q2_0 GEMV
+work. That belief was then tested and **disproved** — see the next section.
+
+### Phase 0.5 follow-up: dispatch fusion is measurably neutral
+
+The prediction above was tested directly and **did not hold**. Shipped:
+
+- **`add_rms_norm` fold** — each residual add is absorbed into the norm that
+  consumes it; the FFN's trailing add is carried forward as a *pending*
+  residual. Removes 48 dispatches/token.
+- **`hadamard_signed` rewrite** — double-buffered, 9 unrolled stages, one
+  barrier per stage, no dynamically-indexed register array (that indexing
+  spilled to local memory). Bit-identical.
+- **`had_pre.wgsl`** — a fused "pre-op + Hadamard" kernel with four modes
+  (`add+rms_norm+had`, `rms_norm+had`, `swiglu+had`, `sigmoid_mul+had`). It
+  replaces **79 dispatches/token** with 79 fused ones — the entire norm→rotate→
+  mat-vec prefix of every block, plus the head. Bit-identical to running the
+  standalone kernels in sequence (`test_vulkan_had_pre_matches_standalone_kernels`
+  asserts exact equality, not epsilon parity).
+
+Measured with the order-rotating interleaved harness (6 rounds, 80 W limit,
+AC):
+
+| build | median tok/s | min tok/s |
+|---|---|---|
+| baseline (pre-fold) | 56.77 | 56.01 |
+| + add_rms_norm fold + hadamard rewrite | 58.20 | 57.12 |
+| + `had_pre` fusion (−79 dispatches) | **58.16** | **57.14** |
+
+**The fusion is exactly neutral.** That falsifies the "~300 small dispatches
+are launch-bound" reading of the cost model: removing a dispatch while *keeping
+its work* saves nothing. A related `bench_chain` measurement agrees — removing
+a hadamard dispatch entirely (work *and* launch) is worth ~12.5 µs, but that
+12.5 µs is the kernel's own execution latency, not launch overhead. The
+per-dispatch launch cost here is ~0 because the decode loop submits 48
+dispatches per command buffer and the GPU never drains between them.
+
+So: **the decode loop is bound by the serial execution latency of its kernels,
+not by dispatch count.** Fusion is kept anyway — it is verified bit-identical,
+cuts CPU-side encoding and VRAM churn by 25%, and pays off whenever the host
+becomes the bottleneck (larger batches, weaker CPUs, MoE offload) — but it is
+not a tok/s lever and should not be budgeted as one.
+
+### Q2_0 GEMV: re-diagnosed, still ~12% headroom
+
+`bench_gemv` shows Q2_0 pinned at **56–62 GB/s on every shape** (small, mid,
+large, big-k) while Q4_K reaches 130–160 GB/s on the *same* shapes. Three
+diagnostics (patched shader, timed, reverted):
+
+| variant | emb_head time | conclusion |
+|---|---|---|
+| as shipped | 2.34 ms | — |
+| code load + 4× `i32→f32` extraction removed | 2.29 ms | **not** unpack-ALU-bound |
+| k-loop `x` load removed | 2.51 ms | **not** x-traffic-bound |
+| *all* k-loop global loads removed | 1.79 ms | 76% is instruction latency |
+| k-loop `break` removed (enable unrolling) | 2.66 ms | worse — register pressure |
+
+The right metric is **weights/s, not bytes/s**: Q2_0 achieves ~206 Gweights/s
+against Q4_K's ~231 Gweights/s on the same warp-per-row structure. A 2-bit
+kernel *should* be cheaper per weight, so the residual gap is real but small —
+consistent with the earlier "within ~15% of `mul_mat_vec_q`" finding. With all
+memory access removed the kernel still spends 1.79 ms of 2.34 ms, i.e. it is
+latency/occupancy-bound on its own dependency chain; that is a deep rewrite
+(more accumulator sets + real unrolling + occupancy work) for a ≤12% prize, so
+it stays closed.
 
 
 ---
@@ -146,12 +210,23 @@ Takeaways:
 
 ## Next decision (gated)
 
-**Where we are.** Phase 0 is PASSED and Phase 0.5's GEMV work is done: short
-context is **59.4 tok/s** (median of 7) against 33.7 for HEAD, with byte-identical
-tokens. The GEMV is now within ~15% of llama.cpp's efficiency for this shape, so
-the remaining short-context lever is the **~5.6 ms/token of ~300 small
-latency-bound dispatches**, and the remaining long-context lever is still
-Phase 1 (paged KV).
+**Where we are.** Phase 0 is PASSED. Phase 0.5's GEMV work is done *and* its
+follow-up (dispatch fusion) has now been measured and closed out as neutral:
+short context is **58.2 tok/s** (median of 6, rotating harness, AC/80 W) against
+56.8 for the pre-fusion baseline, and the `had_pre` fusion that removes 79 of
+~310 dispatches per token changes nothing. Both the GEMV and dispatch count are
+now measured dead ends for short-context tok/s.
+
+**What that leaves.** Two levers that are actually large:
+
+1. **Phase 1 (paged KV)** — the long-context bottleneck (F1–F4): decode reads
+   grow as O(seq_k), which is what takes 4096-context from ~59 to ~18.7 tok/s.
+   This is the *product* goal (run big models on small hardware), and it is a
+   structural change, not a micro-optimisation.
+2. **M2 (MoE expert offload)** — weights ≫ VRAM streamed from system RAM while
+   the GPU computes hot experts. This is the only shape that "punches above the
+   weight class" on an 8 GB card: a 27B dense ternary (M1) cannot fit, but a
+   ~30 B MoE with 2–3 B active params can run at 40–60 tok/s here.
 
 **Note on the retired gate.** The "≥ 80 tok/s" short-context floor appears
 throughout the phases below but does **not** reproduce on this machine: HEAD
@@ -160,14 +235,29 @@ be expressed as no-regression *ratios* measured under identical conditions
 (same prompt, 1 warmup + 6 timed runs, clocks recorded), because the pinned
 curve was taken under different power/thermal conditions.
 
+**Note on measurement validity.** Micro-optimisation work needs AC power. On
+battery this laptop pins the GPU to a 30 W power limit (default 80 W) and
+tok/s drifts 57 → 21 across a session; only interleaved, order-rotating A/B is
+valid then. The fusion result above was taken while charging at the 80 W limit.
+
 Proposed order:
 
-1. **Fuse the small dispatches** (short-context tok/s). Start with
-   `rms_norm` + `hadamard_signed` (they run back to back ~24x/token on the same
-   2048-vector) and fold the residual `add` into the GEMV epilogue. Target: cut
-   the ~5.6 ms non-GEMV share by a third without touching numerics.
-2. **Phase 1 (paged KV)** — the long-context bottleneck (F1–F4): decode reads
-   grow as O(seq_k), which is what takes 4096-context from ~59 to ~18.7 tok/s.
-3. **M1** (27B ternary + lean MTP graft) and **M2** (MoE expert offload) as
-   planned.
+1. **M2 (MoE expert offload)** — ahead of M1, because it is the only milestone
+   that fits the hardware and it reuses the offload/bandwidth machinery the
+   engine is being built for. Entry model: Strata Coder (IQ1_M, 29.6 GB) on the
+   32 GB RAM box.
+2. **Phase 1 (paged KV)** — parallel track; it is what makes long context and
+   offloaded-KV MoE viable, and it is the concrete fix for the 4096-context
+   collapse.
+3. **M1** (27B ternary dense) — only if a leaner representation lands; it is
+   INFEASIBLE at ~7.6 GB of weights on this 8 GB card.
+
+Closed out (do not re-open without new evidence):
+
+- **Dispatch fusion** — neutral (this section). Kept in the tree because it is
+  bit-identical and cuts CPU encoding/VRAM churn 25%, but not a tok/s lever.
+- **Q2_0 GEMV micro-optimisation** — ~206 vs Q4_K's ~231 Gweights/s; the kernel
+  spends 76% of its time with *zero* memory access, i.e. it is bound by its own
+  instruction latency/occupancy. ≤12% prize for a deep rewrite.
+
 
