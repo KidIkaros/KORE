@@ -2523,7 +2523,8 @@ impl VulkanBackend {
             &self.gemv_q2_0_pipeline,
             bytemuck::bytes_of(&uniforms),
             &[x_buf.arc_buffer(), w_buf.arc_buffer(), &out],
-            (n.div_ceil(4).max(1) as u32, m.div_ceil(4).max(1) as u32, 1),
+            // 4 sub-warps x 4 rows per warp = 16 output rows per workgroup.
+            (n.div_ceil(16).max(1) as u32, m.div_ceil(4).max(1) as u32, 1),
             "gemv_q2_0_pass",
         );
         Ok(self.make_tensor(KoreVulkanBuffer::new(out, DType::F32, vec![m, n]), &[m, n]))
