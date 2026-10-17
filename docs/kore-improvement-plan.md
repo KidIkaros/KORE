@@ -3,6 +3,22 @@
 **Artifact of:** `docs/kore-systems-audit.md` (Meadows leverage-point audit).
 **Sequencing rule:** promote what is already good (the verified 72.20+ tok/s baseline, the research), then add the missing structural pieces one at a time, with a **token-for-token regression test** before every commit.
 
+> **Current status (2026-10-17), all cold-die / interleaved A/B on the 8 GB
+> RTX 2070 Max-Q + Vulkan:**
+>
+> | | before | now |
+> |---|---|---|
+> | decode, ctx 13 | 68.4 tok/s | **112.3 tok/s** (wide Q2_0 GEMV, 1.64×) |
+> | decode, ctx 4104 | 29.9 tok/s | 65.2 tok/s (split-KV sharding, 2.18×) |
+> | decode, ctx 8200 | 19.0 tok/s | 61.9 tok/s (3.26×) |
+> | decode curve, ctx 13 → 8200 | −72% | **−9%** (flat) |
+> | prefill, 8192 tokens | 12.84 tok/s | 40.39 tok/s |
+>
+> Tokens are byte-identical to the pre-change binaries throughout. The two open
+> levers that are large are now **chunked prefill** (prefill still runs one token
+> at a time) and **MoE expert offload** (the capability goal; not verifiable on
+> this 15 GB-RAM machine). See *Next decision (gated)* at the end.
+
 ---
 
 ## Verified anchors (do not break)
@@ -38,6 +54,13 @@ Shipped in commit `0d49fe7`:
   ctx2048 21.0→25.9 tok/s (+22–30%).
 
 ## Phase 0.5 status: GEMV OPTIMISED — the remainder is ~300 small dispatches
+
+> **Partly superseded (2026-10-17).** Two claims below no longer hold: "further
+> micro-tuning here has low headroom" and "the remaining lever is the small
+> kernels, not the GEMV". The Q2_0 GEMV was reopened with a different diagnosis
+> (load-instruction bound) and rewritten for a further **1.64× end-to-end**
+> (ctx-13 decode 68.4 → 112.3 tok/s). See *Phase 2, lever 1*. The dispatch-count
+> and byte-throughput observations below remain accurate.
 
 Phase 0.5 was originally opened because `bench_gemv` showed the Q2_0 GEMV
 moving weight bytes at ~22–36 GB/s against ~287–318 GB/s for the F32 GEMV. That
@@ -125,10 +148,17 @@ cuts CPU-side encoding and VRAM churn by 25%, and pays off whenever the host
 becomes the bottleneck (larger batches, weaker CPUs, MoE offload) — but it is
 not a tok/s lever and should not be budgeted as one.
 
-### Q2_0 GEMV: re-diagnosed, still ~12% headroom
+### Q2_0 GEMV: re-diagnosed, then FIXED — load-issue bound, not latency bound
 
-`bench_gemv` shows Q2_0 pinned at **56–62 GB/s on every shape** (small, mid,
-large, big-k) while Q4_K reaches 130–160 GB/s on the *same* shapes. Three
+> **Superseded (2026-10-17).** The diagnosis below reached the right *evidence*
+> but the wrong *conclusion*, and closed a lever that was worth 1.6×. The
+> "all k-loop global loads removed → 1.79/2.34 ms" row is the tell: the kernel
+> was **load-instruction** bound (too many load *instructions* per weight), not
+> ALU bound and not latency/occupancy bound. The fix is a wider per-lane tile —
+> see *Phase 2, lever 1* for the measured result.
+
+`bench_gemv` showed Q2_0 pinned at **56–62 GB/s on every shape** (small, mid,
+large, big-k) while Q4_K reached 130–160 GB/s on the *same* shapes. Three
 diagnostics (patched shader, timed, reverted):
 
 | variant | emb_head time | conclusion |
@@ -139,14 +169,15 @@ diagnostics (patched shader, timed, reverted):
 | *all* k-loop global loads removed | 1.79 ms | 76% is instruction latency |
 | k-loop `break` removed (enable unrolling) | 2.66 ms | worse — register pressure |
 
-The right metric is **weights/s, not bytes/s**: Q2_0 achieves ~206 Gweights/s
-against Q4_K's ~231 Gweights/s on the same warp-per-row structure. A 2-bit
-kernel *should* be cheaper per weight, so the residual gap is real but small —
-consistent with the earlier "within ~15% of `mul_mat_vec_q`" finding. With all
-memory access removed the kernel still spends 1.79 ms of 2.34 ms, i.e. it is
-latency/occupancy-bound on its own dependency chain; that is a deep rewrite
-(more accumulator sets + real unrolling + occupancy work) for a ≤12% prize, so
-it stays closed.
+The right metric is **weights/s, not bytes/s**: Q2_0 achieved ~206 Gweights/s
+against Q4_K's ~231 Gweights/s on the same warp-per-row structure. That table's
+verdict — "latency/occupancy-bound on its own dependency chain, a deep rewrite
+for a ≤12% prize" — was wrong. What it actually measured was the cost of
+issuing *8 loads per 16 weights* (4 code + 4 scale) where 2 suffice; the
+"if I remove the loads nothing else costs anything" row was the proof, read as
+a dead end instead of the answer. The rewrite that fixed it is small and local
+(widen the per-lane tile from one code *byte* to one code *word*), not the
+"more accumulator sets + real unrolling" beast that was budgeted.
 
 
 ---
@@ -307,28 +338,67 @@ Takeaways from the audit:
 
 ## Phase 2 — throughput, only after Phase 1 is green — REVISED
 
-**Goal:** the measured bottleneck. Cold-die ctx-13 decode is **14.55 ms/token**, of
-which ~10–11 ms is the Q2_0 GEMVs and ~3.5–4 ms is ~150 small latency-bound
-dispatches. And **prefill is one token at a time**, so a 4096-token prompt takes
-71 s (57.8 tok/s) — the same speed as decode, which is the real usability limit.
+**Goal:** the measured bottleneck. Cold-die ctx-13 decode was **14.55 ms/token**
+at the start of Phase 2, of which ~10–11 ms is the Q2_0 GEMVs and ~3.5–4 ms is
+~150 small latency-bound dispatches. And **prefill is one token at a time**, so a
+4096-token prompt takes 71 s (57.8 tok/s) — the same speed as decode, which is
+the real usability limit.
 
 Measured decomposition (see the plan's P1b entry) and the levers, in order of
 confidence:
 
-1. **GEMV inner loop (~70% of the token).** `bench_gemv` gives Q2_0 193 Gweights/s
-   on the big shapes against Q4_K's 240 on identical shapes *and* identical grids.
-   The GB/s gap (54 vs 135) is a mirage: Q2_0 reads half the bytes per weight.
-   The split-K/occupancy hypothesis is **refuted** — `emb_head` launches 62080
-   warps. The ~20% gap is unpack work per weight (4 weights/byte), so the fix is
-   fewer instructions per weight (a `dot()`-based unpack, a wider per-lane tile),
-   not more parallelism.
-2. **Batched/chunked prefill (the usability lever).** Needs a chunked parallel
-   scan for the 18 DeltaNet/GDN layers plus batched GEMVs for the 6 full-attention
-   layers — a large project, not a quick win. The GEMV kernel already supports
-   `m = 2..4`.
-3. **Continuous batching / multi-token decode** — note 2: the GDN recurrence is
-   what blocks batching across tokens.
-4. `argmax` fusion, KV pre-allocation reuse — small.
+### 1. DONE — GEMV inner loop (~70% of the token)
+
+Rewritten to give each lane one code **word** (16 k-elements) per row instead of
+one code **byte** (4), cutting the load stream from 36 loads per 64 weights to
+12 (0.5625 → 0.1875 loads/weight) with every access still coalesced.
+
+| measurement (matched, same session) | before | after | ratio |
+|---|---|---|---|
+| ctx-13 decode, interleaved A/B, 9 rounds | 68.37 tok/s | **112.28 tok/s** | **1.64×** |
+| `emb_head` n=248320 k=2048 (509M weights) | 2.67 ms | 1.55 ms | 1.72× |
+| `big_k` n=16384 k=8192 | 0.70 ms | 0.33 ms | 2.12× |
+| `qkv` n=6144 k=2048 | 0.12 ms | 0.06 ms | 2.00× |
+| `mid` n=65536 k=2048 | 0.73 ms | 0.47 ms | 1.55× |
+| `ffn_down` n=2048 k=6144 | 0.08 ms | 0.06 ms | 1.33× |
+| F32 control (different kernel) | 0.54 ms | 0.52 ms | 1.04× (noise) |
+
+Q2_0 now runs at ~328 Gweights/s on `emb_head`, i.e. *above* Q4_K's 264. Generated
+tokens are byte-identical to the pre-change binary on two prompts, and an
+`assert_eq!` test pins `m=1` vs `m=4` bit-invariance — the strict form of the
+lossless-spec-decode requirement. A `k`/`n` sweep covers the new path.
+
+Named and rejected along the way:
+- `unpack4xU8` for the code extraction: ~8% faster on `emb_head` but produces
+  **wrong values** on this naga (≈26× off) — a backend-portability hazard, so it
+  stays out. The explicit `(cb >> 2j) & 3` form is used instead.
+- Sub-group add / warp shuffles: naga rejects `subgroupAdd`.
+
+**Remaining GEMV headroom** (if it is ever reopened): at 328 Gweights/s the kernel
+is now much closer to the unpack-ALU wall — ~5 ops per 2-bit weight, of which
+~3.5 is the mask/convert/subtract extraction. `emb_head` is still 18% of the
+token, so a further 1.3× there is worth ~1.05× end-to-end.
+
+### 2. Batched/chunked prefill (the usability lever)
+
+Needs a chunked parallel scan for the 18 DeltaNet/GDN layers plus batched GEMVs
+for the 6 full-attention layers — a large project, not a quick win. The GEMV
+kernel already supports `m = 2..4` *and* is now bit-invariant across `m`, which
+is a precondition for verifying a batched prefill against the token-at-a-time
+path.
+
+### 3. Small-op fusion/parallelisation (~25% of the token)
+
+~150 latency-bound dispatches at ~4–7 µs of *exposed* latency each
+(`bench_chain`: `rms_norm` h=6144 is 21.6 µs dependent vs 5.2 µs independent —
+the gap is single-workgroup reduction barriers, since decode has `rows = 1`).
+Independent prefill-shaped work already hides it; a decode step cannot.
+
+### 4. Continuous batching / multi-token decode
+
+Note 2: the GDN recurrence is what blocks batching across tokens.
+
+### 5. `argmax` fusion, KV pre-allocation reuse — small.
 
 Takeaways from the original audit, for the record:
 - **F9 (buffers):** continuous/mtp batching so the decode reads the KV in a
@@ -354,54 +424,62 @@ Takeaways from the original audit, for the record:
 
 ## Next decision (gated)
 
-**Where we are.** Phase 0 is PASSED. Phase 0.5's GEMV work is done *and* its
-follow-up (dispatch fusion) has now been measured and closed out as neutral:
-short context is **58.2 tok/s** (median of 6, rotating harness, AC/80 W) against
-56.8 for the pre-fusion baseline, and the `had_pre` fusion that removes 79 of
-~310 dispatches per token changes nothing. Both the GEMV and dispatch count are
-now measured dead ends for short-context tok/s.
+**Where we are.** Phase 0 PASSED. Phase 0.5's GEMV work is done, its
+dispatch-fusion follow-up is measured and closed as neutral, and the Q2_0 GEMV
+has since been **reopened and rewritten** (+1.64× end-to-end). Long context is
+fixed (Phase 1a, split-KV sharding): decode is now **flat from ctx 13 to 8200**
+(67.6 → 61.9 tok/s, +9%) instead of collapsing to 19.0.
 
-**What that leaves.** Two levers that are actually large:
+Measured short-context decode, cold die, ctx 13, interleaved A/B:
 
-1. **Phase 1 (paged KV)** — the long-context bottleneck (F1–F4): decode reads
-   grow as O(seq_k), which is what takes 4096-context from ~59 to ~18.7 tok/s.
-   This is the *product* goal (run big models on small hardware), and it is a
-   structural change, not a micro-optimisation.
-2. **M2 (MoE expert offload)** — weights ≫ VRAM streamed from system RAM while
-   the GPU computes hot experts. This is the only shape that "punches above the
-   weight class" on an 8 GB card: a 27B dense ternary (M1) cannot fit, but a
-   ~30 B MoE with 2–3 B active params can run at 40–60 tok/s here.
+| stage | tok/s |
+|---|---|
+| pre-GEMV-rewrite (2026-10-17, v1 shader) | 68.4 |
+| after the wide Q2_0 GEMV | **112.3** |
+
+**What that leaves.** Three levers, none of them micro-optimisation:
+
+1. **Small-op fusion/parallelisation (~25% of the token).** ~150 dispatches at
+   ~4–7 µs of exposed latency each, because decode has `rows = 1` and the
+   reduction kernels run one workgroup per row behind memory barriers.
+2. **Chunked/batched prefill (the usability lever).** Prefill is token-at-a-time,
+   so a 4096-token prompt costs the same 57.8 tok/s as decode. Needs a chunked
+   parallel scan for the 18 DeltaNet/GDN layers plus batched GEMVs for the 6
+   full-attention layers. The `m = 2..4` GEMV path is now bit-invariant, which is
+   the precondition for verifying a batched prefill against the scalar path.
+3. **MoE expert offload (the capability lever).** Weights ≫ VRAM streamed from
+   system RAM while the GPU computes hot experts. This is the only shape that
+   "punches above the weight class" on an 8 GB card: a 27B dense ternary (M1)
+   cannot fit, but a ~30 B MoE with 2–3 B active params can run at 40–60 tok/s.
+   **Not buildable on this machine** (15 GB RAM, no model > 1.5 GB), so it is
+   unverifiable here and belongs on a bigger box.
 
 **Note on the retired gate.** The "≥ 80 tok/s" short-context floor appears
 throughout the phases below but does **not** reproduce on this machine: HEAD
-itself measures 33.7 tok/s @ctx5. It is retired as an absolute gate — gates must
-be expressed as no-regression *ratios* measured under identical conditions
-(same prompt, 1 warmup + 6 timed runs, clocks recorded), because the pinned
-curve was taken under different power/thermal conditions.
+itself measured 33.7 tok/s @ctx5 when the gate was written. It is retired as an
+absolute gate — gates must be expressed as no-regression *ratios* measured under
+identical conditions (same prompt, warmup + timed runs, clocks recorded).
 
 **Note on measurement validity.** Micro-optimisation work needs AC power. On
-battery this laptop pins the GPU to a 30 W power limit (default 80 W) and
-tok/s drifts 57 → 21 across a session; only interleaved, order-rotating A/B is
-valid then. The fusion result above was taken while charging at the 80 W limit.
-
-Proposed order:
-
-1. **M2 (MoE expert offload)** — ahead of M1, because it is the only milestone
-   that fits the hardware and it reuses the offload/bandwidth machinery the
-   engine is being built for. Entry model: Strata Coder (IQ1_M, 29.6 GB) on the
-   32 GB RAM box.
-2. **Phase 1 (paged KV)** — parallel track; it is what makes long context and
-   offloaded-KV MoE viable, and it is the concrete fix for the 4096-context
-   collapse.
-3. **M1** (27B ternary dense) — only if a leaner representation lands; it is
-   INFEASIBLE at ~7.6 GB of weights on this 8 GB card.
+battery this laptop pins the GPU to a 30 W power limit (default 80 W) and tok/s
+drifts 57 → 21 across a session; only interleaved, order-rotating A/B is valid
+then. The GEMV A/B above was interleaved 9 rounds, alternating order, and both
+arms saw 62–77 °C and 1425–1740 MHz.
 
 Closed out (do not re-open without new evidence):
 
-- **Dispatch fusion** — neutral (this section). Kept in the tree because it is
-  bit-identical and cuts CPU encoding/VRAM churn 25%, but not a tok/s lever.
-- **Q2_0 GEMV micro-optimisation** — ~206 vs Q4_K's ~231 Gweights/s; the kernel
-  spends 76% of its time with *zero* memory access, i.e. it is bound by its own
-  instruction latency/occupancy. ≤12% prize for a deep rewrite.
+- **Dispatch fusion** — neutral. Kept in the tree because it is bit-identical and
+  cuts CPU encoding/VRAM churn 25%, but it is not a tok/s lever.
+- **Paged KV as a decode-speed fix** — the long-context collapse was too few
+  workgroups (8) in the attention kernel, fixed exactly by split-KV sharding with
+  no KV-layout change. Paged KV is now a memory-management concern only.
+- **Q2_0 GEMV split-K / occupancy** — refuted by shape data; `emb_head` launches
+  62080 warps. (The *load-issue* diagnosis replaced it and was correct.)
+
+Also closed, and worth naming because it looks like a win:
+
+- **`unpack4xU8` for the 2-bit code extraction** — ~8% faster on `emb_head` but
+  produces wrong values on this naga (≈26× off). Rejected as a correctness and
+  portability hazard; the explicit mask/shift/subtract form is used instead.
 
 
