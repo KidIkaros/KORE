@@ -7,11 +7,54 @@
 
 ## Verified anchors (do not break)
 
-| anchor | measured |
-|---|---|
-| short-context decode (≥5 tok) | ≥ 80 tok/s (dry 72.20, steady-state 79.81–81.82) — hard floor |
-| long context (4096) | ~1.8 tok/s (memory-bound, measured) — the failure to fix |
-| kore-vulkan build | currently 3 errors (Q8 path half-built) — the immediate blocker |
+> **UPDATE 2026-10-17 — the baseline anchors below were NOT reproducible.** On the
+> same card, AC power, identical harness: `HEAD` itself (F32 KV, pre-Q8) measures
+> **33.7 tok/s** at ctx 5, **28.7** at 1024, **21.0** at 2048 — not 80 / 7.3 / 3.8.
+> The machine currently thermal-throttles (GPU ~1500 MHz of 2100, ~86 °C, 50 W of
+> an 80 W limit) and `llama-server` holds ~3.2 GB RAM with swap exhausted. The
+> original 80 tok/s floor is therefore **retired as an absolute gate**; use A/B
+> ratios under identical conditions instead.
+
+| anchor | originally recorded | re-measured 2026-10-17 (HEAD) |
+|---|---|---|
+| short-context decode (ctx 5) | ≥ 80 tok/s | 33.7 tok/s |
+| long context (1024 / 2048) | 7.3 / 3.8 tok/s | 28.7 / 21.0 tok/s |
+| kore-vulkan build | 3 errors (Q8 half-built) | green (Phase 0 done) |
+
+## Phase 0 status: PASSED (2026-10-17)
+
+Shipped in commit `0d49fe7`:
+
+- Q8 (INT8) KV path: GPU per-row quantization (`quantize_q8_rows`) + packed-u32
+  append (`kv_cache_append_q8`) + fused decode (`flash_decode_gqa_q8`); no
+  per-token device→host round-trip.
+- **Correctness gate passed:** decode token-ids are byte-identical to the F32
+  reference.
+- **Found + fixed a real bug:** the repacked Q2_0 GEMV kernel was striding 8
+  blocks/iteration with only 32 lanes/row, silently skipping ¾ of every weight
+  row. Fixed to 2 blocks/iteration; GPU-vs-CPU parity test added.
+- GPU tests: 13/13 green in `kore-vulkan`.
+- A/B vs HEAD (identical conditions): ctx5 33.7→41.2, ctx1024 28.7→37.3,
+  ctx2048 21.0→25.9 tok/s (+22–30%).
+
+## Phase 0.5 status: MEASURED — Q2_0 GEMV is the dominant, inefficient cost
+
+`bench_gemv` (commit `0d49fe7`) shows the Q2_0 GEMV moving weight bytes at
+**~22–36 GB/s**, versus **~287–318 GB/s** for the F32 GEMV on the same card. A
+10× drop in byte-throughput despite reading 14× fewer bytes per weight means the
+Q2_0 kernel is **not** bandwidth-bound — the limiter is the access pattern
+(the repack interleaves code words as `j*bpr + b`, so a warp's code reads are
+scattered/broadcast rather than coalesced) and/or the per-element ALU/LUT work.
+Decode is therefore bottlenecked here, not on FLOPs or dispatch count:
+reconstructing a token from per-shape GEMV latency gives ~18 ms of Q2_0 weight
+reads per token (of ~24 ms total), with the Q2_0 LM head (`n=248320`) alone at
+**3.9 ms** (~16%).
+
+**Implication:** raising tok/s (and making M1's 27B target reachable) is gated on
+fixing the Q2_0 GEMV (coalesced code layout + drop the shared-memory LUT) and/or
+the LM head. This is the highest-leverage kernel work and should precede the
+paged-KV work in Phase 1.
+
 
 ---
 
