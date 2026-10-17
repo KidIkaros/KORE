@@ -87,7 +87,7 @@ fn main() {
         let call = |a: usize| -> Vec<f32> {
             let o = if a == 0 {
                 b.fused_attention_decode_gqa_q8(
-                    &q, &k8, &v8, &ks, &vs, HEADS, KV_HEADS, HEAD_DIM, SCALE,
+                    &q, &k8, &v8, &ks, &vs, HEADS, KV_HEADS, HEAD_DIM, SCALE, seq_k,
                 )
             } else {
                 b.fused_attention_decode_gqa_q8_split(
@@ -101,6 +101,7 @@ fn main() {
                     HEAD_DIM,
                     SCALE,
                     arm_splits(a),
+                    seq_k,
                 )
             }
             .unwrap();

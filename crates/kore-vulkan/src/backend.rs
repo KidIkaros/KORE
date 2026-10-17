@@ -2142,6 +2142,7 @@ impl VulkanBackend {
         num_kv_heads: usize,
         head_dim: usize,
         scale: f32,
+        seq_k: usize,
     ) -> Result<Tensor> {
         let q_shape = q.shape().dims();
         let k_shape = k_q8.shape().dims();
@@ -2157,8 +2158,16 @@ impl VulkanBackend {
         }
         let seq_q = q_shape[0];
         let q_dim = q_shape[1];
-        let seq_k = k_shape[0];
         let kv_dim = k_shape[1];
+        // `seq_k` may be narrowed to attend an earlier position of a cache that
+        // already holds later keys, but never widened past what is resident.
+        if seq_k == 0 || seq_k > k_shape[0] || seq_k > ks_shape[0] || seq_k > vs_shape[0] {
+            return Err(VulkanError::ShapeMismatch {
+                op: "fused_attention_decode_gqa_q8 seq_k".into(),
+                lhs: vec![seq_k],
+                rhs: k_shape.to_vec(),
+            });
+        }
 
         if q_dim != num_heads * head_dim || kv_dim != num_kv_heads * head_dim {
             return Err(VulkanError::ShapeMismatch {
@@ -2227,6 +2236,7 @@ impl VulkanBackend {
         head_dim: usize,
         scale: f32,
         n_splits: usize,
+        seq_k: usize,
     ) -> Result<Tensor> {
         let q_shape = q.shape().dims();
         let k_shape = k_q8.shape().dims();
@@ -2242,8 +2252,16 @@ impl VulkanBackend {
         }
         let seq_q = q_shape[0];
         let q_dim = q_shape[1];
-        let seq_k = k_shape[0];
         let kv_dim = k_shape[1];
+        // See the single-group kernel: `seq_k` narrows the window so a batched
+        // caller can reproduce an earlier position's shard partition exactly.
+        if seq_k == 0 || seq_k > k_shape[0] {
+            return Err(VulkanError::ShapeMismatch {
+                op: "fused_attention_decode_gqa_q8_split seq_k".into(),
+                lhs: vec![seq_k],
+                rhs: k_shape.to_vec(),
+            });
+        }
         if seq_q != 1 {
             return Err(VulkanError::UnsupportedOperation(format!(
                 "fused_attention_decode_gqa_q8_split is decode-only (seq_q == 1), got {seq_q}"
@@ -2288,16 +2306,19 @@ impl VulkanBackend {
         let vs_buf = KoreVulkanBuffer::from_storage(v_scales.storage_ref(), vs_shape, &self.device, &self.queue)?;
 
         let n_shards = num_heads * n_splits;
-        let ml_buffer = crate::buffer::alloc_storage_buffer(
+        // Both streams are scratch: they are bound directly and never wrapped in
+        // a tensor, so they must recycle through `PooledBuffer` or every call
+        // destroys and re-creates an `n_shards * head_dim` allocation.
+        let ml_buffer = crate::buffer::PooledBuffer::new(crate::buffer::alloc_storage_buffer(
             &self.device,
             n_shards * 2 * std::mem::size_of::<f32>(),
             "kore_flash_decode_gqa_q8_split_ml",
-        );
-        let acc_buffer = crate::buffer::alloc_storage_buffer(
+        ));
+        let acc_buffer = crate::buffer::PooledBuffer::new(crate::buffer::alloc_storage_buffer(
             &self.device,
             n_shards * head_dim * std::mem::size_of::<f32>(),
             "kore_flash_decode_gqa_q8_split_acc",
-        );
+        ));
         let out_buffer = crate::buffer::alloc_storage_buffer(
             &self.device,
             (q_dim * std::mem::size_of::<f32>()).max(4),
@@ -2327,8 +2348,8 @@ impl VulkanBackend {
                 v_buf.arc_buffer(),
                 ks_buf.arc_buffer(),
                 vs_buf.arc_buffer(),
-                &ml_buffer,
-                &acc_buffer,
+                ml_buffer.arc(),
+                acc_buffer.arc(),
             ],
             (num_heads as u32, n_splits as u32, 1),
             "flash_decode_gqa_q8_split_pass",
@@ -2343,7 +2364,7 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.flash_decode_gqa_q8_combine_pipeline,
             bytemuck::bytes_of(&cu),
-            &[&ml_buffer, &acc_buffer, &out_buffer],
+            &[ml_buffer.arc(), acc_buffer.arc(), &out_buffer],
             (num_heads as u32, 1, 1),
             "flash_decode_gqa_q8_combine_pass",
         );
@@ -3738,9 +3759,10 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         num_kv_heads: usize,
         head_dim: usize,
         scale: f32,
+        seq_k: usize,
     ) -> kore_core::Result<Tensor> {
         self.fused_attention_decode_gqa_q8(
-            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale,
+            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale, seq_k,
         )
         .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
@@ -3763,10 +3785,11 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         head_dim: usize,
         scale: f32,
         n_splits: usize,
+        seq_k: usize,
     ) -> kore_core::Result<Tensor> {
         self.fused_attention_decode_gqa_q8_split(
             q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale,
-            n_splits,
+            n_splits, seq_k,
         )
         .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }

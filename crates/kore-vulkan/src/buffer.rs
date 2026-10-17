@@ -108,6 +108,47 @@ pub fn reclaim_in_flight_buffers() {
     recycle(pending);
 }
 
+/// A kernel scratch buffer that hands its allocation back to the pool on drop.
+///
+/// [`alloc_storage_buffer`] returns a bare `Arc<wgpu::Buffer>`; only
+/// [`KoreVulkanBuffer`]'s `Drop` knows to park it for recycling. Scratch buffers
+/// that are bound directly and never wrapped in a tensor — the split-attention
+/// accumulator above all, which is `n_shards * head_dim * 4` bytes and grows
+/// with context — were therefore destroyed and re-created on *every* dispatch.
+/// Wrapping them in this guard costs nothing and makes them behave like every
+/// other intermediate in the step.
+pub struct PooledBuffer(Arc<wgpu::Buffer>);
+
+impl PooledBuffer {
+    pub fn new(buffer: Arc<wgpu::Buffer>) -> Self {
+        Self(buffer)
+    }
+
+    /// Borrow the underlying buffer.
+    pub fn arc(&self) -> &Arc<wgpu::Buffer> {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for PooledBuffer {
+    type Target = wgpu::Buffer;
+
+    fn deref(&self) -> &wgpu::Buffer {
+        &self.0
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.0) == 1 {
+            let mut pool = get_buffer_pool().lock();
+            if pool.pending.len() < 8192 {
+                pool.pending.push(Arc::clone(&self.0));
+            }
+        }
+    }
+}
+
 /// Wraps a GPU buffer with a KORE-compatible interface.
 #[derive(Clone, Debug)]
 pub struct KoreVulkanBuffer {

@@ -602,7 +602,7 @@ fn test_vulkan_kv_append_q8_and_decode_matches_reference() {
     let q = Tensor::from_f32(&q_data, &[seq_q, q_dim]).to(dev).unwrap();
     let actual = backend
         .fused_attention_decode_gqa_q8(
-            &q, &kc, &vc, &k_scales, &v_scales, num_heads, num_kv_heads, head_dim, scale,
+            &q, &kc, &vc, &k_scales, &v_scales, num_heads, num_kv_heads, head_dim, scale, seq_k,
         )
         .expect("fused_attention_decode_gqa_q8")
         .to(kore_core::Device::Cpu)
@@ -690,7 +690,7 @@ fn test_vulkan_split_attention_matches_single_group() {
     let q = Tensor::from_f32(&q_data, &[1, q_dim]).to(dev).unwrap();
     let single = backend
         .fused_attention_decode_gqa_q8(
-            &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale,
+            &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale, seq_k,
         )
         .expect("single-group attention")
         .to(kore_core::Device::Cpu)
@@ -701,7 +701,7 @@ fn test_vulkan_split_attention_matches_single_group() {
         let got = backend
             .fused_attention_decode_gqa_q8_split(
                 &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale,
-                n_splits,
+                n_splits, seq_k,
             )
             .expect("split attention")
             .to(kore_core::Device::Cpu)
@@ -721,6 +721,7 @@ fn test_vulkan_split_attention_matches_single_group() {
         backend
             .fused_attention_decode_gqa_q8_split(
                 &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale, 0,
+                seq_k,
             )
             .is_err(),
         "n_splits == 0 must be rejected"
@@ -732,6 +733,7 @@ fn test_vulkan_split_attention_matches_single_group() {
         backend
             .fused_attention_decode_gqa_q8_split(
                 &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, -scale, 4,
+                seq_k,
             )
             .is_err(),
         "negative scale (causal) must be rejected"
@@ -748,7 +750,7 @@ fn test_vulkan_split_attention_matches_single_group() {
     assert!(
         backend
             .fused_attention_decode_gqa_q8_split(
-                &q48, &k48, &k48, &s48, &s48, num_heads, num_kv_heads, hd48, scale, 4,
+                &q48, &k48, &k48, &s48, &s48, num_heads, num_kv_heads, hd48, scale, 4, 8,
             )
             .is_err(),
         "head_dim % 32 != 0 must be rejected"

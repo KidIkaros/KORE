@@ -1092,12 +1092,12 @@ impl Qwen35Gpu {
                         b.fused_attention_decode_gqa_q8_split(
                             &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
                             cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
-                            n_splits,
+                            n_splits, seq_k,
                         )?
                     } else {
                         b.fused_attention_decode_gqa_q8(
                             &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
-                            cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
+                            cfg.n_heads, cfg.n_kv, cfg.head_dim, scale, seq_k,
                         )?
                     };
                     // ---- end Q8 path ----------------------------------------------
@@ -1183,6 +1183,11 @@ impl Qwen35Gpu {
         let o = Tensor::zeros(&[m, cfg.ssm_inner], DType::F32)
             .to(self.device)
             .map_err(|e2| err(&format!("readout staging: {e2}")))?;
+        // Same idea for the per-column attention readouts of the full-attention
+        // layers: gathered on device so the batched gate/FFN tail can consume them.
+        let attn_staging = Tensor::zeros(&[m, cfg.n_heads * cfg.head_dim], DType::F32)
+            .to(self.device)
+            .map_err(|e2| err(&format!("attention staging: {e2}")))?;
 
         let signs_h = self.signs_t(hidden)?;
 
@@ -1273,36 +1278,51 @@ impl Qwen35Gpu {
                     )?;
                     *len += m;
 
-                    // `seq_q > 1` selects the causal-chunk path inside the kernel.
-                    // The split-KV kernel is `seq_q == 1` only, so a batch runs the
-                    // single-group kernel; a sharded multi-column variant is a
-                    // separate optimisation and not needed for correctness.
-                    let attn = if m == 1 && attn_can_shard(cfg, *len) {
-                        let n_splits = attn_shard_count(*len);
-                        b.fused_attention_decode_gqa_q8_split(
-                            &q,
-                            &kv_q8,
-                            &vv_q8,
-                            &k_scales,
-                            &v_scales,
-                            cfg.n_heads,
-                            cfg.n_kv,
-                            cfg.head_dim,
-                            scale,
-                            n_splits,
-                        )?
+                    // Attention is the one op the split-KV kernel cannot batch: it
+                    // is `seq_q == 1` only. Attending the whole batch in one call
+                    // therefore forces the single-group kernel, which is the
+                    // latency-bound one sharding exists to replace (2.2x at ctx
+                    // 4104). So each column is attended on its own, with the shard
+                    // count sequential decode would have used at that position and
+                    // `seq_k` narrowed to that position. Row r therefore performs
+                    // exactly the reduction `forward` performs at position
+                    // pos0 + r -- bit for bit, which is what lets a verify pass
+                    // accept a draft. It also reads only up to that row's own
+                    // `max_t`, whereas one batched call would read the full `seq_k`
+                    // for every row.
+                    let attn = if m == 1 {
+                        let sk = *len;
+                        if attn_can_shard(cfg, sk) {
+                            b.fused_attention_decode_gqa_q8_split(
+                                &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
+                                cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
+                                attn_shard_count(sk), sk,
+                            )?
+                        } else {
+                            b.fused_attention_decode_gqa_q8(
+                                &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
+                                cfg.n_heads, cfg.n_kv, cfg.head_dim, scale, sk,
+                            )?
+                        }
                     } else {
-                        b.fused_attention_decode_gqa_q8(
-                            &q,
-                            &kv_q8,
-                            &vv_q8,
-                            &k_scales,
-                            &v_scales,
-                            cfg.n_heads,
-                            cfg.n_kv,
-                            cfg.head_dim,
-                            scale,
-                        )?
+                        for r in 0..m {
+                            let sk = *len - m + r + 1;
+                            let qr = q.slice_rows(r, 1)?;
+                            let row = if attn_can_shard(cfg, sk) {
+                                b.fused_attention_decode_gqa_q8_split(
+                                    &qr, &kv_q8, &vv_q8, &k_scales, &v_scales,
+                                    cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
+                                    attn_shard_count(sk), sk,
+                                )?
+                            } else {
+                                b.fused_attention_decode_gqa_q8(
+                                    &qr, &kv_q8, &vv_q8, &k_scales, &v_scales,
+                                    cfg.n_heads, cfg.n_kv, cfg.head_dim, scale, sk,
+                                )?
+                            };
+                            b.scatter_row(&attn_staging, r, &row)?;
+                        }
+                        attn_staging.clone()
                     };
 
                     let (_a, _bv, ot) = b.had_pre(3, &attn, &g, signs_h, signs_h, cfg.eps)?;

@@ -331,6 +331,12 @@ pub trait DeviceBackend: Send + Sync {
     }
 
     /// Fused GQA decode attention (quantized; K/V are INT8 + per-token scales).
+    ///
+    /// `seq_k` is the number of leading keys of `k_q8` this call may attend to.
+    /// It normally equals `k_q8`'s leading extent; passing a smaller value lets a
+    /// caller attend an *earlier* position against a cache that already holds
+    /// later ones, which is how a multi-column verify pass reproduces the
+    /// key window (and therefore the reduction) of sequential decode.
     #[allow(clippy::too_many_arguments)]
     fn fused_attention_decode_gqa_q8(
         &self,
@@ -343,6 +349,7 @@ pub trait DeviceBackend: Send + Sync {
         _num_kv_heads: usize,
         _head_dim: usize,
         _scale: f32,
+        _seq_k: usize,
     ) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
             "fused_attention_decode_gqa_q8 not implemented for backend '{}'",
@@ -353,9 +360,9 @@ pub trait DeviceBackend: Send + Sync {
     /// Split-KV GQA decode attention (`seq_q == 1`).
     ///
     /// Same result as [`Self::fused_attention_decode_gqa_q8`], but the KV window
-    /// is sharded across `n_splits * num_heads` workgroups so the GPU has enough
-    /// parallel work to hide memory latency. Backends without sharding fall back
-    /// to the single-group kernel, ignoring `n_splits`.
+    /// (`seq_k` keys) is sharded across `n_splits * num_heads` workgroups so the
+    /// GPU has enough parallel work to hide memory latency. Backends without
+    /// sharding fall back to the single-group kernel, ignoring `n_splits`.
     #[allow(clippy::too_many_arguments)]
     fn fused_attention_decode_gqa_q8_split(
         &self,
@@ -369,9 +376,10 @@ pub trait DeviceBackend: Send + Sync {
         head_dim: usize,
         scale: f32,
         _n_splits: usize,
+        seq_k: usize,
     ) -> crate::Result<crate::Tensor> {
         self.fused_attention_decode_gqa_q8(
-            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale,
+            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale, seq_k,
         )
     }
 
