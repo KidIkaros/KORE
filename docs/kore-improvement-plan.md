@@ -14,10 +14,21 @@
 > | decode curve, ctx 13 → 8200 | −72% | **−9%** (flat) |
 > | prefill, 8192 tokens | 12.84 tok/s | 40.39 tok/s |
 >
-> Tokens are byte-identical to the pre-change binaries throughout. The two open
-> levers that are large are now **chunked prefill** (prefill still runs one token
-> at a time) and **MoE expert offload** (the capability goal; not verifiable on
-> this 15 GB-RAM machine). See *Next decision (gated)* at the end.
+> Tokens are byte-identical to the pre-change binaries throughout.
+>
+> The surprise lever was on the **host** side, not the GPU. A decode step was
+> creating **529 fresh wgpu storage buffers** — one per op output — because
+> `Drop` could only park a buffer (the in-progress encoder still references it)
+> and the pool was drained only in `sync()`, i.e. after the token had already
+> paid for all of them, at ~3 µs of CPU each. Handing the parked list back when
+> its submission completes (`fbcbe71`) removed all 529: an interleaved cool-die
+> A/B over 9 order-rotating rounds gave **109.83 → 112.75 tok/s** median, with
+> all 9 paired rounds favouring the pooled arm and tokens byte-identical.
+>
+> The large levers that remain are **chunked prefill** (prefill still runs one
+> token at a time), **MoE expert offload** (the capability goal; not verifiable
+> on this 15 GB-RAM machine) and the **per-block row-wide reduction in
+> `had_pre`** modes 0/1. See *Next decision (gated)* at the end.
 
 ---
 
@@ -437,11 +448,26 @@ Measured short-context decode, cold die, ctx 13, interleaved A/B:
 | pre-GEMV-rewrite (2026-10-17, v1 shader) | 68.4 |
 | after the wide Q2_0 GEMV | **112.3** |
 
-**What that leaves.** Three levers, none of them micro-optimisation:
+A later, separate interleaved A/B measured 109.8 before and **112.8** after
+per-submission buffer recycling (`fbcbe71`). Its own baseline sits a little
+below the 112.3 row because the two A/Bs ran under different thermal
+conditions — compare within a run, never across.
 
-1. **Small-op fusion/parallelisation (~25% of the token).** ~150 dispatches at
-   ~4–7 µs of exposed latency each, because decode has `rows = 1` and the
-   reduction kernels run one workgroup per row behind memory barriers.
+**What that leaves.** Three levers, none of them the *host-side* per-dispatch
+cost that the census was built to find (that turned out to be buffer creation,
+and it is now fixed):
+
+1. **The row-wide reduction inside the small ops (~20% of the token).**
+   `had_pre` is 79 dispatches/step and now the largest non-GEMV cost
+   (`bench_chain`: 20.0 µs dependent at h=2048, 31.2 µs at h=6144). Modes 0/1
+   recompute the whole-row sum of squares **in every 512-block workgroup**, so
+   the cost grows with `h` while the Hadamard part does not. Two cheaper fixes
+   were tried and **refuted by measurement** (see the closed-out list). What is
+   left is to stop computing the same row sum 4× (h=2048) or 12× (h=6144) — but
+   any restructuring that changes the summation order forfeits the
+   byte-identical-token gate, so it needs a numeric-equivalence reference first.
+   **Gate:** fewer exposed µs in `bench_chain` *and* an explicit tolerance
+   argument, not a token-id diff.
 2. **Chunked/batched prefill (the usability lever).** Prefill is token-at-a-time,
    so a 4096-token prompt costs the same 57.8 tok/s as decode. Needs a chunked
    parallel scan for the 18 DeltaNet/GDN layers plus batched GEMVs for the 6
@@ -481,5 +507,20 @@ Also closed, and worth naming because it looks like a win:
 - **`unpack4xU8` for the 2-bit code extraction** — ~8% faster on `emb_head` but
   produces wrong values on this naga (≈26× off). Rejected as a correctness and
   portability hazard; the explicit mask/shift/subtract form is used instead.
+- **`had_pre` barrier-count reduction** — refuted by A/B on `bench_chain`.
+  Replacing the 8-barrier 256→1 sum-of-squares tree with a single thread running
+  it serially (2 barriers, same pairing and order, hence bit-identical) made
+  `had_pre` mode 0 **much worse**: 25.0 → 42.3 µs dependent at h=2048 and
+  36.8 → 52.7 at h=6144. 255 dependent shared-memory reads cost far more than
+  the six drained barriers they replace. Barriers are cheap; serial
+  shared-memory chains are not. (The in-register butterfly stages h=1,2 were
+  bundled into that same revert, so their effect is unmeasured — they pair only
+  a thread's own four elements, so they are bit-exact and remain an untaken
+  micro-win.)
+- **"Per-dispatch latency is the small-op cost"** — only half right. The *only*
+  way to see it is to separate the enqueue (independent) from the dependent
+  chain in `bench_chain`; the latency of a 3-output op tracks its **output
+  buffer count** at ~3 µs each, which is host-side `create_buffer`, not the GPU.
+  That part is fixed (`fbcbe71`); what remains is genuinely inside the kernels.
 
 
