@@ -208,6 +208,32 @@ struct Q8GqaUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Q8GqaSplitUniforms {
+    seq_q: u32,
+    seq_k: u32,
+    head_dim: u32,
+    scale: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    kv_dim: u32,
+    q_dim: u32,
+    n_splits: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Q8CombineUniforms {
+    head_dim: u32,
+    n_splits: u32,
+    num_heads: u32,
+    _pad0: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct QuantQ8Uniforms {
     rows: u32,
     cols: u32,
@@ -363,6 +389,8 @@ pub struct VulkanBackend {
     kv_append_pair_pipeline: Arc<wgpu::ComputePipeline>,
     kv_cache_append_q8_pipeline: Arc<wgpu::ComputePipeline>,
     flash_decode_gqa_q8_pipeline: Arc<wgpu::ComputePipeline>,
+    flash_decode_gqa_q8_split_pipeline: Arc<wgpu::ComputePipeline>,
+    flash_decode_gqa_q8_combine_pipeline: Arc<wgpu::ComputePipeline>,
     quantize_q8_rows_pipeline: Arc<wgpu::ComputePipeline>,
     add_rms_norm_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q2_0_pipeline: Arc<wgpu::ComputePipeline>,
@@ -589,6 +617,36 @@ impl VulkanBackend {
                 label: Some("kore_flash_decode_gqa_q8_pipeline"),
                 layout: None,
                 module: &flash_decode_gqa_q8_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let flash_decode_gqa_q8_split_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_flash_decode_gqa_q8_split_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/flash_decode_gqa_q8_split.wgsl").into()),
+        });
+        let flash_decode_gqa_q8_split_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_flash_decode_gqa_q8_split_pipeline"),
+                layout: None,
+                module: &flash_decode_gqa_q8_split_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let flash_decode_gqa_q8_combine_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_flash_decode_gqa_q8_combine_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/flash_decode_gqa_q8_combine.wgsl").into()),
+        });
+        let flash_decode_gqa_q8_combine_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_flash_decode_gqa_q8_combine_pipeline"),
+                layout: None,
+                module: &flash_decode_gqa_q8_combine_shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
@@ -906,6 +964,8 @@ impl VulkanBackend {
             flash_decode_pipeline,
             flash_decode_gqa_pipeline,
             flash_decode_gqa_q8_pipeline,
+            flash_decode_gqa_q8_split_pipeline,
+            flash_decode_gqa_q8_combine_pipeline,
             rope_pipeline,
             argmax_pipeline,
             gemv_q4_k_split3_pipeline,
@@ -1991,6 +2051,153 @@ impl VulkanBackend {
             &[q_buf.arc_buffer(), k_buf.arc_buffer(), v_buf.arc_buffer(), ks_buf.arc_buffer(), vs_buf.arc_buffer(), &out_buffer],
             (num_heads as u32, seq_q as u32, 1),
             "flash_decode_gqa_q8_compute_pass",
+        );
+
+        let out_kore_buf = KoreVulkanBuffer::new(out_buffer, DType::F32, vec![seq_q, q_dim]);
+        Ok(self.make_tensor(out_kore_buf, &[seq_q, q_dim]))
+    }
+
+    /// Split-KV variant of [`Self::fused_attention_decode_gqa_q8`] for `seq_q == 1`.
+    ///
+    /// Shards the KV window across `n_splits` workgroups per head
+    /// (grid `(num_heads, n_splits, 1)`) and merges the shards in a second,
+    /// tiny pass. The single-group kernel has only `num_heads` workgroups to hide
+    /// memory latency with, which is why decode attention falls to ~1.4 GB/s at
+    /// long context; sharding gives it `num_heads * n_splits`.
+    ///
+    /// `head_dim` must be a multiple of 32 (the shard kernel's shared `Q` staging
+    /// and vectorized V accumulation require it) and `n_splits >= 1`.
+    pub fn fused_attention_decode_gqa_q8_split(
+        &self,
+        q: &Tensor,
+        k_q8: &Tensor,
+        v_q8: &Tensor,
+        k_scales: &Tensor,
+        v_scales: &Tensor,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        n_splits: usize,
+    ) -> Result<Tensor> {
+        let q_shape = q.shape().dims();
+        let k_shape = k_q8.shape().dims();
+        let v_shape = v_q8.shape().dims();
+        let ks_shape = k_scales.shape().dims();
+        let vs_shape = v_scales.shape().dims();
+        if q_shape.len() != 2 || k_shape.len() != 2 || v_shape.len() != 2
+            || ks_shape.len() != 1 || vs_shape.len() != 1
+        {
+            return Err(VulkanError::UnsupportedOperation(
+                "fused_attention_decode_gqa_q8_split requires 2D Q/K/V + 1D scale buffers".into(),
+            ));
+        }
+        let seq_q = q_shape[0];
+        let q_dim = q_shape[1];
+        let seq_k = k_shape[0];
+        let kv_dim = k_shape[1];
+        if seq_q != 1 {
+            return Err(VulkanError::UnsupportedOperation(format!(
+                "fused_attention_decode_gqa_q8_split is decode-only (seq_q == 1), got {seq_q}"
+            )));
+        }
+        if q_dim != num_heads * head_dim || kv_dim != num_kv_heads * head_dim {
+            return Err(VulkanError::ShapeMismatch {
+                op: "fused_attention_decode_gqa_q8_split".into(),
+                lhs: q_shape.to_vec(),
+                rhs: k_shape.to_vec(),
+            });
+        }
+        if head_dim == 0 || head_dim % 32 != 0 || head_dim > 256 {
+            return Err(VulkanError::UnsupportedOperation(format!(
+                "fused_attention_decode_gqa_q8_split needs head_dim % 32 == 0 and head_dim <= 256 \
+                 (shared-Q staging), got {head_dim}"
+            )));
+        }
+        if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+            return Err(VulkanError::UnsupportedOperation(format!(
+                "num_heads {num_heads} must be a multiple of num_kv_heads {num_kv_heads}"
+            )));
+        }
+        if n_splits == 0 || seq_k == 0 {
+            return Err(VulkanError::UnsupportedOperation(
+                "fused_attention_decode_gqa_q8_split needs n_splits >= 1 and seq_k >= 1".into(),
+            ));
+        }
+        // A negative `scale` is the caller's signal to apply causal masking (see
+        // the single-group kernel); the shard kernel cannot, so refuse rather
+        // than silently return unmasked attention.
+        if scale < 0.0 {
+            return Err(VulkanError::UnsupportedOperation(
+                "fused_attention_decode_gqa_q8_split does not support causal masking".into(),
+            ));
+        }
+
+        let q_buf = KoreVulkanBuffer::from_storage(q.storage_ref(), q_shape, &self.device, &self.queue)?;
+        let k_buf = KoreVulkanBuffer::from_storage(k_q8.storage_ref(), k_shape, &self.device, &self.queue)?;
+        let v_buf = KoreVulkanBuffer::from_storage(v_q8.storage_ref(), v_shape, &self.device, &self.queue)?;
+        let ks_buf = KoreVulkanBuffer::from_storage(k_scales.storage_ref(), ks_shape, &self.device, &self.queue)?;
+        let vs_buf = KoreVulkanBuffer::from_storage(v_scales.storage_ref(), vs_shape, &self.device, &self.queue)?;
+
+        let n_shards = num_heads * n_splits;
+        let ml_buffer = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            n_shards * 2 * std::mem::size_of::<f32>(),
+            "kore_flash_decode_gqa_q8_split_ml",
+        );
+        let acc_buffer = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            n_shards * head_dim * std::mem::size_of::<f32>(),
+            "kore_flash_decode_gqa_q8_split_acc",
+        );
+        let out_buffer = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (q_dim * std::mem::size_of::<f32>()).max(4),
+            "kore_flash_decode_gqa_q8_split_out",
+        );
+
+        let su = Q8GqaSplitUniforms {
+            seq_q: seq_q as u32,
+            seq_k: seq_k as u32,
+            head_dim: head_dim as u32,
+            scale,
+            num_heads: num_heads as u32,
+            num_kv_heads: num_kv_heads as u32,
+            kv_dim: kv_dim as u32,
+            q_dim: q_dim as u32,
+            n_splits: n_splits as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        self.record_dispatch(
+            &self.flash_decode_gqa_q8_split_pipeline,
+            bytemuck::bytes_of(&su),
+            &[
+                q_buf.arc_buffer(),
+                k_buf.arc_buffer(),
+                v_buf.arc_buffer(),
+                ks_buf.arc_buffer(),
+                vs_buf.arc_buffer(),
+                &ml_buffer,
+                &acc_buffer,
+            ],
+            (num_heads as u32, n_splits as u32, 1),
+            "flash_decode_gqa_q8_split_pass",
+        );
+
+        let cu = Q8CombineUniforms {
+            head_dim: head_dim as u32,
+            n_splits: n_splits as u32,
+            num_heads: num_heads as u32,
+            _pad0: 0,
+        };
+        self.record_dispatch(
+            &self.flash_decode_gqa_q8_combine_pipeline,
+            bytemuck::bytes_of(&cu),
+            &[&ml_buffer, &acc_buffer, &out_buffer],
+            (num_heads as u32, 1, 1),
+            "flash_decode_gqa_q8_combine_pass",
         );
 
         let out_kore_buf = KoreVulkanBuffer::new(out_buffer, DType::F32, vec![seq_q, q_dim]);
@@ -3331,6 +3538,27 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
     fn quantize_q8_rows(&self, x: &Tensor) -> kore_core::Result<(Tensor, Tensor)> {
         self.quantize_q8_rows(x)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fused_attention_decode_gqa_q8_split(
+        &self,
+        q: &Tensor,
+        k_q8: &Tensor,
+        v_q8: &Tensor,
+        k_scales: &Tensor,
+        v_scales: &Tensor,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        n_splits: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.fused_attention_decode_gqa_q8_split(
+            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale,
+            n_splits,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 }
 

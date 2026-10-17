@@ -31,6 +31,47 @@ fn err(msg: &str) -> KoreError {
     KoreError::StorageError(format!("qwen35: {msg}"))
 }
 
+/// Below this many cached keys the merge pass costs more than the sharding saves,
+/// so decode attention uses the single-workgroup kernel. Overridable with
+/// `KORE_ATTN_SPLIT_MIN` (set it above the context length to disable sharding).
+const ATTN_SPLIT_MIN_SEQ_K: usize = 256;
+
+fn attn_split_min_seq_k() -> usize {
+    static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("KORE_ATTN_SPLIT_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(ATTN_SPLIT_MIN_SEQ_K)
+    })
+}
+
+/// Keys per shard targeted by [`attn_shard_count`]. Swept on the RTX 2070
+/// Max-Q (see `bench_attn`): ~64 keys per shard is the flat part of the curve —
+/// below that a shard stops paying for its per-workgroup Q staging, above it the
+/// shard count (and so the merge width) grows without buying parallelism.
+const ATTN_KEYS_PER_SHARD: usize = 64;
+
+/// Number of KV shards for a decode attention of `seq_k` keys.
+///
+/// Capped at 64: the merge pass reads `n_splits * head_dim` floats per head, so
+/// an unbounded shard count would make the merge the new bottleneck, and the
+/// measured benefit flattens past ~64 anyway.
+fn attn_shard_count(seq_k: usize) -> usize {
+    seq_k.div_ceil(ATTN_KEYS_PER_SHARD).clamp(1, 64)
+}
+
+/// Whether the split-KV kernel can run this model's attention shape at this
+/// context. Sharding is only an optimisation — whenever it does not apply the
+/// caller must fall back to the single-group kernel rather than fail.
+fn attn_can_shard(cfg: &Qwen35Config, seq_k: usize) -> bool {
+    seq_k >= attn_split_min_seq_k()
+        && cfg.head_dim % 32 == 0
+        && cfg.head_dim <= 256
+        && cfg.n_kv != 0
+        && cfg.n_heads % cfg.n_kv == 0
+}
+
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
     pub n_layers: usize,
@@ -1033,10 +1074,26 @@ impl Qwen35Gpu {
                     )?;
                     *len += 1;
 
-                    let attn = b.fused_attention_decode_gqa_q8(
-                        &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
-                        cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
-                    )?;
+                    // Decode attention is O(seq_k) KV reads and, without sharding,
+                    // runs in only `n_heads` workgroups -- not enough parallel work
+                    // to hide memory latency, so it decays to ~1.4 GB/s and dominates
+                    // the long-context cliff. Shard the window across n_splits
+                    // workgroups per head once the window is big enough to pay for
+                    // the merge pass.
+                    let seq_k = *len;
+                    let attn = if attn_can_shard(cfg, seq_k) {
+                        let n_splits = attn_shard_count(seq_k);
+                        b.fused_attention_decode_gqa_q8_split(
+                            &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
+                            cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
+                            n_splits,
+                        )?
+                    } else {
+                        b.fused_attention_decode_gqa_q8(
+                            &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
+                            cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
+                        )?
+                    };
                     // ---- end Q8 path ----------------------------------------------
 
                     let (_a, _bv, ot) = b.had_pre(3, &attn, &g, self.signs_t(hidden)?, self.signs_t(hidden)?, cfg.eps)?;

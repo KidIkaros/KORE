@@ -617,6 +617,144 @@ fn test_vulkan_kv_append_q8_and_decode_matches_reference() {
     }
 }
 
+/// Split-KV attention must reproduce the single-group kernel to float rounding
+/// for any shard count, including counts that do not divide `seq_k` evenly and
+/// counts far larger than `seq_k / 8`.
+#[test]
+fn test_vulkan_split_attention_matches_single_group() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+
+    let num_heads = 4usize;
+    let num_kv_heads = 2usize;
+    let head_dim = 64usize; // the shard kernel needs head_dim % 32 == 0
+    let seq_k = 700usize; // deliberately not divisible by any shard count below
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let q_data: Vec<f32> = (0..q_dim).map(|i| (i as f32 * 0.19).sin()).collect();
+    let k_data: Vec<f32> = (0..seq_k * kv_dim)
+        .map(|i| (i as f32 * 0.23).cos() * 3.0)
+        .collect();
+    let v_data: Vec<f32> = (0..seq_k * kv_dim)
+        .map(|i| (i as f32 * 0.31).sin() * 2.0)
+        .collect();
+
+    let mut k_bytes = Vec::with_capacity(seq_k * kv_dim);
+    let mut v_bytes = Vec::with_capacity(seq_k * kv_dim);
+    let mut k_scales_host = vec![0.0f32; seq_k];
+    let mut v_scales_host = vec![0.0f32; seq_k];
+    for t in 0..seq_k {
+        let (kb, ks) = q8_quant_row(&k_data[t * kv_dim..(t + 1) * kv_dim]);
+        let (vb, vs) = q8_quant_row(&v_data[t * kv_dim..(t + 1) * kv_dim]);
+        k_bytes.extend_from_slice(&kb);
+        v_bytes.extend_from_slice(&vb);
+        k_scales_host[t] = ks;
+        v_scales_host[t] = vs;
+    }
+
+    let kc = Tensor::zeros(&[seq_k, kv_dim], kore_core::DType::U8)
+        .to(dev)
+        .unwrap();
+    let vc = Tensor::zeros(&[seq_k, kv_dim], kore_core::DType::U8)
+        .to(dev)
+        .unwrap();
+    let ks_buf = Tensor::from_f32(&k_scales_host, &[seq_k]).to(dev).unwrap();
+    let vs_buf = Tensor::from_f32(&v_scales_host, &[seq_k]).to(dev).unwrap();
+    // Separate source buffers: the append's elementwise copy reads `*_new` and
+    // writes `*_buf`, and wgpu rejects one buffer bound both read and read-write.
+    let ks_new = Tensor::from_f32(&k_scales_host, &[seq_k]).to(dev).unwrap();
+    let vs_new = Tensor::from_f32(&v_scales_host, &[seq_k]).to(dev).unwrap();
+    let k_new = Tensor::from_storage(
+        kore_core::Storage::from_bytes(kore_core::DType::U8, seq_k * kv_dim, k_bytes).unwrap(),
+        &[seq_k, kv_dim],
+    )
+    .to(dev)
+    .unwrap();
+    let v_new = Tensor::from_storage(
+        kore_core::Storage::from_bytes(kore_core::DType::U8, seq_k * kv_dim, v_bytes).unwrap(),
+        &[seq_k, kv_dim],
+    )
+    .to(dev)
+    .unwrap();
+    let (kc, vc) = backend
+        .kv_cache_append_q8(
+            &kc, &vc, &ks_buf, &vs_buf, &k_new, &v_new, &ks_new, &vs_new, 0,
+        )
+        .expect("kv_cache_append_q8");
+
+    let q = Tensor::from_f32(&q_data, &[1, q_dim]).to(dev).unwrap();
+    let single = backend
+        .fused_attention_decode_gqa_q8(
+            &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale,
+        )
+        .expect("single-group attention")
+        .to(kore_core::Device::Cpu)
+        .unwrap();
+    let want = single.as_f32_slice().unwrap();
+
+    for &n_splits in &[1usize, 3, 7, 11, 64] {
+        let got = backend
+            .fused_attention_decode_gqa_q8_split(
+                &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale,
+                n_splits,
+            )
+            .expect("split attention")
+            .to(kore_core::Device::Cpu)
+            .unwrap();
+        let g = got.as_f32_slice().unwrap();
+        assert_eq!(g.len(), want.len());
+        for (i, (a, b)) in g.iter().zip(want.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 2e-5 * (1.0 + b.abs()),
+                "n_splits={n_splits} idx {i}: split {a} vs single {b}"
+            );
+        }
+    }
+
+    // Shape/size guards must reject rather than silently compute something wrong.
+    assert!(
+        backend
+            .fused_attention_decode_gqa_q8_split(
+                &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale, 0,
+            )
+            .is_err(),
+        "n_splits == 0 must be rejected"
+    );
+    // A negative scale means "apply causal masking" in the single-group kernel;
+    // the shard kernel cannot, so it must refuse instead of returning unmasked
+    // attention.
+    assert!(
+        backend
+            .fused_attention_decode_gqa_q8_split(
+                &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, -scale, 4,
+            )
+            .is_err(),
+        "negative scale (causal) must be rejected"
+    );
+    // head_dim 48 is not a multiple of 32 (the shard kernel's staging requirement).
+    let hd48 = 48usize;
+    let q48 = Tensor::from_f32(&vec![0.0f32; num_heads * hd48], &[1, num_heads * hd48])
+        .to(dev)
+        .unwrap();
+    let k48 = Tensor::zeros(&[8, num_kv_heads * hd48], kore_core::DType::U8)
+        .to(dev)
+        .unwrap();
+    let s48 = Tensor::from_f32(&vec![1.0f32; 8], &[8]).to(dev).unwrap();
+    assert!(
+        backend
+            .fused_attention_decode_gqa_q8_split(
+                &q48, &k48, &k48, &s48, &s48, num_heads, num_kv_heads, hd48, scale, 4,
+            )
+            .is_err(),
+        "head_dim % 32 != 0 must be rejected"
+    );
+}
+
 /// GPU per-row INT8 quantization must match the exact CPU recipe:
 /// `scale = absmax/127`, `q = clamp(round(x/scale), -127, 127)`, stored `q + 128`.
 #[test]

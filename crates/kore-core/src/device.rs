@@ -321,6 +321,31 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Split-KV GQA decode attention (`seq_q == 1`).
+    ///
+    /// Same result as [`Self::fused_attention_decode_gqa_q8`], but the KV window
+    /// is sharded across `n_splits * num_heads` workgroups so the GPU has enough
+    /// parallel work to hide memory latency. Backends without sharding fall back
+    /// to the single-group kernel, ignoring `n_splits`.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_attention_decode_gqa_q8_split(
+        &self,
+        q: &crate::Tensor,
+        k_q8: &crate::Tensor,
+        v_q8: &crate::Tensor,
+        k_scales: &crate::Tensor,
+        v_scales: &crate::Tensor,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        _n_splits: usize,
+    ) -> crate::Result<crate::Tensor> {
+        self.fused_attention_decode_gqa_q8(
+            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale,
+        )
+    }
+
     /// Copy quantized INT8 K/V + per-token INT8 scales into the quantized KV cache
     /// and the parallel scale buffers.
     #[allow(clippy::too_many_arguments)]
