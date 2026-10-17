@@ -37,6 +37,8 @@ use kore_core::device::DeviceBackend;
 use kore_core::{Device, KoreError, Result, Tensor};
 use kore_kernels::q2_0::gemv_q2_0;
 
+use crate::gguf_min::MiniGguf;
+
 /// Routing configuration for one MoE layer.
 ///
 /// Mirrors the GGUF metadata real MoE checkpoints carry
@@ -83,6 +85,72 @@ impl MoeConfig {
     pub fn capacity_for(&self, hidden: usize, budget_bytes: usize) -> usize {
         let per = self.expert_bytes(hidden).max(1);
         (budget_bytes / per).clamp(1, self.n_expert)
+    }
+
+    /// Read the routing configuration out of GGUF metadata.
+    ///
+    /// Returns `None` when the expert keys are absent -- which is how a dense
+    /// layer is recognised, without the caller needing to know the architecture
+    /// in advance. Key names follow the convention every MoE GGUF in the wild
+    /// uses (`<arch>.expert_count`, `.expert_used_count`,
+    /// `.expert_feed_forward_length`, `.expert_weights_norm`).
+    ///
+    /// `expert_weights_norm` defaults to `false` when absent, matching upstream;
+    /// guessing `true` would silently rescale the router weights of a model that
+    /// genuinely does not renormalise.
+    pub fn from_gguf(gguf: &MiniGguf, arch: &str, hidden: usize) -> Result<Option<Self>> {
+        let key = |suffix: &str| format!("{arch}.{suffix}");
+        Self::from_meta(
+            hidden,
+            &|suffix| gguf.get_u64(&key(suffix)),
+            &|suffix| match gguf.get(&key(suffix)) {
+                Some(crate::gguf_min::MetaVal::Bool(b)) => Some(*b),
+                Some(v) => v.as_u64().map(|u| u != 0),
+                None => None,
+            },
+        )
+    }
+
+    /// The reading rules of `from_gguf`, over key lookups instead of a file.
+    ///
+    /// The lookups take the *suffix* (`expert_count`), not the full key; the
+    /// architecture prefix is the caller's business. This exists so the rules --
+    /// which keys are required, which default, and what "no expert keys at all"
+    /// means -- are testable without a checkpoint on disk.
+    pub fn from_meta(
+        hidden: usize,
+        get_u: &dyn Fn(&str) -> Option<u64>,
+        get_bool: &dyn Fn(&str) -> Option<bool>,
+    ) -> Result<Option<Self>> {
+        // No `expert_count` is the *normal* case for a dense checkpoint, not an
+        // error: it is the signal that this layer should use a plain FFN.
+        let Some(n_expert) = get_u("expert_count") else {
+            return Ok(None);
+        };
+        let n_expert = n_expert as usize;
+        let n_expert_used = get_u("expert_used_count").ok_or_else(|| {
+            KoreError::StorageError(
+                "moe: 'expert_count' is present but 'expert_used_count' is not".into(),
+            )
+        })? as usize;
+        let expert_ffn = get_u("expert_feed_forward_length").ok_or_else(|| {
+            KoreError::StorageError("moe: missing 'expert_feed_forward_length'".into())
+        })? as usize;
+        let norm_topk_prob = get_bool("expert_weights_norm").unwrap_or(false);
+
+        let cfg = Self {
+            n_expert,
+            n_expert_used,
+            expert_ffn,
+            norm_topk_prob,
+        };
+        cfg.validate()?;
+        if !hidden.is_multiple_of(64) {
+            return Err(KoreError::StorageError(format!(
+                "moe: hidden {hidden} is not a multiple of 64"
+            )));
+        }
+        Ok(Some(cfg))
     }
 }
 
@@ -374,6 +442,7 @@ pub struct MoeStats {
 /// the activation rotation the expert weights use, so they consume the
 /// un-rotated post-norm activation. It is small enough (`n_expert * hidden`) to
 /// run on the CPU without a device round-trip.
+#[derive(Clone)]
 pub struct RouterMat {
     pub w: Vec<f32>,
     pub n_expert: usize,
@@ -451,6 +520,142 @@ impl MoeLayer {
     pub fn resident_bytes(&self) -> usize {
         self.experts.iter().filter(|e| e.device.is_some()).count()
             * self.cfg.expert_bytes(self.hidden)
+    }
+
+    /// Build a layer from three stacked expert banks, as a GGUF stores them.
+    ///
+    /// `ffn_gate_exps.weight` / `ffn_up_exps.weight` are
+    /// `ne = [n_embd, n_ff, n_expert]` and `ffn_down_exps.weight` is
+    /// `ne = [n_ff, n_embd, n_expert]`. GGUF lists `ne[0]` first and makes it
+    /// the fastest-varying index, so putting the expert index **last** in `ne`
+    /// makes it the *outermost* dimension -- which is exactly what makes one
+    /// expert's weights a contiguous slab rather than a gather. All this
+    /// function does is cut the three banks into per-expert pieces.
+    ///
+    /// The split copies. A bank could instead be one shared allocation with each
+    /// expert holding an offset into it; that is worth doing once a real bank is
+    /// large enough to care (see the Phase 3 notes in
+    /// `docs/kore-improvement-plan.md`).
+    pub fn from_stacked(
+        cfg: MoeConfig,
+        hidden: usize,
+        router: RouterMat,
+        capacity: usize,
+        gate: &[u8],
+        up: &[u8],
+        down: &[u8],
+    ) -> Result<Self> {
+        cfg.validate()?;
+        let size_gate = cfg.expert_ffn * (hidden / 64) * 18;
+        let size_down = hidden * (cfg.expert_ffn / 64) * 18;
+        for (what, bank, size) in [
+            ("gate", gate, size_gate),
+            ("up", up, size_gate),
+            ("down", down, size_down),
+        ] {
+            let want = size * cfg.n_expert;
+            if bank.len() != want {
+                return Err(KoreError::StorageError(format!(
+                    "moe: {what} bank is {} bytes, expected {want} ({size} x {} experts)",
+                    bank.len(),
+                    cfg.n_expert
+                )));
+            }
+        }
+
+        let mut experts = Vec::with_capacity(cfg.n_expert);
+        for e in 0..cfg.n_expert {
+            let slab = |bank: &[u8], size: usize| bank[e * size..(e + 1) * size].to_vec();
+            experts.push(MoeExpert::offloaded(ExpertMats {
+                gate: HostMat::new(slab(gate, size_gate), hidden, cfg.expert_ffn)?,
+                up: HostMat::new(slab(up, size_gate), hidden, cfg.expert_ffn)?,
+                down: HostMat::new(slab(down, size_down), cfg.expert_ffn, hidden)?,
+            }));
+        }
+        Self::new(cfg, hidden, router, experts, capacity)
+    }
+
+    /// Load one MoE layer out of a GGUF, or `None` if this layer is dense.
+    ///
+    /// Reads the routing config (`<arch>.expert_count` and friends) and three
+    /// tensors: `blk.{layer}.ffn_gate_exps.weight`, `..._up_exps.weight`,
+    /// `..._down_exps.weight`, plus the router `blk.{layer}.ffn_gate_inp.weight`
+    /// (f32, `ne = [n_embd, n_expert]`, so GGUFs already store each expert's
+    /// router row contiguously).
+    ///
+    /// Everything is checked against the config rather than trusted: a tensor
+    /// whose declared dims or payload length disagree with `expert_count` is an
+    /// error, not a silent misread. Weights must be Q2_0; another quantisation
+    /// is rejected here rather than corrupted downstream.
+    pub fn from_gguf(
+        gguf: &MiniGguf,
+        arch: &str,
+        layer: usize,
+        hidden: usize,
+        capacity: usize,
+    ) -> Result<Option<Self>> {
+        let Some(cfg) = MoeConfig::from_gguf(gguf, arch, hidden)? else {
+            return Ok(None);
+        };
+        let exps = |proj: &str| format!("blk.{layer}.ffn_{proj}_exps.weight");
+
+        // gate/up are [n_embd, n_ff, n_expert]; down is [n_ff, n_embd, n_expert].
+        let check = |proj: &str, dims: &[usize], want: [usize; 3]| -> Result<()> {
+            // A single-expert layer is sometimes stored as a plain 2-D matrix.
+            let flat = cfg.n_expert == 1 && dims == &want[..2];
+            if dims != want.as_slice() && !flat {
+                return Err(KoreError::StorageError(format!(
+                    "moe: {} has dims {dims:?}, expected {want:?} for {} experts",
+                    exps(proj),
+                    cfg.n_expert
+                )));
+            }
+            Ok(())
+        };
+        for (proj, want) in [
+            ("gate", [hidden, cfg.expert_ffn, cfg.n_expert]),
+            ("up", [hidden, cfg.expert_ffn, cfg.n_expert]),
+            ("down", [cfg.expert_ffn, hidden, cfg.n_expert]),
+        ] {
+            let t = gguf.tensor(&exps(proj))?;
+            if t.type_id != kore_kernels::q2_0::Q2_0_TYPE_ID {
+                return Err(KoreError::StorageError(format!(
+                    "moe: {} is GGML type {}, only Q2_0 ({}) is supported",
+                    exps(proj),
+                    t.type_id,
+                    kore_kernels::q2_0::Q2_0_TYPE_ID
+                )));
+            }
+            check(proj, &t.dims, want)?;
+        }
+
+        let router_name = format!("blk.{layer}.ffn_gate_inp.weight");
+        let rt = gguf.tensor(&router_name)?;
+        if rt.type_id != 0 {
+            return Err(KoreError::StorageError(format!(
+                "moe: router {router_name} is GGML type {}, expected f32 (0)",
+                rt.type_id
+            )));
+        }
+        if rt.dims != [hidden, cfg.n_expert] {
+            return Err(KoreError::StorageError(format!(
+                "moe: router {router_name} has dims {:?}, expected {:?}",
+                rt.dims,
+                [hidden, cfg.n_expert]
+            )));
+        }
+        let router = RouterMat::new(gguf.tensor_f32(&router_name)?, cfg.n_expert, hidden)?;
+
+        Self::from_stacked(
+            cfg,
+            hidden,
+            router,
+            capacity,
+            gguf.tensor_bytes(&exps("gate"))?,
+            gguf.tensor_bytes(&exps("up"))?,
+            gguf.tensor_bytes(&exps("down"))?,
+        )
+        .map(Some)
     }
 
     fn promote(
@@ -980,5 +1185,221 @@ mod tests {
             "three routes through two slots must evict"
         );
         assert_eq!(layer.resident_bytes(), per * layer.cache.resident_count());
+    }
+
+    // ---- Stacked expert banks: the GGUF layout, and the byte-slicing that
+    // turns it into per-expert weights.
+
+    /// A GGUF `*_exps` bank: the per-expert matrices concatenated, expert index
+    /// outermost. Returns the bank and the per-expert pieces it must cut into.
+    fn stacked_bank(rng: &mut Lcg, m: usize, n: usize, n_expert: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut bank = Vec::new();
+        let mut per = Vec::new();
+        for _ in 0..n_expert {
+            let w: Vec<f32> = (0..m * n).map(|_| rng.next()).collect();
+            let bytes = encode_q2_0(&w, m, n);
+            bank.extend_from_slice(&bytes);
+            per.push(bytes);
+        }
+        (bank, per)
+    }
+
+    /// Build the same layer twice -- once from the stacked banks, once from the
+    /// pieces the banks are supposed to cut into -- and require the two to be
+    /// indistinguishable, byte for byte. This is what makes the offset
+    /// arithmetic safe; it is the assertion `from_gguf` relies on, minus the
+    /// file. Note the slab checks below run without a GPU: what a bank cuts into
+    /// is a pure byte-layout question.
+    #[test]
+    fn stacked_banks_cut_into_the_same_experts_as_by_hand() {
+        const HIDDEN: usize = 512;
+        let cfg = cfg();
+        let mut rng = Lcg(0x0bad_c0de_1234_5678);
+
+        let (gate, gate_per) = stacked_bank(&mut rng, HIDDEN, cfg.expert_ffn, cfg.n_expert);
+        let (up, up_per) = stacked_bank(&mut rng, HIDDEN, cfg.expert_ffn, cfg.n_expert);
+        let (down, down_per) = stacked_bank(&mut rng, cfg.expert_ffn, HIDDEN, cfg.n_expert);
+
+        let mut stacked = MoeLayer::from_stacked(
+            cfg,
+            HIDDEN,
+            selection_router(cfg.n_expert, HIDDEN),
+            2,
+            &gate,
+            &up,
+            &down,
+        )
+        .unwrap();
+
+        // Each expert holds exactly its slab, byte for byte, and nothing else.
+        for e in 0..cfg.n_expert {
+            let host = stacked.experts[e].host.as_ref().unwrap();
+            assert_eq!(host.gate.bytes, gate_per[e], "expert {e} gate slab");
+            assert_eq!(host.up.bytes, up_per[e], "expert {e} up slab");
+            assert_eq!(host.down.bytes, down_per[e], "expert {e} down slab");
+        }
+
+        // The same layer assembled by hand from the pieces must be the same
+        // layer -- including through the device kernels, not just in RAM.
+        let hand: Vec<MoeExpert> = (0..cfg.n_expert)
+            .map(|e| {
+                MoeExpert::offloaded(ExpertMats {
+                    gate: HostMat::new(gate_per[e].clone(), HIDDEN, cfg.expert_ffn).unwrap(),
+                    up: HostMat::new(up_per[e].clone(), HIDDEN, cfg.expert_ffn).unwrap(),
+                    down: HostMat::new(down_per[e].clone(), cfg.expert_ffn, HIDDEN).unwrap(),
+                })
+            })
+            .collect();
+        let mut by_hand =
+            MoeLayer::new(cfg, HIDDEN, selection_router(cfg.n_expert, HIDDEN), hand, 2).unwrap();
+
+        // A fixed route, so the same experts run on both layers without the
+        // routers having to agree.
+        let route_ids = [1usize, 3];
+        let route_w = [0.25f32, 0.75];
+        let x: Vec<f32> = (0..HIDDEN).map(|_| rng.next()).collect();
+
+        let Some((backend, device)) = vulkan() else {
+            eprintln!("skipping the device half: no Vulkan backend");
+            return;
+        };
+        let x_rot = Tensor::from_f32(&x, &[1, HIDDEN]).to(device).unwrap();
+        let a = to_vec(
+            &stacked
+                .forward_routed(backend.as_ref(), device, &route_ids, &route_w, &x_rot)
+                .unwrap(),
+        );
+        let b = to_vec(
+            &by_hand
+                .forward_routed(backend.as_ref(), device, &route_ids, &route_w, &x_rot)
+                .unwrap(),
+        );
+        assert_eq!(a, b, "stacked and by-hand experts must be the same layer");
+    }
+
+    #[test]
+    fn stacked_banks_must_be_exactly_the_right_size() {
+        const HIDDEN: usize = 512;
+        let cfg = cfg();
+        // Banks are sized per projection, not per expert: gate/up are
+        // [hidden, expert_ffn] and down is [expert_ffn, hidden].
+        let per_gate = cfg.expert_ffn * (HIDDEN / 64) * 18;
+        let per_down = HIDDEN * (cfg.expert_ffn / 64) * 18;
+        let gate = vec![0u8; per_gate * cfg.n_expert];
+        let down = vec![0u8; per_down * cfg.n_expert];
+
+        let router = selection_router(cfg.n_expert, HIDDEN);
+        assert!(
+            MoeLayer::from_stacked(cfg, HIDDEN, router.clone(), 1, &gate, &gate, &down).is_ok()
+        );
+
+        // A bank one expert short: refused, rather than read as a shorter layer.
+        // The three banks are checked independently, so a wrong count in any one
+        // of them is caught.
+        for (g, d) in [
+            (&gate[..gate.len() - per_gate], &down[..]),
+            (&gate[..], &down[..down.len() - per_down]),
+        ] {
+            let bad = MoeLayer::from_stacked(cfg, HIDDEN, router.clone(), 1, g, g, d);
+            assert!(bad.is_err(), "a short bank must be rejected");
+        }
+
+        // A bank carries no shape of its own. Gate is [hidden, expert_ffn] and
+        // down is [expert_ffn, hidden], and both hold `m*n/64` blocks -- so the
+        // *lengths* are always equal and the check above guards against
+        // truncation, not transposition. Which tensor is which is a naming
+        // question, settled by the loader reading the right name off the file,
+        // not by anything measurable in the bytes.
+        assert_eq!(per_gate, per_down);
+    }
+
+    #[test]
+    fn a_dense_layer_has_no_expert_keys() {
+        // Every lookup empty: a dense checkpoint. `None`, not an error.
+        assert_eq!(
+            MoeConfig::from_meta(512, &|_| None, &|_| None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn moe_metadata_is_read_and_missing_pieces_are_refused() {
+        let meta = |k: &str| match k {
+            "expert_count" => Some(8u64),
+            "expert_used_count" => Some(2),
+            "expert_feed_forward_length" => Some(1024),
+            _ => None,
+        };
+        // `expert_weights_norm` absent -> off, matching upstream's default.
+        let cfg = MoeConfig::from_meta(512, &meta, &|_| None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg,
+            MoeConfig {
+                n_expert: 8,
+                n_expert_used: 2,
+                expert_ffn: 1024,
+                norm_topk_prob: false,
+            }
+        );
+        // Present and true -> on.
+        let cfg = MoeConfig::from_meta(512, &meta, &|_| Some(true))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.norm_topk_prob);
+
+        // Claiming experts while omitting the rest is an error, not a guess.
+        let partial = |k: &str| (k == "expert_count").then_some(8u64);
+        assert!(MoeConfig::from_meta(512, &partial, &|_| None).is_err());
+        // And a used-count larger than the expert count cannot route.
+        let over = |k: &str| match k {
+            "expert_count" => Some(4u64),
+            "expert_used_count" => Some(9),
+            "expert_feed_forward_length" => Some(1024),
+            _ => None,
+        };
+        assert!(MoeConfig::from_meta(512, &over, &|_| None).is_err());
+    }
+
+    /// A dense checkpoint must not be mistaken for an MoE one. Run against the
+    /// real Bonsai GGUF when it is present, using the model's *own* architecture
+    /// prefix, so this is a statement about this model rather than about a
+    /// string the test picked.
+    #[test]
+    fn a_dense_gguf_reports_no_moe_layer() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let rel = "models/bonsai2-2b/Ternary-Bonsai-2-2B-Q2_0.gguf";
+        let Some(path) = [format!("{root}/../../{rel}"), rel.to_string()]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        else {
+            eprintln!("skipping: no Bonsai GGUF on disk");
+            return;
+        };
+        let gguf = crate::gguf_min::MiniGguf::load(std::path::Path::new(&path)).unwrap();
+        let arch = gguf
+            .get_str("general.architecture")
+            .expect("architecture metadata")
+            .to_string();
+        let hidden = gguf
+            .get_u64(&format!("{arch}.embedding_length"))
+            .expect("embedding_length") as usize;
+
+        // Absent expert keys -> dense, not an error.
+        assert_eq!(MoeConfig::from_gguf(&gguf, &arch, hidden).unwrap(), None);
+        assert!(MoeLayer::from_gguf(&gguf, &arch, 0, hidden, 1)
+            .unwrap()
+            .is_none());
+
+        // The layer really is an FFN, just not a stacked one: a 2-D Q2_0 gate,
+        // which is the shape an MoE loader must reject as an expert bank.
+        let gate = gguf.tensor("blk.0.ffn_gate.weight").unwrap();
+        assert_eq!(gate.dims, vec![hidden, 6144]);
+        assert_eq!(
+            gate.type_id,
+            kore_kernels::q2_0::Q2_0_TYPE_ID,
+            "Bonsai FFN weights are Q2_0, the format the MoE path consumes"
+        );
     }
 }
