@@ -42,8 +42,8 @@ fn main() {
         let mut states = gpu.new_state(max_ctx).expect("gpu state");
         let mut out = Vec::new();
         let mut next = 0u32;
-        for (i, &t) in ids.iter().enumerate() {
-            next = gpu.forward(&model, t, i, &mut states).expect("gpu fwd");
+        if !ids.is_empty() {
+            next = gpu.prefill(&model, &ids, 0, &mut states).expect("gpu prefill");
         }
         for k in 0..n_new {
             let tok_id = next;

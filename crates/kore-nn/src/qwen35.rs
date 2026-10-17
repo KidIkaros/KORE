@@ -72,6 +72,26 @@ fn attn_can_shard(cfg: &Qwen35Config, seq_k: usize) -> bool {
         && cfg.n_heads % cfg.n_kv == 0
 }
 
+/// How much of the vocabulary projection a forward pass needs.
+///
+/// The head is a `vocab x hidden` matvec and the single largest weight read in a
+/// step, but the head is not allowed to touch the recurrent state: it reads the
+/// last position's normalized hidden and nothing else. A prefill therefore only
+/// ever reads the prediction at its **last** position, and none at all for the
+/// chunks that precede it, which makes `Skip` and `Last` pure savings.
+#[derive(Clone, Copy)]
+enum Head {
+    /// Advance state only; produce no token.
+    Skip,
+    /// Project the last column only (one prefill chunk's prediction).
+    Last,
+    /// Project every column (a verify pass wants all of them).
+    Every,
+}
+
+/// Prefill chunk width: the ternary GEMV's four-column accumulator.
+const PREFILL_CHUNK: usize = 4;
+
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
     pub n_layers: usize,
@@ -1142,6 +1162,51 @@ impl Qwen35Gpu {
         pos0: usize,
         states: &mut [GpuState],
     ) -> Result<Vec<u32>> {
+        self.forward_pass(cpu, tokens, pos0, states, Head::Every)
+    }
+
+    /// Prefill: consume the whole of `prompt` and return the greedy token that
+    /// follows it.
+    ///
+    /// Runs the same pass as [`Self::forward_batch`], chunked at the GEMV's
+    /// four-column width, which amortises each weight read over four positions.
+    /// The vocabulary projection is skipped for every chunk but the last: the
+    /// head is roughly a fifth of a step's weight stream and a prefill reads the
+    /// prediction at one position, not at every one. The head does not feed the
+    /// recurrent state, so skipping it cannot change what the next step sees.
+    ///
+    /// State after the call, and the returned token, are what token-at-a-time
+    /// decode would have produced -- bit for bit, which is what `verify_m`
+    /// checks. This is a pure speed-up over feeding `forward` one token at a time.
+    pub fn prefill(
+        &self,
+        cpu: &Qwen35Model,
+        prompt: &[u32],
+        pos0: usize,
+        states: &mut [GpuState],
+    ) -> Result<u32> {
+        if prompt.is_empty() {
+            return Err(err("prefill needs at least one token"));
+        }
+        let n_chunks = prompt.len().div_ceil(PREFILL_CHUNK);
+        let mut out = Vec::new();
+        for (i, chunk) in prompt.chunks(PREFILL_CHUNK).enumerate() {
+            let head = if i + 1 == n_chunks { Head::Last } else { Head::Skip };
+            out = self.forward_pass(cpu, chunk, pos0 + i * PREFILL_CHUNK, states, head)?;
+        }
+        out.pop().ok_or_else(|| err("prefill produced no token"))
+    }
+
+    /// Shared core of [`Self::forward_batch`] and [`Self::prefill`]. `head` says
+    /// how much of the vocabulary projection the pass has to produce.
+    fn forward_pass(
+        &self,
+        cpu: &Qwen35Model,
+        tokens: &[u32],
+        pos0: usize,
+        states: &mut [GpuState],
+        head: Head,
+    ) -> Result<Vec<u32>> {
         let b = &self.backend;
         let cfg = &self.cfg;
         let m = tokens.len();
@@ -1344,7 +1409,20 @@ impl Qwen35Gpu {
             }
         }
 
+        if matches!(head, Head::Skip) {
+            // A prefill chunk that is not the last one only advances state.
+            // Running the head here would compute `m` predictions nobody reads.
+            return Ok(Vec::new());
+        }
         let (_r, _h, ht) = b.had_pre(0, &x, &pending, &self.out_norm, signs_h, cfg.eps)?;
+        // A prefill chunk needs the prediction at its last position only. The
+        // head is row-independent, so projecting that row on its own is the same
+        // arithmetic as reading it out of the full `[m, vocab]` result.
+        let ht = if matches!(head, Head::Last) {
+            ht.slice_rows(m - 1, 1)?
+        } else {
+            ht
+        };
         let logits = b.gemv_q2_0(&ht, &self.emb, cfg.vocab, self.emb_m)?;
         b.argmax_last_dim(&logits)
     }
@@ -1360,8 +1438,8 @@ impl Qwen35Gpu {
         let mut states = self.new_state(max_ctx)?;
         let mut out = Vec::with_capacity(n_new);
         let mut next = 0u32;
-        for (i, &t) in tokens.iter().enumerate() {
-            next = self.forward(cpu, t, i, &mut states)?;
+        if !tokens.is_empty() {
+            next = self.prefill(cpu, tokens, 0, &mut states)?;
         }
         for k in 0..n_new {
             let tok = next;

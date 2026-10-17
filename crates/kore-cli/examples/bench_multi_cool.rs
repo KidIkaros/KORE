@@ -96,7 +96,10 @@ fn main() {
         .unwrap_or(8);
 
     for &m in &widths {
-        assert!(chunk % m == 0, "chunk {chunk} must be a multiple of width {m}");
+        assert!(
+            chunk.is_multiple_of(m),
+            "chunk {chunk} must be a multiple of width {m}"
+        );
     }
 
     let model = Qwen35Model::from_gguf(Path::new(&gguf)).expect("load model");
@@ -126,9 +129,7 @@ fn main() {
     let mut states: Vec<Vec<GpuState>> = Vec::with_capacity(widths.len());
     for _ in &widths {
         let mut st = gpu.new_state(max_ctx).expect("gpu state");
-        for (i, &t) in prefill.iter().enumerate() {
-            gpu.forward(&model, t, i, &mut st).expect("prefill fwd");
-        }
+        gpu.prefill(&model, &prefill, 0, &mut st).expect("prefill");
         states.push(st);
     }
     let pre_s = t_pre.elapsed().as_secs_f64();
@@ -137,11 +138,7 @@ fn main() {
     let hot = gpu_temp_c();
     let t_cool = Instant::now();
     let mut cooled_to = hot;
-    loop {
-        let t = match gpu_temp_c() {
-            Some(t) => t,
-            None => break,
-        };
+    while let Some(t) = gpu_temp_c() {
         cooled_to = Some(t);
         if t <= cool_c || t_cool.elapsed().as_secs() >= cool_max_s {
             break;

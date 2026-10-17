@@ -95,6 +95,19 @@ fn main() {
         p += chunk;
     }
 
+    // ---- 2b. prefill path: one call, chunked internally at the GEMV width ----
+    // The head runs on the last chunk only, so this also pins that skipping it
+    // leaves the state exactly where sequential decode would.
+    let mut st_p = gpu.new_state(max_ctx).expect("state");
+    let p_tok = gpu.prefill(&model, &stream, 0, &mut st_p).expect("prefill");
+    if p_tok != ref_out[l - 1] {
+        eprintln!(
+            "FAIL m={m}: prefill token {p_tok} != sequential {}",
+            ref_out[l - 1]
+        );
+        std::process::exit(1);
+    }
+
     // ---- 3. state probe: one more step from each, same token, same position ----
     let probe = 42u32;
     let a = gpu
@@ -103,6 +116,9 @@ fn main() {
     let b = gpu
         .forward_batch(&model, &[probe], l, &mut st_b)
         .expect("probe batched")[0];
+    let c = gpu
+        .forward(&model, probe, l, &mut st_p)
+        .expect("probe prefill");
 
     if let Some((pos, got, want)) = mismatch {
         eprintln!("FAIL m={m}: position {pos}: batched argmax {got} != sequential {want}");
@@ -112,8 +128,12 @@ fn main() {
         eprintln!("FAIL m={m}: state probe diverged: sequential {a} vs batched {b}");
         std::process::exit(1);
     }
+    if a != c {
+        eprintln!("FAIL m={m}: prefill state probe diverged: sequential {a} vs prefill {c}");
+        std::process::exit(1);
+    }
 
     println!(
-        "OK m={m}: {l} positions bit-identical to sequential decode, state probe agrees ({a})"
+        "OK m={m}: {l} positions bit-identical to sequential decode, state probe agrees ({a}), prefill agrees"
     );
 }
