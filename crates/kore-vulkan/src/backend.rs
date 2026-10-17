@@ -54,6 +54,36 @@ fn bump_op_count(label: &'static str) {
     }
 }
 
+/// Opt-in dispatch ablation, enabled by `KORE_SKIP_OPS=label[,label...]`.
+///
+/// The census says *how many* dispatches there are; it cannot say what they
+/// cost, because this adapter exposes no GPU timestamp queries. Skipping a group
+/// and re-measuring the step is the substitute: the chain still runs end to end
+/// with the same shapes and the same dependencies (on stale data, so the output
+/// is garbage -- this is a timing probe, never a correctness one), and the wall
+/// time delta is that group's contribution to the step.
+///
+/// The special value `all` skips every dispatch, which measures the *host* side
+/// of the chain -- the model loop, buffer draws and uniform writes -- with no
+/// GPU work and no submissions at all. That is the number that says whether a
+/// step is host-bound or GPU-bound. Like the census, the list is read once and
+/// costs an `OnceLock` read per dispatch when set.
+static SKIP_OPS: OnceLock<Vec<String>> = OnceLock::new();
+
+fn skip_op(label: &'static str) -> bool {
+    let list = SKIP_OPS.get_or_init(|| {
+        std::env::var("KORE_SKIP_OPS")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    list.iter().any(|s| s == "all" || s == label)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GemmUniforms {
@@ -1048,6 +1078,11 @@ impl VulkanBackend {
         const RING_SIZE: usize = 2048;
         if op_count_enabled() {
             bump_op_count(label);
+        }
+        // Ablation probe (see `skip_op`): drop this dispatch before it costs
+        // anything, leaving the shapes and dependencies intact.
+        if skip_op(label) {
+            return;
         }
         let mut batch = self.batch.lock();
         if batch.dispatches.len() >= 48 {

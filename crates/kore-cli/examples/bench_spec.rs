@@ -48,6 +48,7 @@ fn raw_q2_0(rng: &mut u64, k: usize, n: usize) -> Vec<u8> {
 }
 
 struct Op {
+    label: String,
     w: Tensor,
     /// Output rows, and the reduction width.
     n: usize,
@@ -131,7 +132,13 @@ fn main() {
             })
             .collect();
 
-        ops.push(Op { w, n, k, xs });
+        ops.push(Op {
+            label: name.clone(),
+            w,
+            n,
+            k,
+            xs,
+        });
     }
 
     println!(
@@ -194,6 +201,66 @@ fn main() {
             med / b as f64,
             base / med,
             weight_bytes as f64 / (med / 1e3) / 1e9
+        );
+    }
+
+    // Which ops pay the bill. Grouped by tensor role -- 18 identical DeltaNet
+    // layers are one story, not 18 rows -- and sorted by contribution.
+    //
+    // The `GB/s` column is the diagnostic that matters, because it is where a
+    // kernel that cannot hide memory latency shows itself: the workgroup count
+    // is `n / 16`, so a narrow output (attention k/v at `n = 512` is 32
+    // workgroups) cannot fill a 36-SM part, and per byte moved it is slow in a
+    // way no arithmetic explains. That is the same disease the split-KV sharding
+    // cured at long context, and the same test applies here.
+    println!("\nper-op at m = 1, by contribution:");
+    println!(
+        "{:>9}  {:>7}  {:>9}  {:>7}  {:>7}  {:>7}  {}",
+        "each ms", "count", "total ms", "GB/s", "n", "wg", "role"
+    );
+    let role = |l: &str| -> String {
+        match l.strip_prefix("blk.") {
+            Some(rest) => rest
+                .split_once('.')
+                .map(|(_, r)| r)
+                .unwrap_or(rest)
+                .to_string(),
+            None => l.to_string(),
+        }
+    };
+    let mut agg: Vec<(String, usize, usize, usize, f64, usize)> = Vec::new(); // role, n, k, count, sum, one-op ms
+    for op in &ops {
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let t0 = Instant::now();
+            let mut last = None;
+            for _ in 0..40 {
+                last = Some(backend.gemv_q2_0(&op.xs[0], &op.w, op.n, op.k).unwrap());
+            }
+            let _ = last.unwrap().cpu().unwrap();
+            best = best.min(t0.elapsed().as_secs_f64() * 1e3 / 40.0);
+        }
+        let r = role(&op.label);
+        match agg
+            .iter_mut()
+            .find(|a| a.0 == r && a.1 == op.n && a.2 == op.k)
+        {
+            Some(e) => {
+                e.3 += 1;
+                e.4 += best;
+                e.5 = e.5.min(best as usize);
+            }
+            None => agg.push((r, op.n, op.k, 1, best, 0)),
+        }
+    }
+    agg.sort_by(|a, b| b.4.total_cmp(&a.4));
+    for (r, n, k, count, sum, _) in &agg {
+        let bytes = *n as f64 * (*k / 64) as f64 * 18.0;
+        let each = sum / *count as f64;
+        println!(
+            "{each:>9.3}  {count:>7}  {sum:>9.3}  {:>7.1}  {n:>7}  {:>7}  {r}",
+            bytes / (each / 1e3) / 1e9,
+            n.div_ceil(16)
         );
     }
 }
