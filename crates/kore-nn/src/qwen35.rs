@@ -973,7 +973,12 @@ impl Qwen35Gpu {
     }
 
     fn had_fwd(&self, x: &Tensor) -> Result<Tensor> {
-        self.backend.hadamard_signed(x, self.signs_t(x.numel())?, 512, 0)
+        // The signed Hadamard is per-row and the sign table covers one row, so a
+        // multi-column batch reuses the single-row table. Keying on `numel` would
+        // demand an `m * cols` table that the model does not have; keying on the
+        // row width is identical at `m = 1`.
+        let width = *x.shape().dims().last().unwrap_or(&x.numel());
+        self.backend.hadamard_signed(x, self.signs_t(width)?, 512, 0)
     }
 
     /// Shared FFN block with the *incoming* residual folded into its post-norm.
@@ -996,7 +1001,8 @@ impl Qwen35Gpu {
     ) -> Result<(Tensor, Tensor)> {
         let b = &self.backend;
         // Fused residual-add + RMSNorm + Hadamard: one dispatch instead of two.
-        let (x_r, _h, ht) = b.had_pre(0, x, res, post_norm, self.signs_t(x.numel())?, self.cfg.eps)?;
+        // The sign table is one row wide (the batch shares it across rows).
+        let (x_r, _h, ht) = b.had_pre(0, x, res, post_norm, self.signs_t(hidden)?, self.cfg.eps)?;
         let gv = b.gemv_q2_0(&ht, g, ffn, hidden)?;
         let uv = b.gemv_q2_0(&ht, u, ffn, hidden)?;
         // Fused SwiGLU + Hadamard (the second half of the FFN's activation pair).

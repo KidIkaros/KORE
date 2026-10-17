@@ -342,6 +342,13 @@ struct HadamardSignedUniforms {
     block_size: u32,
     scale: f32,
     mode: u32,
+    /// Row width. The transform and its sign pattern act on 512-blocks *within a
+    /// row*, so for an `[rows, cols]` input the sign index is row-local
+    /// (`block base % cols`). At `rows = 1` that is the identity, `base % cols == base`.
+    cols: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 #[repr(C)]
@@ -2862,8 +2869,17 @@ impl VulkanBackend {
         block_size: usize,
         mode: u32,
     ) -> Result<Tensor> {
+        let shape = x.shape().dims();
         let numel = x.numel();
-        if block_size != 512 || numel % block_size != 0 || signs.numel() < numel {
+        // The transform acts on 512-blocks *within each row*, and `signs` covers one
+        // row, so an `[rows, cols]` input applies the same sign pattern to every row.
+        // At `rows = 1` (`cols == numel`) this is the check it always was.
+        let cols = shape.last().copied().unwrap_or(numel);
+        if block_size != 512
+            || numel % block_size != 0
+            || cols % block_size != 0
+            || signs.numel() < cols
+        {
             return Err(VulkanError::ShapeMismatch {
                 op: "hadamard_signed".into(),
                 lhs: vec![numel],
@@ -2879,6 +2895,10 @@ impl VulkanBackend {
             block_size: block_size as u32,
             scale: (block_size as f32).sqrt().recip(),
             mode,
+            cols: cols as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         self.record_dispatch(
             &self.hadamard_signed_pipeline,
@@ -2951,10 +2971,12 @@ impl VulkanBackend {
                 rhs: vec![weight.numel()],
             });
         }
-        if signs.numel() < numel {
+        // `signs` covers one row; the pattern is applied to every row of an
+        // `[rows, cols]` input. At `rows = 1` this is `signs.numel() < numel`.
+        if signs.numel() < cols {
             return Err(VulkanError::ShapeMismatch {
                 op: "had_pre".into(),
-                lhs: vec![numel],
+                lhs: vec![cols],
                 rhs: vec![signs.numel()],
             });
         }

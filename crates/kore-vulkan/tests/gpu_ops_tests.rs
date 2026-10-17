@@ -910,26 +910,51 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     let ref_had3 = backend.hadamard_signed(&gated, &signs, 512, 0).expect("had3");
     assert_eq!(to_cpu(&had3), to_cpu(&ref_had3), "mode 3 hadamard differs");
 
-    // ---- multi-row: the grid is one workgroup per (row, 512-block), and each
-    // workgroup must use *its own* row's residual stream and sign table. The
-    // decode path only ever runs one row, so this covers a latent path. ----
+    // ---- multi-row: one workgroup per (row, 512-block). The sign table covers a
+    // *single* row, so every row must use the same row-local sign pattern. This is
+    // exactly the property the multi-column forward relies on. The sign table is
+    // deliberately non-periodic: the previous parity-2 table made a global
+    // `signs[bb + j]` index (row*cols + block*512 + j) coincide with the row-local
+    // one, so it could not catch a regression. With a one-row table a global index
+    // would also read out of bounds. ----
     let rows = 3usize;
     let rcols = 1024usize; // 2 blocks per row
     let n = rows * rcols;
     let ra: Vec<f32> = (0..n).map(|i| phase(i) * 1.3).collect();
     let rb: Vec<f32> = (0..n).map(|i| phase(i + 7) * 0.6).collect();
-    let rs: Vec<f32> = (0..n)
-        .map(|i| if (i * 40503usize) % 2 == 0 { -1.0 } else { 1.0 })
+    let rs: Vec<f32> = (0..rcols)
+        .map(|i| if (i * 2654435761usize) % 5 < 2 { -1.0 } else { 1.0 })
         .collect();
     let ra = Tensor::from_f32(&ra, &[rows, rcols]).to(dev).unwrap();
     let rb = Tensor::from_f32(&rb, &[rows, rcols]).to(dev).unwrap();
-    let rs = Tensor::from_f32(&rs, &[rows, rcols]).to(dev).unwrap();
+    let rs = Tensor::from_f32(&rs, &[rcols]).to(dev).unwrap();
     let rw: Vec<f32> = (0..rcols).map(|i| 0.5 + phase(i + 5) * 0.5).collect();
     let rw = Tensor::from_f32(&rw, &[rcols]).to(dev).unwrap();
 
     let (mres, mnorm, mhad) = backend
         .had_pre(0, &ra, &rb, &rw, &rs, eps)
         .expect("had_pre multi-row");
+
+    // The authoritative check: bit-identical to `rows` independent single-row calls.
+    for r in 0..rows {
+        let (sres, snorm, shad) = backend
+            .had_pre(
+                0,
+                &ra.slice_rows(r, 1).expect("slice a"),
+                &rb.slice_rows(r, 1).expect("slice b"),
+                &rw,
+                &rs,
+                eps,
+            )
+            .expect("had_pre single row");
+        let off = r * rcols;
+        let row = |t: &Tensor| to_cpu(t)[off..off + rcols].to_vec();
+        assert_eq!(row(&mres), to_cpu(&sres), "row {r} residual differs");
+        assert_eq!(row(&mnorm), to_cpu(&snorm), "row {r} normed differs");
+        assert_eq!(row(&mhad), to_cpu(&shad), "row {r} hadamard differs");
+    }
+
+    // And in agreement with the multi-row standalone kernels.
     let (rres, rnorm) = backend
         .add_rms_norm(&ra, &rb, &rw, eps)
         .expect("add_rms_norm multi-row");
@@ -939,6 +964,52 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     assert_eq!(to_cpu(&mres), to_cpu(&rres), "multi-row residual differs");
     assert_eq!(to_cpu(&mnorm), to_cpu(&rnorm), "multi-row normed differs");
     assert_eq!(to_cpu(&mhad), to_cpu(&rhad), "multi-row hadamard differs");
+}
+
+/// `hadamard_signed` on an `[rows, cols]` input must be *bit-identical* to `rows`
+/// single-row calls: the transform and its sign pattern are per-row, and `signs`
+/// is one row wide. The multi-column forward batches the DeltaNet output through
+/// this op, so a global sign index would corrupt every row past the first.
+#[test]
+fn test_vulkan_hadamard_signed_multi_row_bit_identical() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+    let (rows, cols) = (4usize, 1024usize); // 2 blocks per row
+    let phase = |i: usize| (i as f32 * 0.013).sin();
+    let x: Vec<f32> = (0..rows * cols).map(|i| phase(i) * 2.1).collect();
+    // Single-row, non-periodic sign table.
+    let signs: Vec<f32> = (0..cols)
+        .map(|i| if (i * 2246822519usize) % 7 < 3 { -1.0 } else { 1.0 })
+        .collect();
+    let x = Tensor::from_f32(&x, &[rows, cols]).to(dev).unwrap();
+    let signs = Tensor::from_f32(&signs, &[cols]).to(dev).unwrap();
+    let to_cpu = |t: &Tensor| {
+        t.to(kore_core::Device::Cpu)
+            .unwrap()
+            .as_f32_slice()
+            .unwrap()
+            .to_vec()
+    };
+
+    for mode in 0u32..2u32 {
+        let all = backend
+            .hadamard_signed(&x, &signs, 512, mode)
+            .expect("hadamard_signed multi-row");
+        for r in 0..rows {
+            let one = backend
+                .hadamard_signed(&x.slice_rows(r, 1).expect("slice"), &signs, 512, mode)
+                .expect("hadamard_signed single row");
+            let off = r * cols;
+            assert_eq!(
+                to_cpu(&all)[off..off + cols],
+                to_cpu(&one)[..],
+                "mode {mode} row {r} differs from the single-row call"
+            );
+        }
+    }
 }
 
 /// The wide Q2_0 path walks one code word (16 elements) per lane per row, so a
@@ -1140,4 +1211,117 @@ fn test_vulkan_qknorm_rope_per_row_positions_bit_identical() {
             pos0 + r
         );
     }
+}
+
+/// The multi-column forward's KV *write* gate.
+///
+/// `kv_cache_append_q8` with `num_new = m` rows at `row_offset` must be
+/// *bit-identical* to `m` single-row appends at `row_offset + r`. Both halves of
+/// the append are contiguous range copies — the packed-INT8 K/V run and the f32
+/// per-token scales (elementwise `op_type = 8`) — so this holds by construction,
+/// which is precisely why it is worth pinning: the whole multi-column design
+/// assumes it, and a future "optimization" that word-strides the copy by row, or
+/// writes per-row offsets, would break the verify pass silently and only at m > 1.
+///
+/// The K/V compare is byte-for-byte over the entire resident cache (not just the
+/// appended window) so a stray write outside `[row_offset, row_offset + m)` fails
+/// here too.
+#[test]
+fn test_vulkan_kv_cache_append_q8_multi_row_bit_identical() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+
+    let kv_dim = 32usize; // multiple of 4: packed-u32 requirement
+    let max_ctx = 16usize;
+    let rows = 3usize;
+    let row_offset = 4usize;
+
+    let k_data: Vec<f32> = (0..rows * kv_dim).map(|i| (i as f32 * 0.23).cos() * 3.0).collect();
+    let v_data: Vec<f32> = (0..rows * kv_dim).map(|i| (i as f32 * 0.31).sin() * 2.0).collect();
+    let mut k_all = Vec::new();
+    let mut v_all = Vec::new();
+    let mut k_scales = Vec::new();
+    let mut v_scales = Vec::new();
+    for t in 0..rows {
+        let (kb, ks) = q8_quant_row(&k_data[t * kv_dim..(t + 1) * kv_dim]);
+        let (vb, vs) = q8_quant_row(&v_data[t * kv_dim..(t + 1) * kv_dim]);
+        k_all.extend_from_slice(&kb);
+        v_all.extend_from_slice(&vb);
+        k_scales.push(ks);
+        v_scales.push(vs);
+    }
+
+    let u8_rows = |bytes: &[u8], n: usize| {
+        Tensor::from_storage(
+            kore_core::Storage::from_bytes(kore_core::DType::U8, bytes.len(), bytes.to_vec()).unwrap(),
+            &[n, kv_dim],
+        )
+        .to(dev)
+        .unwrap()
+    };
+
+    // A fresh full-capacity cache pair, so the whole underlying buffer is comparable.
+    let fresh = || {
+        (
+            Tensor::zeros(&[max_ctx, kv_dim], kore_core::DType::U8).to(dev).unwrap(),
+            Tensor::zeros(&[max_ctx, kv_dim], kore_core::DType::U8).to(dev).unwrap(),
+            Tensor::from_f32(&vec![0.0f32; max_ctx], &[max_ctx]).to(dev).unwrap(),
+            Tensor::from_f32(&vec![0.0f32; max_ctx], &[max_ctx]).to(dev).unwrap(),
+        )
+    };
+
+    // Arm A: one dispatch, `rows` columns at `row_offset`.
+    let (kc_a, vc_a, ks_a, vs_a) = fresh();
+    let (kv_a, vv_a) = backend
+        .kv_cache_append_q8(
+            &kc_a,
+            &vc_a,
+            &ks_a,
+            &vs_a,
+            &u8_rows(&k_all, rows),
+            &u8_rows(&v_all, rows),
+            &Tensor::from_f32(&k_scales, &[rows]).to(dev).unwrap(),
+            &Tensor::from_f32(&v_scales, &[rows]).to(dev).unwrap(),
+            row_offset,
+        )
+        .expect("batched append");
+
+    // Arm B: the same rows one at a time, each at its own offset.
+    let (kc_b, vc_b, ks_b, vs_b) = fresh();
+    let mut last: Option<(Tensor, Tensor)> = None;
+    for r in 0..rows {
+        let (kv, vv) = backend
+            .kv_cache_append_q8(
+                &kc_b,
+                &vc_b,
+                &ks_b,
+                &vs_b,
+                &u8_rows(&k_all[r * kv_dim..(r + 1) * kv_dim], 1),
+                &u8_rows(&v_all[r * kv_dim..(r + 1) * kv_dim], 1),
+                &Tensor::from_f32(&k_scales[r..r + 1], &[1]).to(dev).unwrap(),
+                &Tensor::from_f32(&v_scales[r..r + 1], &[1]).to(dev).unwrap(),
+                row_offset + r,
+            )
+            .expect("single-row append");
+        last = Some((kv, vv));
+    }
+    let (kv_b, vv_b) = last.expect("rows > 0");
+
+    // Compare raw storage bytes: U8 cache and f32 scales alike, bit for bit.
+    let raw = |t: &Tensor| t.to(kore_core::Device::Cpu).unwrap().storage_ref().as_bytes().to_vec();
+    assert_eq!(raw(&kv_a), raw(&kv_b), "K cache bytes differ: batched m={rows} vs {rows} single-row appends");
+    assert_eq!(raw(&vv_a), raw(&vv_b), "V cache bytes differ: batched m={rows} vs {rows} single-row appends");
+    assert_eq!(raw(&ks_a), raw(&ks_b), "K scales differ: batched m={rows} vs {rows} single-row appends");
+    assert_eq!(raw(&vs_a), raw(&vs_b), "V scales differ: batched m={rows} vs {rows} single-row appends");
+
+    // Non-vacuous: the appended window must actually contain the rows.
+    let kc_bytes = raw(&kv_a);
+    assert_eq!(
+        &kc_bytes[row_offset * kv_dim..(row_offset + rows) * kv_dim],
+        k_all.as_slice(),
+        "appended K window does not hold the source rows"
+    );
 }

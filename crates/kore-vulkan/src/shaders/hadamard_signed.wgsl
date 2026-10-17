@@ -3,6 +3,10 @@ struct HadamardSignedUniforms {
     block_size: u32,   // 512
     scale: f32,        // 1/sqrt(block)
     mode: u32,         // 0 = signs-then-WHT (forward), 1 = WHT-then-signs (restore)
+    cols: u32,         // row width; sign index is row-local (block base % cols)
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: HadamardSignedUniforms;
@@ -34,13 +38,16 @@ fn main(
     }
     let lx = local_id.x;
     let base = block_idx * params.block_size;
+    // Row-local sign base: the sign table covers one row, so an [rows, cols]
+    // input reuses the same pattern on every row.
+    let sbase = (base % params.cols);
 
     // load (mode 0: apply signs on the way in)
     for (var i = 0u; i < 4u; i = i + 1u) {
         let j = lx * 4u + i;
         var v = input[base + j];
         if (params.mode == 0u) {
-            v = v * signs[base + j];
+            v = v * signs[sbase + j];
         }
         buf_a[j] = v;
     }
@@ -114,7 +121,7 @@ fn main(
         let j = lx * 4u + i;
         var v = buf_b[j] * params.scale;
         if (params.mode == 1u) {
-            v = v * signs[base + j];
+            v = v * signs[sbase + j];
         }
         output[base + j] = v;
     }

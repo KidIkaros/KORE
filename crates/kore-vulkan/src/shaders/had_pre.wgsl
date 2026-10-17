@@ -125,7 +125,10 @@ fn main(
         } else {
             v = a[bb + j] / (1.0 + exp(-b[bb + j]));
         }
-        buf_a[j] = v * signs[bb + j];
+        // The sign pattern covers one row (same width as `weight`), so it is
+        // indexed row-locally: `cidx + i` equals `blk * 512 + j`, not `bb + j`.
+        // At rows = 1 the two expressions are identical.
+        buf_a[j] = v * signs[cidx + i];
     }
     workgroupBarrier();
 
