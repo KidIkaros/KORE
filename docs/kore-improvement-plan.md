@@ -401,6 +401,73 @@ kernel already supports `m = 2..4` *and* is now bit-invariant across `m`, which
 is a precondition for verifying a batched prefill against the token-at-a-time
 path.
 
+#### 2b. What a verify pass costs — MEASURED, and the premise was wrong
+
+Speculative decoding (prompt-lookup, i.e. n-gram drafts from the prompt itself)
+was chosen as the next lever. It rests on one assumption: that verifying `k+1`
+columns costs about what verifying one costs, because `gemv_q2_0` reads each
+weight block once for all rows — the workgroup count is `(n/16, ceil(m/4))`, the
+same at `m = 1` and `m = 4`. So decode is assumed bandwidth-bound and batching
+assumed to be nearly free.
+
+`bench_spec` (commit `6483abf`) walks the real GEMV op list of one Bonsai-2
+decode step — 151 ops, 504 MiB of packed weights, shapes read from the
+checkpoint — and times it at several batch sizes, interleaved, median of 8,
+because a sweep charges the die's clock drift to whichever size went last:
+
+| batch | step ms | per-token | vs `m=1` | eff GB/s |
+|---|---|---|---|---|
+| 1 | 4.619 | 4.619 | 1.00× | 114.5 |
+| 2 | 7.421 | 3.710 | 1.245× | 71.3 |
+| 4 | 12.975 | 3.244 | **1.424×** | 40.8 |
+
+Two things follow. 114 GB/s effective against a ~384 GB/s card means the kernel
+is **not** stream-bound, so the weight read is not what batching pays for. And
+each extra row costs ~0.6 of a fresh one, which fits the two-term model the
+shader's own header already records (58% of the `m=1` cost on the load side, 12
+loads per 64 weights of which 4 scale with `m`): `0.58·(8+4m)/12 + 0.42·m` gives
+2.84× at `m=4` against 2.81× measured. The rows cost what that model predicts.
+
+So the ceiling on the GEMV half of a 3-draft verify is **~1.4× per token, not
+~4×** — and the honest caveat is that this is the GEMV half in isolation: the
+other 194 dispatches (6.4 ms of the census's 10.98 ms at ctx 5) are per-*step*
+overhead as much as per-*token* work, and per-step overhead amortises over rows
+for free, which pushes the true step-level ceiling *above* 1.4×. Only a
+multi-column forward can measure it.
+
+**The actionable finding is the other term.** The `0.42·m` is per-column
+*arithmetic*, not per-column traffic, and it is not irreducible: `dot_wide`
+recomputes `byte_deltas(ww, j)` for every column, although for a given row the
+code word — and so its deltas — is identical across columns. Hoisting it out of
+the column loop is pure common-subexpression elimination: same arithmetic, same
+summation order, therefore **bit-identical, including at `m=1` where nothing
+changes**. On the measured split it turns 64 delta computations per
+k-iteration at `m=4` into 16 (~1.4× → ~3× per token). It is *not* done here
+because it changes nothing that ships today, and because holding 16 partial
+`vec4`s to preserve the summation order is a real register-pressure risk in a
+kernel that is already hand-tuned — worth doing when a verify pass exists to
+measure it against, not before.
+
+**What this means for the lever.** Prompt-lookup spec decode is not blocked on
+its own logic; it is blocked on a **multi-column forward**, and that is the same
+machinery as chunked prefill:
+
+| piece | needs |
+|---|---|
+| `gemv_q2_0` | `m ≤ 4` ✓ already batch-invariant |
+| `had_pre`, `hadamard_signed` | multi-row variants |
+| `qknorm_rope` | takes `pos` as a scalar → per-row positions |
+| `flash_decode_gqa_q8` | `m` queries against one KV state |
+| `gdn_gates`/`gdn_conv`/`gdn_step` | an `m`-step loop inside one dispatch (the recurrence is sequential per token and does not parallelise, but its *weight* traffic amortises) |
+| `kv_cache_append_q8`, `quantize_q8_rows`, `argmax` | `m` rows |
+| `GpuState` | snapshot/restore, because a rejected draft must roll the KV cache and the scan state back to the accepted prefix |
+
+Build order that keeps every step verifiable: get `m=2` bit-identical to two
+`m=1` steps first (the batch-invariance gate, now over the *whole* forward rather
+than one kernel), then `m=4`, then the drafter and the acceptance loop, then the
+optimisations — with `bench_spec` as the per-shader instrument because it needs
+no forward to measure a kernel change.
+
 ### 3. Small-op fusion/parallelisation (~25% of the token)
 
 ~150 latency-bound dispatches at ~4–7 µs of *exposed* latency each
