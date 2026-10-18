@@ -570,17 +570,63 @@ fn gemv_bytes_f32(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> R
     if w.len() < need {
         return Err(err(&format!("f32 gemv: {} bytes < {need}", w.len())));
     }
-    // Several rows at a time. Each row keeps one sequential accumulator, so
-    // every row's sum is the same sequence of adds as the naive loop -- what
-    // changes is that the lanes' add chains overlap, which is the difference
-    // between one MAC per four cycles (f32 add latency) and eight. Eight is
-    // past the point where the loop is latency-bound and into memory:
-    // measured 246 us at four lanes, 212 us at eight, on a 2048x256 matrix.
+    if n * m >= PAR_MIN_ELEMS {
+        use rayon::prelude::*;
+        // Rows are independent and a row's sum is one sequential chain, so
+        // *which* thread computes a row cannot enter its arithmetic. Blocking
+        // the rows is a scheduling change, not a reassociation -- which is the
+        // only reason this is allowed to touch the router, whose output is a
+        // discrete top-k and not a number that could be averaged over.
+        let rows_per = n.div_ceil(parallel_row_blocks()).max(8);
+        out.par_chunks_mut(rows_per)
+            .enumerate()
+            .for_each(|(b, o)| f32_gemv_rows(w, m, x, b * rows_per, o));
+        return Ok(());
+    }
+    f32_gemv_rows(w, m, x, 0, out);
+    Ok(())
+}
+
+/// How many row blocks to cut an unpacked matrix into.
+///
+/// The region is flat from 4 blocks to 48 (measured in situ on the router:
+/// 62.5, 62.6, 67.8, 68.3, 66.4 ms per 8 tokens at 4/8/12/24/48, against 79.9
+/// serial), so this is sized to *stop* adding threads once the work per block
+/// stops paying for the fork/join and the parked-thread wake-up -- the block
+/// count is not where the remaining time is. `KORE_GEMV_BLOCKS` overrides it,
+/// which is how the serial path is reached for an A/B (`1`).
+fn parallel_row_blocks() -> usize {
+    let blocks = std::env::var("KORE_GEMV_BLOCKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    if blocks > 0 {
+        return blocks;
+    }
+    (rayon::current_num_threads() / 3).clamp(2, 8)
+}
+
+/// Below this many weights the unpacked matvecs run serially: a fork/join costs
+/// more than the work, and the shapes that reach here are a router (2048x256) or
+/// an untied output projection, both far above it.
+const PAR_MIN_ELEMS: usize = 1 << 15;
+
+/// `out[j - start] = dot(W row j, x)` for rows `[start, start + out.len())`.
+///
+/// Several rows at a time. Each row keeps one sequential accumulator, so every
+/// row's sum is the same sequence of adds as the naive loop -- what changes is
+/// that the lanes' add chains overlap, which is the difference between one MAC
+/// per four cycles (f32 add latency) and eight. Eight is past the point where
+/// the loop is latency-bound and into memory: measured 246 us at four lanes,
+/// 212 us at eight, on a 2048x256 matrix -- and 12 GB/s, i.e. one core's worth
+/// of memory bandwidth, which is what the row blocking above is for.
+fn f32_gemv_rows(w: &[u8], m: usize, x: &[f32], start: usize, out: &mut [f32]) {
     const R: usize = 8;
     let rb = m * 4;
     let x = &x[..m];
-    let mut j = 0usize;
-    while j + R <= n {
+    let end = start + out.len();
+    let mut j = start;
+    while j + R <= end {
         let mut lanes: [std::slice::ChunksExact<'_, u8>; R] =
             std::array::from_fn(|r| w[(j + r) * rb..(j + r + 1) * rb].chunks_exact(4));
         let mut acc = [0.0f32; R];
@@ -590,18 +636,21 @@ fn gemv_bytes_f32(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> R
                 acc[r] += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xi;
             }
         }
-        out[j..j + R].copy_from_slice(&acc);
+        out[j - start..j - start + R].copy_from_slice(&acc);
         j += R;
     }
-    for (jj, o) in out.iter_mut().enumerate().skip(j).take(n - j) {
-        let row = &w[jj * rb..(jj + 1) * rb];
+    for (idx, o) in out.iter_mut().enumerate() {
+        let row = start + idx;
+        if row < j {
+            continue;
+        }
+        let rw = &w[row * rb..(row + 1) * rb];
         let mut acc = 0.0f32;
-        for (c, &xi) in row.chunks_exact(4).zip(x) {
+        for (c, &xi) in rw.chunks_exact(4).zip(x) {
             acc += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xi;
         }
         *o = acc;
     }
-    Ok(())
 }
 
 /// `out[j] = dot(W row j, x)` for an unpacked f16 matrix.
@@ -1743,6 +1792,15 @@ struct GpuMoe {
     /// Whether the batched expert path may run (every expert uses a K-quant the
     /// concatenation trick is valid for).
     can_batch: bool,
+    /// The routing state a *prefetcher* would have to work from: this layer's
+    /// picks on the previous token, plus how well they would have covered this
+    /// token's misses.
+    ///
+    /// Prefetch is the only lever left on the upload region (see the plan), and
+    /// its whole value depends on routing locality. This measures that directly
+    /// rather than inferring it from the LRU's hit rate, which reflects a
+    /// *policy* (recency over the last 32) rather than a *predictor*.
+    prefetch: Mutex<PrefetchStats>,
     /// Host-side wall clock accumulated by the routed FFN, split by region.
     ///
     /// Only the *host* half of each region shows up here: a `gemv` costs one
@@ -1752,6 +1810,24 @@ struct GpuMoe {
     /// Read together they answer the question this exists for: how much of a
     /// step is host encoding, how much is waiting, and how much is bytes.
     times: Mutex<MoeTimes>,
+}
+
+/// How well the previous token's routing at the same layer predicts this one's.
+#[derive(Default, Clone)]
+pub struct PrefetchStats {
+    /// This layer's picks on the previous token.
+    pub prev: Vec<usize>,
+    /// Steps observed (one per layer per token).
+    pub steps: u64,
+    /// Experts this token picked at all, summed over steps.
+    pub picks: u64,
+    /// Of those, how many were also picked on the previous token.
+    pub overlap: u64,
+    /// Experts that were *not* resident, i.e. the uploads the region pays for.
+    pub misses: u64,
+    /// Of those misses, how many the previous token's set would have named, and
+    /// so could have been uploaded early instead of on the critical path.
+    pub covered: u64,
 }
 
 /// Microseconds per region of one routed FFN, summed since construction.
@@ -1947,6 +2023,11 @@ impl DeviceBank {
             .1)
     }
 
+    /// Whether expert `e` is resident and would be a hit rather than a miss.
+    fn resident(&self, e: usize) -> bool {
+        self.slot_holding(e).is_some()
+    }
+
     fn slot_holding(&self, e: usize) -> Option<usize> {
         self.slots
             .iter()
@@ -2114,6 +2195,7 @@ impl Qwen35Gpu {
                         ffn_cols: m.gate.m,
                         ffn_bytes: m.gate.byte_len(),
                         can_batch,
+                        prefetch: Mutex::new(PrefetchStats::default()),
                         times: Mutex::new(MoeTimes::default()),
                     }))
                 }
@@ -2285,7 +2367,36 @@ impl Qwen35Gpu {
         total
     }
 
+    /// How well the previous token's routing predicts this one's, over layers.
+    ///
+    /// `covered / misses` is the fraction of uploads a perfect prefetcher drawn
+    /// from the previous token could have moved off the critical path; only the
+    /// counters are summed, the per-layer `prev` sets are left alone.
+    pub fn prefetch_stats(&self) -> PrefetchStats {
+        let mut total = PrefetchStats::default();
+        for layer in &self.layers {
+            let ffn = match layer {
+                GpuLayer::Delta(l) => &l.ffn,
+                GpuLayer::Full(l) => &l.ffn,
+            };
+            if let GpuFfn::Moe(m) = ffn {
+                let p = m.prefetch.lock().expect("prefetch stats").clone();
+                total.steps += p.steps;
+                total.picks += p.picks;
+                total.overlap += p.overlap;
+                total.misses += p.misses;
+                total.covered += p.covered;
+            }
+        }
+        total
+    }
+
     /// Zero the [`MoeTimes`] counters, e.g. after a warmup token.
+    ///
+    /// The prefetch counters reset with them (they are the same "decode steps
+    /// only" statistic), but the per-layer `prev` sets deliberately do **not**:
+    /// the last prompt token is the correct predictor for the first generated
+    /// one, so clearing it would throw away a real observation.
     pub fn reset_moe_times(&self) {
         for layer in &self.layers {
             let ffn = match layer {
@@ -2294,6 +2405,12 @@ impl Qwen35Gpu {
             };
             if let GpuFfn::Moe(m) = ffn {
                 *m.times.lock().expect("moe profile") = MoeTimes::default();
+                let mut p = m.prefetch.lock().expect("prefetch stats");
+                p.steps = 0;
+                p.picks = 0;
+                p.overlap = 0;
+                p.misses = 0;
+                p.covered = 0;
             }
         }
     }
@@ -2421,6 +2538,27 @@ impl Qwen35Gpu {
             for p in &mut picks {
                 p.0 = forced.min(m.n_experts.saturating_sub(1));
             }
+        }
+
+        if std::env::var_os("KORE_MOE_PROFILE").is_some() {
+            // Locality probe. `prev` is last token's pick set at this layer --
+            // the only thing a prefetcher can know before the router runs.
+            let mut pf = m.prefetch.lock().expect("prefetch stats");
+            let prev: Vec<usize> = pf.prev.clone();
+            pf.steps += 1;
+            pf.picks += picks.len() as u64;
+            pf.overlap += picks.iter().filter(|(e, _)| prev.contains(e)).count() as u64;
+            let g = m.gate.lock().expect("gate bank");
+            for (e, _) in &picks {
+                if !g.resident(*e) {
+                    pf.misses += 1;
+                    if prev.contains(e) {
+                        pf.covered += 1;
+                    }
+                }
+            }
+            drop(g);
+            pf.prev = picks.iter().map(|(e, _)| *e).collect();
         }
 
         let signs = self.signs_or_placeholder(cfg.moe_ffn)?;
@@ -3257,8 +3395,18 @@ mod weight_path_tests {
     #[test]
     fn unpacked_f32_gemv_is_bit_identical_to_the_naive_loop() {
         // 256 is a multiple of the four-row lane width and 7 is not, so the
-        // remainder loop is compared as well as the interleaved one.
-        for &(m, n) in &[(2048usize, 256usize), (2048, 7), (5, 6)] {
+        // remainder loop is compared as well as the interleaved one. 100 and
+        // 200 are large enough to go parallel (above `PAR_MIN_ELEMS`) and are
+        // not multiples of the row block, so a partial last block is compared
+        // too -- which is the only way the row blocking could have reassociated
+        // anything.
+        for &(m, n) in &[
+            (2048usize, 256usize),
+            (2048, 7),
+            (5, 6),
+            (2048, 100),
+            (300, 200),
+        ] {
             let mut s: u32 = 0x9E37_79B9;
             let mut next = || {
                 s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);

@@ -159,6 +159,19 @@ fn main() {
                 misses as f64 / out.len().max(1) as f64,
                 t.upload_bytes / out.len().max(1) as u64,
             );
+            let p = gpu.prefetch_stats();
+            if p.steps > 0 {
+                eprintln!(
+                    "moe locality: {:.0}% of picks repeat the previous token ({}/{}), \
+                     {:.1} picks/step | misses {:.2}/step, {:.0}% of them named by the previous set",
+                    100.0 * p.overlap as f64 / p.picks.max(1) as f64,
+                    p.overlap,
+                    p.picks,
+                     p.picks as f64 / p.steps as f64,
+                    p.misses as f64 / p.steps as f64,
+                    p.covered as f64 / p.misses.max(1) as f64,
+                );
+            }
         }
         match &tok {
             Some(t) => println!("{}", t.decode(&out, true).expect("decode")),
