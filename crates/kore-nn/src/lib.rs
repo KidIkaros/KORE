@@ -6,6 +6,7 @@ pub mod activations;
 pub mod binary_linear;
 pub mod bit_linear;
 pub mod conv;
+pub mod dequant;
 pub mod dropout;
 pub mod embedding;
 pub mod geometric;

@@ -447,26 +447,17 @@ impl MiniGguf {
     }
 
     /// F32 tensor decoded to Vec<f32>.
+    /// Read a tensor as f32, dequantizing if the file stored it packed.
+    ///
+    /// These are the small auxiliary tensors -- norms, conv taps, GDN gate
+    /// weights -- that the runtime keeps as plain f32 buffers. Real files do
+    /// quantize some of them: `POCKET-35B-Q2_K` ships `ssm_alpha`/`ssm_beta`
+    /// as Q2_K, which an f32-only reader cannot load at all.
     pub fn tensor_f32(&self, name: &str) -> Result<Vec<f32>> {
         let t = self.tensor(name)?;
         let bytes = self.tensor_bytes(name)?;
-        if t.type_id == 0 {
-            Ok(bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-                .collect())
-        } else if t.type_id == 1 {
-            // An f16 export -- and every 1-D auxiliary tensor in a file written
-            // with `--outtype f16` -- lands here.
-            Ok(bytes
-                .chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect())
-        } else if t.type_id == 42 {
-            kore_kernels::q2_0::dequantize_q2_0(bytes, t.n_elements())
-        } else {
-            Err(err(&format!("cannot f32-decode type {}", t.type_id)))
-        }
+        crate::dequant::tensor_to_f32(t.type_id, bytes, t.n_elements())
+            .map_err(|e| err(&format!("tensor '{name}': {e}")))
     }
 }
 

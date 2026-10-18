@@ -554,25 +554,8 @@ impl QW {
             .bytes()
             .get(start..start + rb)
             .ok_or_else(|| err(&format!("'{}': row {index} is out of range", self.name)))?;
-        match self.kind {
-            QKind::F32 => Ok(row
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()),
-            QKind::F16 => Ok(row
-                .chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect()),
-            QKind::Q2_0 => kore_kernels::q2_0::dequantize_q2_0(row, self.m),
-            // Q2_K/Q3_K stay in `k_quant`: it is the written specification,
-            // and it is the only implementation that matches gguf-py for Q3_K
-            // (`oxillama` 0.1.4 decodes that scale packing wrongly).
-            QKind::Q4_0 | QKind::Q5_0 | QKind::Q8_0 => {
-                oxillama_quant::dequantize_to_f32(row, self.kind.gguf(), self.m)
-                    .map_err(|e| err(&format!("'{}': dequantize: {e}", self.name)))
-            }
-            kind => k_quant::dequantize(kind.type_id(), row, self.m),
-        }
+        crate::dequant::tensor_to_f32(self.kind.type_id(), row, self.m)
+            .map_err(|e| err(&format!("'{}': dequantize: {e}", self.name)))
     }
 }
 
@@ -776,7 +759,15 @@ impl Qwen35Model {
             prefix: arch.to_string(),
             n_layers,
             hidden: get_uk("embedding_length")?,
-            ffn: get_uk("feed_forward_length")?,
+            // A pure-MoE file has no dense feed-forward at all, so the key is
+            // simply absent (POCKET-35B is one: every layer routes, and the
+            // only dense FFN is the shared expert's). Only the dense path reads
+            // this, so zero is the honest value rather than a magic number.
+            ffn: match get_uk("feed_forward_length") {
+                Ok(v) => v,
+                Err(_) if moe => 0,
+                Err(e) => return Err(e),
+            },
             n_heads: get_uk("attention.head_count")?,
             n_kv: get_uk("attention.head_count_kv")?,
             head_dim: get_uk("attention.key_length")?,
