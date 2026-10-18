@@ -72,7 +72,7 @@ pub fn cmd_infer(
         _ => kore_attention::KvCacheQuantMode::F32,
     };
 
-    if model.as_ref().map_or(false, |m| m.ends_with(".gguf")) {
+    if model.as_ref().is_some_and(|m| m.ends_with(".gguf")) {
         cmd_infer_gguf(
             target_device,
             model.as_ref().unwrap(),
@@ -620,8 +620,8 @@ fn infer_gguf_qwen35(
             });
     }
     let prefill_time = t_gen.elapsed();
-    let mut pos = prompt_tokens.len();
-    for _ in 0..max_new_tokens {
+    let base = prompt_tokens.len();
+    for pos in base..base + max_new_tokens {
         let tok = Qwen35Model::argmax(&logits);
         if tok == model.cfg.eos {
             break;
@@ -637,7 +637,6 @@ fn infer_gguf_qwen35(
                 eprintln!("\nError during decode: {}", e);
                 std::process::exit(1);
             });
-        pos += 1;
     }
     let total = t_gen.elapsed();
 

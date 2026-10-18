@@ -100,10 +100,10 @@ fn attn_shard_count(seq_k: usize) -> usize {
 /// caller must fall back to the single-group kernel rather than fail.
 fn attn_can_shard(cfg: &Qwen35Config, seq_k: usize) -> bool {
     seq_k >= attn_split_min_seq_k()
-        && cfg.head_dim % 32 == 0
+        && cfg.head_dim.is_multiple_of(32)
         && cfg.head_dim <= 256
         && cfg.n_kv != 0
-        && cfg.n_heads % cfg.n_kv == 0
+        && cfg.n_heads.is_multiple_of(cfg.n_kv)
 }
 
 /// How much of the vocabulary projection a forward pass needs.
@@ -509,9 +509,9 @@ fn gemv_bytes_f32(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> R
     for (j, o) in out.iter_mut().enumerate().take(n) {
         let row = &w[j * m * 4..(j + 1) * m * 4];
         let mut acc = 0.0f32;
-        for i in 0..m {
+        for (i, &xi) in x.iter().enumerate().take(m) {
             let b = i * 4;
-            acc += f32::from_le_bytes([row[b], row[b + 1], row[b + 2], row[b + 3]]) * x[i];
+            acc += f32::from_le_bytes([row[b], row[b + 1], row[b + 2], row[b + 3]]) * xi;
         }
         *o = acc;
     }
@@ -527,9 +527,9 @@ fn gemv_bytes_f16(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> R
     for (j, o) in out.iter_mut().enumerate().take(n) {
         let row = &w[j * m * 2..(j + 1) * m * 2];
         let mut acc = 0.0f32;
-        for i in 0..m {
+        for (i, &xi) in x.iter().enumerate().take(m) {
             let b = i * 2;
-            acc += half::f16::from_le_bytes([row[b], row[b + 1]]).to_f32() * x[i];
+            acc += half::f16::from_le_bytes([row[b], row[b + 1]]).to_f32() * xi;
         }
         *o = acc;
     }
@@ -573,6 +573,9 @@ enum Layer {
 /// `qwen35` has one dense SwiGLU. `qwen35moe` replaces it with a router over
 /// `n_experts` stacked experts, of which the top `n_experts_used` are evaluated,
 /// plus one always-on shared expert behind a sigmoid gate.
+// One per layer, and the dense arm is the common one; boxing either arm
+// would put an indirection in the decode loop for nothing.
+#[allow(clippy::large_enum_variant)]
 enum FfnW {
     Dense { gate: QW, up: QW, down: QW },
     Moe(MoeW),
@@ -748,7 +751,7 @@ impl Qwen35Model {
                 cfg.ssm_groups, cfg.ssm_state, cfg.ssm_inner
             )));
         }
-        if cfg.ssm_dt_rank % cfg.ssm_groups != 0 {
+        if !cfg.ssm_dt_rank.is_multiple_of(cfg.ssm_groups) {
             return Err(err(&format!(
                 "{} value heads is not a multiple of {} key heads",
                 cfg.ssm_dt_rank, cfg.ssm_groups
@@ -1157,6 +1160,9 @@ impl Qwen35Model {
         let conv_dim = qkv_dim;
         let hist_w = conv_k - 1;
         // st.conv_hist layout: [c * hist_w + slot] where slot 0 = oldest
+        // `c` indexes three parallel arrays (weight, history, activation), so
+        // an iterator over any one of them would not describe the loop.
+        #[allow(clippy::needless_range_loop)]
         for c in 0..conv_dim {
             let mut acc = 0.0f32;
             for k in 0..hist_w {
@@ -1309,6 +1315,9 @@ impl Qwen35Model {
             let kvh = i / group;
             let qi = &q[i * hd..(i + 1) * hd];
             let mut scores = vec![0.0f32; st.len];
+            // `p` walks the cache; it indexes K and is also the score's own
+            // position, which no single iterator describes.
+            #[allow(clippy::needless_range_loop)]
             for p in 0..st.len {
                 let kp = &st.k[p * kv_dim + kvh * hd..p * kv_dim + (kvh + 1) * hd];
                 scores[p] = qi.iter().zip(kp).map(|(a, b)| a * b).sum::<f32>() * scale;
@@ -1324,6 +1333,7 @@ impl Qwen35Model {
             }
             for j in 0..hd {
                 let mut acc = 0.0f32;
+                #[allow(clippy::needless_range_loop)]
                 for p in 0..st.len {
                     acc += scores[p] * st.v[p * kv_dim + kvh * hd + j];
                 }
@@ -1466,12 +1476,16 @@ struct GpuFull {
     ffn: GpuFfn,
 }
 
+// One per layer; see `FfnW`.
+#[allow(clippy::large_enum_variant)]
 enum GpuLayer {
     Delta(GpuDelta),
     Full(GpuFull),
 }
 
 /// Mutable per-layer device state.
+// One per layer; see `FfnW`.
+#[allow(clippy::large_enum_variant)]
 pub enum GpuState {
     Delta {
         hist: Tensor,
@@ -1516,6 +1530,7 @@ pub struct Rewind {
 
 impl Rewind {
     /// Keep the state as it is after column `row` of a `cols`-column pass.
+    #[allow(clippy::too_many_arguments)]
     fn capture(
         &mut self,
         b: &Arc<dyn DeviceBackend>,
@@ -1973,8 +1988,8 @@ impl Qwen35Gpu {
                             &q,
                             &kv_q8,
                             &vv_q8,
-                            &k_scales,
-                            &v_scales,
+                            k_scales,
+                            v_scales,
                             cfg.n_heads,
                             cfg.n_kv,
                             cfg.head_dim,
@@ -1987,8 +2002,8 @@ impl Qwen35Gpu {
                             &q,
                             &kv_q8,
                             &vv_q8,
-                            &k_scales,
-                            &v_scales,
+                            k_scales,
+                            v_scales,
                             cfg.n_heads,
                             cfg.n_kv,
                             cfg.head_dim,
@@ -2364,8 +2379,8 @@ impl Qwen35Gpu {
                                 &q,
                                 &kv_q8,
                                 &vv_q8,
-                                &k_scales,
-                                &v_scales,
+                                k_scales,
+                                v_scales,
                                 cfg.n_heads,
                                 cfg.n_kv,
                                 cfg.head_dim,
@@ -2378,8 +2393,8 @@ impl Qwen35Gpu {
                                 &q,
                                 &kv_q8,
                                 &vv_q8,
-                                &k_scales,
-                                &v_scales,
+                                k_scales,
+                                v_scales,
                                 cfg.n_heads,
                                 cfg.n_kv,
                                 cfg.head_dim,
@@ -2396,8 +2411,8 @@ impl Qwen35Gpu {
                                     &qr,
                                     &kv_q8,
                                     &vv_q8,
-                                    &k_scales,
-                                    &v_scales,
+                                    k_scales,
+                                    v_scales,
                                     cfg.n_heads,
                                     cfg.n_kv,
                                     cfg.head_dim,
@@ -2410,8 +2425,8 @@ impl Qwen35Gpu {
                                     &qr,
                                     &kv_q8,
                                     &vv_q8,
-                                    &k_scales,
-                                    &v_scales,
+                                    k_scales,
+                                    v_scales,
                                     cfg.n_heads,
                                     cfg.n_kv,
                                     cfg.head_dim,

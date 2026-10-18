@@ -356,6 +356,9 @@ pub struct LlamaAttention {
 }
 
 impl LlamaAttention {
+    // A projection pair plus the attention shape: the caller reads them
+    // straight out of the GGUF, so a struct would only be a second spelling.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         q_proj: Linear,
         k_proj: Linear,
@@ -1415,8 +1418,7 @@ fn apply_rope(x: &Tensor, pos: usize, head_dim: usize, inv_freq: &[f32]) -> Resu
         let row_offset = r * row_dim;
         for h in 0..num_heads_per_row {
             let head_offset = row_offset + h * head_dim;
-            for pair in 0..num_pairs {
-                let freq = inv_freq[pair];
+            for (pair, &freq) in inv_freq.iter().enumerate().take(num_pairs) {
                 let angle = token_pos * freq;
                 let cos = angle.cos();
                 let sin = angle.sin();

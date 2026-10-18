@@ -743,10 +743,10 @@ mod tests {
 
     #[test]
     fn test_scalar() {
-        let t = Tensor::scalar(3.14);
+        let t = Tensor::scalar(std::f32::consts::PI);
         assert!(t.shape().is_scalar());
         assert_eq!(t.numel(), 1);
-        assert_eq!(t.get_f32(0), Some(3.14));
+        assert_eq!(t.get_f32(0), Some(std::f32::consts::PI));
     }
 
     #[test]

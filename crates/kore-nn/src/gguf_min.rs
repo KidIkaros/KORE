@@ -205,10 +205,10 @@ fn tensor_nbytes(type_id: u32, dims: &[usize]) -> Result<usize> {
 /// Skip a metadata value of the given type without storing it.
 fn skip_value(rd: &mut Rd, vtype: u32) -> Result<()> {
     match vtype {
-        0 | 1 | 7 => rd.take(1).map(|_| ()),
-        2 | 3 => rd.take(2).map(|_| ()),
-        4 | 5 | 6 => rd.take(4).map(|_| ()),
-        10 | 11 | 12 => rd.take(8).map(|_| ()),
+        0..=1 | 7 => rd.take(1).map(|_| ()),
+        2..=3 => rd.take(2).map(|_| ()),
+        4..=6 => rd.take(4).map(|_| ()),
+        10..=12 => rd.take(8).map(|_| ()),
         8 => {
             let n = rd.u64()?;
             if n > 1 << 24 {
@@ -233,10 +233,10 @@ fn skip_value(rd: &mut Rd, vtype: u32) -> Result<()> {
                 Ok(())
             } else {
                 let esz = match et {
-                    0 | 1 | 7 => 1u64,
-                    2 | 3 => 2,
-                    4 | 5 | 6 => 4,
-                    10 | 11 | 12 => 8,
+                    0..=1 | 7 => 1u64,
+                    2..=3 => 2,
+                    4..=6 => 4,
+                    10..=12 => 8,
                     _ => return Err(err("bad array elem type")),
                 };
                 let total = count
@@ -308,8 +308,8 @@ fn read_value(rd: &mut Rd, vtype: u32, store: bool) -> Result<Option<MetaVal>> {
                 _ => {
                     // unsupported elem type: skip remaining elements
                     let esz = match et {
-                        0 | 1 | 7 => 1usize,
-                        2 | 3 => 2,
+                        0..=1 | 7 => 1usize,
+                        2..=3 => 2,
                         _ => return Err(err("bad array elem type")),
                     };
                     rd.take(count * esz)?;

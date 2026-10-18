@@ -70,7 +70,7 @@ pub fn gemv_q2_0(
     x: &[f32],
     out: &mut [f32],
 ) -> Result<(), KoreError> {
-    if m % Q2_0_BLOCK != 0 {
+    if !m.is_multiple_of(Q2_0_BLOCK) {
         return Err(KoreError::StorageError(format!(
             "q2_0 in-dim {m} not multiple of 64"
         )));
@@ -123,7 +123,7 @@ pub fn q2_0_matvec(w: &[u8], m: usize, n: usize, x: &[f32]) -> Result<Tensor, Ko
 /// `m` = in-dim (per-row elems), `n` = rows. `m` must be a multiple of 128
 /// so every row stays u32-aligned.
 pub fn repack_q2_0(src: &[u8], m: usize, n: usize) -> Result<Vec<u8>, KoreError> {
-    if m % 128 != 0 {
+    if !m.is_multiple_of(128) {
         return Err(KoreError::StorageError(format!(
             "q2_0 repack in-dim {m} not multiple of 128"
         )));

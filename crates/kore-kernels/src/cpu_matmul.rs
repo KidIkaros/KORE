@@ -163,7 +163,7 @@ pub fn gemv_q4_k_cpu(x: &Tensor, w_raw: &[u8], n: usize, k: usize) -> Result<Ten
     } else {
         x_shape[0]
     };
-    if k_in != k || k % 256 != 0 {
+    if k_in != k || !k.is_multiple_of(256) {
         return Err(KoreError::ShapeMismatch {
             expected: vec![m, k],
             got: x_shape.to_vec(),
@@ -198,11 +198,16 @@ pub fn gemv_q4_k_cpu(x: &Tensor, w_raw: &[u8], n: usize, k: usize) -> Result<Ten
 
     if m <= 4 {
         for (r, sums) in row_results.iter().enumerate() {
+            // The index is the row of a fixed-size accumulator set, not a slice
+            // to iterate: `m` is the batch of columns the GEMV was written for.
+            #[allow(clippy::needless_range_loop)]
+            #[allow(clippy::needless_range_loop)]
             for mi in 0..m {
                 out[mi * n + r] = sums[mi];
             }
         }
     } else {
+        #[allow(clippy::needless_range_loop)]
         for mi in 0..m {
             let x_row = &x_data[mi * k..(mi + 1) * k];
             let out_row = &mut out[mi * n..(mi + 1) * n];
@@ -292,12 +297,15 @@ unsafe fn dot_q4_k_row_batch_avx2(
             let dm_mn_lo = dmin * mn[2 * g];
             let d_sc_hi = d * sc[2 * g + 1];
             let dm_mn_hi = dmin * mn[2 * g + 1];
+            #[allow(clippy::needless_range_loop)]
             for mi in 0..m {
                 let xp = x_data.as_ptr().add(mi * k + gk);
                 let mut dlo = _mm256_setzero_ps();
                 let mut dhi = _mm256_setzero_ps();
                 let mut slo = _mm256_setzero_ps();
                 let mut shi = _mm256_setzero_ps();
+                // `c` is a lane register index, not a slice position.
+                #[allow(clippy::needless_range_loop)]
                 for c in 0..4 {
                     let xl = _mm256_loadu_ps(xp.add(c * 8));
                     let xh = _mm256_loadu_ps(xp.add(32 + c * 8));
@@ -345,6 +353,7 @@ fn dot_q4_k_row_batch(
             let q_group = &qs[g * 32..(g + 1) * 32];
             let gk = k_base + g * 64;
 
+            #[allow(clippy::needless_range_loop)]
             for mi in 0..m {
                 let x_lo = &x_data[mi * k + gk..mi * k + gk + 32];
                 let x_hi = &x_data[mi * k + gk + 32..mi * k + gk + 64];
@@ -385,7 +394,7 @@ pub fn gemv_q6_k_cpu(x: &Tensor, w_raw: &[u8], n: usize, k: usize) -> Result<Ten
     } else {
         x_shape[0]
     };
-    if k_in != k || k % 256 != 0 {
+    if k_in != k || !k.is_multiple_of(256) {
         return Err(KoreError::ShapeMismatch {
             expected: vec![m, k],
             got: x_shape.to_vec(),
@@ -414,11 +423,13 @@ pub fn gemv_q6_k_cpu(x: &Tensor, w_raw: &[u8], n: usize, k: usize) -> Result<Ten
             })
             .collect();
         for (r, sums) in row_results.iter().enumerate() {
+            #[allow(clippy::needless_range_loop)]
             for mi in 0..m {
                 out[mi * n + r] = sums[mi];
             }
         }
     } else {
+        #[allow(clippy::needless_range_loop)]
         for mi in 0..m {
             let x_row = &x_data[mi * k..(mi + 1) * k];
             let out_row = &mut out[mi * n..(mi + 1) * n];
@@ -505,13 +516,18 @@ unsafe fn dot_q6_k_row_batch_avx2(
                 ),
             ];
             let mut w = [[_mm256_setzero_ps(); 4]; 4];
+            // `c` is a lane register index, not a slice position.
+            #[allow(clippy::needless_range_loop)]
             for c in 0..4 {
                 cvt_i8x32_f32x8(q[c], &mut w[c]);
             }
 
+            #[allow(clippy::needless_range_loop)]
             for mi in 0..m {
                 let xp = x_data.as_ptr().add(mi * k + gk);
                 let mut acc16 = [[_mm256_setzero_ps(); 2]; 4];
+                // `c` is a lane register index, not a slice position.
+                #[allow(clippy::needless_range_loop)]
                 for c in 0..4 {
                     let xc = xp.add(c * 32);
                     acc16[c][0] = _mm256_fmadd_ps(w[c][0], _mm256_loadu_ps(xc), acc16[c][0]);
@@ -521,6 +537,8 @@ unsafe fn dot_q6_k_row_batch_avx2(
                     acc16[c][1] =
                         _mm256_fmadd_ps(w[c][3], _mm256_loadu_ps(xc.add(24)), acc16[c][1]);
                 }
+                // `c` is a lane register index, not a slice position.
+                #[allow(clippy::needless_range_loop)]
                 for c in 0..4 {
                     let s_a = d * (*sc_g.add(2 * c) as i8) as f32;
                     let s_b = d * (*sc_g.add(2 * c + 1) as i8) as f32;
@@ -577,6 +595,7 @@ fn dot_q6_k_row_batch(
                     let w2 = s2 * (((ql1 >> 4) | (((qhb >> 4) & 3) << 4)) as i32 - 32) as f32;
                     let w3 = s3 * (((ql2 >> 4) | (((qhb >> 6) & 3) << 4)) as i32 - 32) as f32;
 
+                    #[allow(clippy::needless_range_loop)]
                     for mi in 0..m {
                         let base_x = mi * k + gk + l;
                         sums[mi] += w0 * x_data[base_x]

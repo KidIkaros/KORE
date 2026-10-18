@@ -37,7 +37,7 @@ fn op_count_enabled() -> bool {
 /// Dispatch counts by label, most frequent first. Empty unless `KORE_OP_COUNT=1`.
 pub fn op_counts() -> Vec<(&'static str, u64)> {
     let mut v = op_counts_mut().clone();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
     v
 }
 
@@ -462,6 +462,14 @@ impl PendingBatch {
     }
 }
 
+/// Lazily padded Q6_K weight buffers, keyed by the source buffer's address.
+///
+/// The source `Arc` is held inside the cache so its address can never be
+/// recycled by the pool while it is still a key.
+type Q6kPadCache = Arc<
+    parking_lot::Mutex<std::collections::HashMap<usize, (Arc<wgpu::Buffer>, Arc<wgpu::Buffer>)>>,
+>;
+
 /// Vulkan / GPU compute backend for KORE.
 ///
 /// Executes pure-Rust WGSL compute shaders via Vulkan on Linux / Metal on macOS / DX12 on Windows.
@@ -504,13 +512,8 @@ pub struct VulkanBackend {
     gdn_step_pipeline: Arc<wgpu::ComputePipeline>,
     qknorm_rope_pipeline: Arc<wgpu::ComputePipeline>,
     batch: Arc<parking_lot::Mutex<PendingBatch>>,
-    /// Lazily padded Q6_K weight buffers (210B -> 224B blocks), keyed by source buffer
-    /// pointer; the source Arc is held so its address can never be recycled by the pool.
-    q6k_pad_cache: Arc<
-        parking_lot::Mutex<
-            std::collections::HashMap<usize, (Arc<wgpu::Buffer>, Arc<wgpu::Buffer>)>,
-        >,
-    >,
+    /// Lazily padded Q6_K weight buffers (210B -> 224B blocks).
+    q6k_pad_cache: Q6kPadCache,
 }
 
 impl VulkanBackend {
@@ -1905,6 +1908,9 @@ impl VulkanBackend {
     /// Q8 (quantized INT8) KV-cache append: writes a single-token U8 K/V plus
     /// per-token f32 scales into the U8 caches and scale buffers. The decode
     /// shader dequantizes K/V inline (see `fused_attention_decode_gqa_q8`).
+    // The argument list is the kernel's binding table; it mirrors the
+    // `DeviceBackend` method of the same name.
+    #[allow(clippy::too_many_arguments)]
     pub fn kv_cache_append_q8(
         &self,
         k_cache_buf: &Tensor,
@@ -1947,7 +1953,7 @@ impl VulkanBackend {
 
         // INT8 K/V are bound as packed `array<u32>` in WGSL (naga has no 8-bit scalar
         // type), so every row width must be a multiple of 4 to keep byte offsets aligned.
-        if cols_k % 4 != 0 || cols_v % 4 != 0 {
+        if !cols_k.is_multiple_of(4) || !cols_v.is_multiple_of(4) {
             return Err(VulkanError::UnsupportedOperation(
                 "kv_cache_append_q8 requires 4-aligned K/V row widths (packed INT8)".into(),
             ));
@@ -2041,7 +2047,7 @@ impl VulkanBackend {
                 _pad1: 0,
                 _pad2: 0,
             };
-            let workgroups = (num_new as u32 + 255) / 256;
+            let workgroups = (num_new as u32).div_ceil(256);
             self.record_dispatch(
                 &self.elementwise_pipeline,
                 bytemuck::bytes_of(&eu),
@@ -2102,7 +2108,7 @@ impl VulkanBackend {
         }
         let rows = shape[0];
         let cols = shape[1];
-        if cols % 4 != 0 {
+        if !cols.is_multiple_of(4) {
             return Err(VulkanError::UnsupportedOperation(
                 "quantize_q8_rows requires 4-aligned row width (packed INT8)".into(),
             ));
@@ -2252,6 +2258,9 @@ impl VulkanBackend {
     /// Fused Flash-Decoding Grouped Query Attention (GQA):
     /// Computes softmax(Q @ K^T * scale) @ V directly over resident row-major K and V
     /// for all query heads in parallel in a single GPU dispatch, with zero CPU transfers.
+    // The argument list is the kernel's binding table; it mirrors the
+    // `DeviceBackend` method of the same name.
+    #[allow(clippy::too_many_arguments)]
     pub fn fused_attention_decode_gqa(
         &self,
         q: &Tensor,
@@ -2329,6 +2338,9 @@ impl VulkanBackend {
     ///
     /// Reads K/V as 8-bit storage arrays and dequantizes per-thread with the
     /// per-token scale buffers — the KV read traffic is 4x lower than F32.
+    // The argument list is the kernel's binding table; it mirrors the
+    // `DeviceBackend` method of the same name.
+    #[allow(clippy::too_many_arguments)]
     pub fn fused_attention_decode_gqa_q8(
         &self,
         q: &Tensor,
@@ -2377,7 +2389,7 @@ impl VulkanBackend {
                 rhs: k_shape.to_vec(),
             });
         }
-        if kv_dim % 4 != 0 {
+        if !kv_dim.is_multiple_of(4) {
             return Err(VulkanError::UnsupportedOperation(
                 "fused_attention_decode_gqa_q8 requires 4-aligned kv_dim (packed INT8)".into(),
             ));
@@ -2449,6 +2461,9 @@ impl VulkanBackend {
     ///
     /// `head_dim` must be a multiple of 32 (the shard kernel's shared `Q` staging
     /// and vectorized V accumulation require it) and `n_splits >= 1`.
+    // The argument list is the kernel's binding table; it mirrors the
+    // `DeviceBackend` method of the same name.
+    #[allow(clippy::too_many_arguments)]
     pub fn fused_attention_decode_gqa_q8_split(
         &self,
         q: &Tensor,
@@ -2502,13 +2517,13 @@ impl VulkanBackend {
                 rhs: k_shape.to_vec(),
             });
         }
-        if head_dim == 0 || head_dim % 32 != 0 || head_dim > 256 {
+        if head_dim == 0 || !head_dim.is_multiple_of(32) || head_dim > 256 {
             return Err(VulkanError::UnsupportedOperation(format!(
                 "fused_attention_decode_gqa_q8_split needs head_dim % 32 == 0 and head_dim <= 256 \
                  (shared-Q staging), got {head_dim}"
             )));
         }
-        if num_kv_heads == 0 || num_heads % num_kv_heads != 0 {
+        if num_kv_heads == 0 || !num_heads.is_multiple_of(num_kv_heads) {
             return Err(VulkanError::UnsupportedOperation(format!(
                 "num_heads {num_heads} must be a multiple of num_kv_heads {num_kv_heads}"
             )));
@@ -2626,7 +2641,7 @@ impl VulkanBackend {
         let x_shape = x.shape().dims();
         let total_dim = num_heads * head_dim;
         let numel = x.numel();
-        if numel % total_dim != 0 {
+        if !numel.is_multiple_of(total_dim) {
             return Err(VulkanError::ShapeMismatch {
                 op: "rope".into(),
                 lhs: x_shape.to_vec(),
@@ -2654,7 +2669,7 @@ impl VulkanBackend {
             _pad1: 0,
         };
 
-        let workgroups = ((total_pairs as u32) + 63) / 64;
+        let workgroups = (total_pairs as u32).div_ceil(64);
         self.record_dispatch(
             &self.rope_pipeline,
             bytemuck::bytes_of(&uniforms),
@@ -2963,6 +2978,9 @@ impl VulkanBackend {
         )
     }
 
+    // Mirrors the `DeviceBackend` method: the argument list is the kernel's
+    // binding table.
+    #[allow(clippy::too_many_arguments)]
     fn gemv_split3_dispatch(
         &self,
         x: &Tensor,
@@ -3058,6 +3076,9 @@ impl VulkanBackend {
 
     /// Fused RoPE for Q and K in a single dispatch.
     /// q: [M, num_heads_q * head_dim], k: [M, num_kv_heads * head_dim].
+    // The argument list is the kernel's binding table; it mirrors the
+    // `DeviceBackend` method of the same name.
+    #[allow(clippy::too_many_arguments)]
     pub fn rope_pair(
         &self,
         q: &Tensor,
@@ -3073,7 +3094,9 @@ impl VulkanBackend {
         let half_dim = head_dim / 2;
         let total_pairs_q = (q.numel() / head_dim) * half_dim;
         let total_pairs_k = (k.numel() / head_dim) * half_dim;
-        if q.numel() % (num_heads_q * head_dim) != 0 || k.numel() % (num_kv_heads * head_dim) != 0 {
+        if !q.numel().is_multiple_of(num_heads_q * head_dim)
+            || !k.numel().is_multiple_of(num_kv_heads * head_dim)
+        {
             return Err(VulkanError::ShapeMismatch {
                 op: "rope_pair".into(),
                 lhs: q_shape.to_vec(),
@@ -3309,7 +3332,7 @@ impl VulkanBackend {
     /// Q2_0 quantized GEMV: y[m,n] = x[m,k] @ W^T where W is [n,k] Q2_0-packed
     /// (64 elems/block, 18 bytes: fp16 scale + 16 bytes of 2-bit {-1,0,1,2} codes).
     pub fn gemv_q2_0(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
-        if k % 512 != 0 {
+        if !k.is_multiple_of(512) {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q2_0".into(),
                 lhs: vec![k],
@@ -3384,8 +3407,8 @@ impl VulkanBackend {
         // At `rows = 1` (`cols == numel`) this is the check it always was.
         let cols = shape.last().copied().unwrap_or(numel);
         if block_size != 512
-            || numel % block_size != 0
-            || cols % block_size != 0
+            || !numel.is_multiple_of(block_size)
+            || !cols.is_multiple_of(block_size)
             || signs.numel() < cols
         {
             return Err(VulkanError::ShapeMismatch {
@@ -3637,6 +3660,9 @@ impl VulkanBackend {
 
     /// Fused alpha/beta gates: beta = sigmoid(W_b @ h),
     /// gate = softplus(W_a @ h + dt_bias) * a. Returns (beta[n_v], gate[n_v]).
+    // The argument list is the kernel's binding table; it mirrors the
+    // `DeviceBackend` method of the same name.
+    #[allow(clippy::too_many_arguments)]
     pub fn gdn_gates(
         &self,
         h: &Tensor,
@@ -3718,6 +3744,9 @@ impl VulkanBackend {
     /// Fused DeltaNet recurrent step: L2-normed q/k, delta-rule state update
     /// (state mutated in place), output projection, gated RMSNorm with z.
     /// qkv = [q | k | v] conv output, state [n_v*d_v*d_v], out [n_v*d_v].
+    // The argument list is the kernel's binding table; it mirrors the
+    // `DeviceBackend` method of the same name.
+    #[allow(clippy::too_many_arguments)]
     pub fn gdn_step(
         &self,
         qkv: &Tensor,
@@ -3808,6 +3837,9 @@ impl VulkanBackend {
     /// Per-head Q/K RMSNorm + gate split + partial NEOX RoPE for Qwen3.5
     /// full-attention layers. qg [n_heads*(2*head_dim)] = [q|gate] per head.
     /// Returns (q_roped, k_roped, gate).
+    // The argument list is the kernel's binding table; it mirrors the
+    // `DeviceBackend` method of the same name.
+    #[allow(clippy::too_many_arguments)]
     pub fn qknorm_rope(
         &self,
         qg: &Tensor,
@@ -4210,6 +4242,9 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    // Mirrors the `DeviceBackend` method: the argument list is the kernel's
+    // binding table.
+    #[allow(clippy::too_many_arguments)]
     fn rope_pair(
         &self,
         q: &Tensor,
@@ -4300,6 +4335,9 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    // Mirrors the `DeviceBackend` method: the argument list is the kernel's
+    // binding table.
+    #[allow(clippy::too_many_arguments)]
     fn gdn_gates(
         &self,
         h: &Tensor,
@@ -4314,6 +4352,9 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    // Mirrors the `DeviceBackend` method: the argument list is the kernel's
+    // binding table.
+    #[allow(clippy::too_many_arguments)]
     fn gdn_step(
         &self,
         qkv: &Tensor,
@@ -4332,6 +4373,9 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    // Mirrors the `DeviceBackend` method: the argument list is the kernel's
+    // binding table.
+    #[allow(clippy::too_many_arguments)]
     fn qknorm_rope(
         &self,
         qg: &Tensor,

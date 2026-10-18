@@ -326,6 +326,10 @@ pub trait DeviceBackend: Send + Sync {
     /// K: [seq_k, num_kv_heads * head_dim]
     /// V: [seq_k, num_kv_heads * head_dim]
     /// Output: [M, num_heads * head_dim]
+    // The argument list is the kernel's binding table: every backend
+    // marshals exactly these, and bundling them in a struct would only move
+    // the same fields to a call site.
+    #[allow(clippy::too_many_arguments)]
     fn fused_attention_decode_gqa(
         &self,
         _q: &crate::Tensor,
@@ -548,6 +552,10 @@ pub trait DeviceBackend: Send + Sync {
     }
 
     /// Fused RoPE for Q and K in a single dispatch.
+    // The argument list is the kernel's binding table: every backend
+    // marshals exactly these, and bundling them in a struct would only move
+    // the same fields to a call site.
+    #[allow(clippy::too_many_arguments)]
     fn rope_pair(
         &self,
         _q: &crate::Tensor,
@@ -602,6 +610,10 @@ pub trait DeviceBackend: Send + Sync {
     /// no rotation. `signs` is only read when `had`.
     /// Returns `(out_res, out_norm, out_had)`; unused outputs are uninitialized.
     /// `weight` is only read for modes 0/1 (pass `signs` for modes 2/3).
+    // The argument list is the kernel's binding table: every backend
+    // marshals exactly these, and bundling them in a struct would only move
+    // the same fields to a call site.
+    #[allow(clippy::too_many_arguments)]
     fn had_pre(
         &self,
         _mode: u32,
@@ -711,6 +723,10 @@ pub trait DeviceBackend: Send + Sync {
 
     /// Fused DeltaNet gates: `beta = sigmoid(W_b h)`,
     /// `gate = softplus(W_a h + dt_bias) * a`. Returns `(beta[n_v], gate[n_v])`.
+    // The argument list is the kernel's binding table: every backend
+    // marshals exactly these, and bundling them in a struct would only move
+    // the same fields to a call site.
+    #[allow(clippy::too_many_arguments)]
     fn gdn_gates(
         &self,
         _h: &crate::Tensor,
@@ -733,6 +749,10 @@ pub trait DeviceBackend: Send + Sync {
     /// `n_v` value heads read `n_k` key heads: value head `hv` borrows key head
     /// `hv * n_k / n_v`, so a file whose q/k projections carry fewer heads than
     /// v (GQA over the linear attention) needs no reshuffle of the weights.
+    // The argument list is the kernel's binding table: every backend
+    // marshals exactly these, and bundling them in a struct would only move
+    // the same fields to a call site.
+    #[allow(clippy::too_many_arguments)]
     fn gdn_step(
         &self,
         _qkv: &crate::Tensor,
@@ -755,6 +775,10 @@ pub trait DeviceBackend: Send + Sync {
 
     /// Per-head Q/K RMSNorm + gate split + partial NEOX RoPE (Qwen3.5).
     /// Returns `(q_roped, k_roped, gate)`.
+    // The argument list is the kernel's binding table: every backend
+    // marshals exactly these, and bundling them in a struct would only move
+    // the same fields to a call site.
+    #[allow(clippy::too_many_arguments)]
     fn qknorm_rope(
         &self,
         _qg: &crate::Tensor,

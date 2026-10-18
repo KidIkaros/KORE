@@ -158,6 +158,7 @@ impl Transformer {
     /// - `post_attn_norm.gamma`  — [hidden_dim]
     /// - `head.weight`           — [vocab_size, hidden_dim]
     /// - `head.bias`             — [vocab_size]
+    ///
     /// Optional MTP draft head keys:
     /// - `mtp.proj.weight`       — [hidden_dim, hidden_dim]
     /// - `mtp.proj.bias`         — [hidden_dim]
