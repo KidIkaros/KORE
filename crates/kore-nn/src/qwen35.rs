@@ -47,6 +47,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use kore_core::{KoreError, Result};
 
@@ -569,12 +570,34 @@ fn gemv_bytes_f32(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> R
     if w.len() < need {
         return Err(err(&format!("f32 gemv: {} bytes < {need}", w.len())));
     }
-    for (j, o) in out.iter_mut().enumerate().take(n) {
-        let row = &w[j * m * 4..(j + 1) * m * 4];
+    // Several rows at a time. Each row keeps one sequential accumulator, so
+    // every row's sum is the same sequence of adds as the naive loop -- what
+    // changes is that the lanes' add chains overlap, which is the difference
+    // between one MAC per four cycles (f32 add latency) and eight. Eight is
+    // past the point where the loop is latency-bound and into memory:
+    // measured 246 us at four lanes, 212 us at eight, on a 2048x256 matrix.
+    const R: usize = 8;
+    let rb = m * 4;
+    let x = &x[..m];
+    let mut j = 0usize;
+    while j + R <= n {
+        let mut lanes: [std::slice::ChunksExact<'_, u8>; R] =
+            std::array::from_fn(|r| w[(j + r) * rb..(j + r + 1) * rb].chunks_exact(4));
+        let mut acc = [0.0f32; R];
+        for &xi in x {
+            for (r, lane) in lanes.iter_mut().enumerate() {
+                let c = lane.next().expect("a row holds exactly m chunks");
+                acc[r] += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xi;
+            }
+        }
+        out[j..j + R].copy_from_slice(&acc);
+        j += R;
+    }
+    for (jj, o) in out.iter_mut().enumerate().skip(j).take(n - j) {
+        let row = &w[jj * rb..(jj + 1) * rb];
         let mut acc = 0.0f32;
-        for (i, &xi) in x.iter().enumerate().take(m) {
-            let b = i * 4;
-            acc += f32::from_le_bytes([row[b], row[b + 1], row[b + 2], row[b + 3]]) * xi;
+        for (c, &xi) in row.chunks_exact(4).zip(x) {
+            acc += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xi;
         }
         *o = acc;
     }
@@ -587,12 +610,12 @@ fn gemv_bytes_f16(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> R
     if w.len() < need {
         return Err(err(&format!("f16 gemv: {} bytes < {need}", w.len())));
     }
+    let x = &x[..m];
     for (j, o) in out.iter_mut().enumerate().take(n) {
         let row = &w[j * m * 2..(j + 1) * m * 2];
         let mut acc = 0.0f32;
-        for (i, &xi) in x.iter().enumerate().take(m) {
-            let b = i * 2;
-            acc += half::f16::from_le_bytes([row[b], row[b + 1]]).to_f32() * xi;
+        for (c, &xi) in row.chunks_exact(2).zip(x) {
+            acc += half::f16::from_le_bytes([c[0], c[1]]).to_f32() * xi;
         }
         *o = acc;
     }
@@ -1692,6 +1715,30 @@ struct GpuMoe {
     shexp_down: GpuW,
     n_experts: usize,
     n_used: usize,
+    /// Host-side wall clock accumulated by the routed FFN, split by region.
+    ///
+    /// Only the *host* half of each region shows up here: a `gemv` costs one
+    /// command-buffer append and returns, so `compute_us` is submission cost,
+    /// not device cost. `download_us` is the opposite case -- it drains the
+    /// queue, so it carries the device time of everything queued before it.
+    /// Read together they answer the question this exists for: how much of a
+    /// step is host encoding, how much is waiting, and how much is bytes.
+    times: Mutex<MoeTimes>,
+}
+
+/// Microseconds per region of one routed FFN, summed since construction.
+#[derive(Default, Clone, Copy)]
+pub struct MoeTimes {
+    /// `ht` download to the host. This drains the queue, so it contains every
+    /// dispatch the layer queued before the router needed its input.
+    pub download_us: u64,
+    /// Host router matvec plus top-k, with the device idle.
+    pub route_us: u64,
+    /// `DeviceBank::acquire` over every expert of every top-k, misses included.
+    pub upload_us: u64,
+    /// Submission of everything else: the three matvecs, the fused SwiGLU, the
+    /// combine. Host encoding only.
+    pub compute_us: u64,
 }
 
 /// One expert's device copy, uploaded first on a miss.
@@ -1991,6 +2038,7 @@ impl Qwen35Gpu {
                         shexp_down: up_w(&m.shexp_down)?,
                         n_experts: m.n_experts,
                         n_used: cfg.n_experts_used.min(m.n_experts),
+                        times: Mutex::new(MoeTimes::default()),
                     }))
                 }
             }
@@ -2137,6 +2185,42 @@ impl Qwen35Gpu {
         (hits, misses, bytes)
     }
 
+    /// Host microseconds per region of the routed FFN, summed over layers.
+    ///
+    /// Populated only when `KORE_MOE_PROFILE` is set: the timers are two
+    /// `Instant::now()` calls per region per layer, which is noise against a
+    /// 1 MB upload but pointless to pay in a normal run.
+    pub fn moe_times(&self) -> MoeTimes {
+        let mut total = MoeTimes::default();
+        for layer in &self.layers {
+            let ffn = match layer {
+                GpuLayer::Delta(l) => &l.ffn,
+                GpuLayer::Full(l) => &l.ffn,
+            };
+            if let GpuFfn::Moe(m) = ffn {
+                let t = *m.times.lock().expect("moe profile");
+                total.download_us += t.download_us;
+                total.route_us += t.route_us;
+                total.upload_us += t.upload_us;
+                total.compute_us += t.compute_us;
+            }
+        }
+        total
+    }
+
+    /// Zero the [`MoeTimes`] counters, e.g. after a warmup token.
+    pub fn reset_moe_times(&self) {
+        for layer in &self.layers {
+            let ffn = match layer {
+                GpuLayer::Delta(l) => &l.ffn,
+                GpuLayer::Full(l) => &l.ffn,
+            };
+            if let GpuFfn::Moe(m) = ffn {
+                *m.times.lock().expect("moe profile") = MoeTimes::default();
+            }
+        }
+    }
+
     fn wgemv(&self, w: &GpuW, x: &Tensor) -> Result<Tensor> {
         let b = &self.backend;
         match w.kind {
@@ -2229,20 +2313,41 @@ impl Qwen35Gpu {
             ));
         }
 
+        let t_route = Instant::now();
         let h_cpu = ht
             .to(Device::Cpu)
             .map_err(|e| err(&format!("expert routing download: {e}")))?;
+        let download_us = t_route.elapsed().as_micros() as u64;
         let h = h_cpu
             .as_f32_slice()
             .ok_or_else(|| err("expert routing download did not come back as f32"))?;
-        let picks = top_k_experts(&router_probs(&m.router, h, m.n_experts)?, m.n_used);
+        let t_router = Instant::now();
+        let mut picks = top_k_experts(&router_probs(&m.router, h, m.n_experts)?, m.n_used);
+        let route_us = t_router.elapsed().as_micros() as u64;
+
+        // Ablation: pin every slot to one expert so the banks go resident after
+        // the first layer and the step measures the routed *compute* path with
+        // uploads removed. The output is nonsense; only the timing is read.
+        if let Some(forced) = std::env::var("KORE_MOE_FORCE_EXPERT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            for p in &mut picks {
+                p.0 = forced.min(m.n_experts.saturating_sub(1));
+            }
+        }
 
         let signs = self.signs_or_placeholder(cfg.moe_ffn)?;
         let mut acc: Option<Tensor> = None;
+        let (mut upload_us, mut compute_us) = (0u64, 0u64);
         for (e, weight) in picks {
+            let t_up = Instant::now();
             let gate = bank_expert(&m.gate, e, &**b, self.device)?;
             let up = bank_expert(&m.up, e, &**b, self.device)?;
             let down = bank_expert(&m.down, e, &**b, self.device)?;
+            upload_us += t_up.elapsed().as_micros() as u64;
+
+            let t_c = Instant::now();
             let gv = self.wgemv(&gate, ht)?;
             let uv = self.wgemv(&up, ht)?;
             let (_g, _u, act) = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?;
@@ -2254,8 +2359,10 @@ impl Qwen35Gpu {
                 Some(a) => b.add(&a, &dv)?,
                 None => dv,
             });
+            compute_us += t_c.elapsed().as_micros() as u64;
         }
 
+        let t_c = Instant::now();
         // Shared expert: always evaluated, gated by `sigmoid` of its own row.
         let mut sg = vec![0.0f32; m.shexp_router.n];
         m.shexp_router.gemv(h, &mut sg)?;
@@ -2266,10 +2373,20 @@ impl Qwen35Gpu {
         let (_g, _u, sact) = b.had_pre(2, self.folded, &sgate, &sup, signs, signs, cfg.eps)?;
         let sact = b.mul_scalar(&sact, gs)?;
         let sd = self.wgemv(&m.shexp_down, &sact)?;
-        match acc {
-            Some(a) => Ok(b.add(&a, &sd)?),
-            None => Ok(sd),
+        compute_us += t_c.elapsed().as_micros() as u64;
+        let out = match acc {
+            Some(a) => b.add(&a, &sd)?,
+            None => sd,
+        };
+
+        if std::env::var_os("KORE_MOE_PROFILE").is_some() {
+            let mut t = m.times.lock().expect("moe profile");
+            t.download_us += download_us;
+            t.route_us += route_us;
+            t.upload_us += upload_us;
+            t.compute_us += compute_us;
         }
+        Ok(out)
     }
 
     /// One decode step; returns the next greedy token.
@@ -2939,6 +3056,84 @@ impl Qwen35Gpu {
 #[cfg(test)]
 mod weight_path_tests {
     use super::*;
+
+    /// Where does the router's 3 ms per layer actually go? Time the matvec on
+    /// its own, with the same shape POCKET uses. Run with `--nocapture`.
+    #[test]
+    fn router_gemv_throughput() {
+        let (m, n) = (2048usize, 256usize);
+        let mut s: u32 = 0x9E37_79B9;
+        let mut next = || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 8) as f32 / 8_388_608.0 - 1.0
+        };
+        let x: Vec<f32> = (0..m).map(|_| next()).collect();
+        let mut w = Vec::with_capacity(n * m * 4);
+        for _ in 0..n * m {
+            w.extend_from_slice(&next().to_le_bytes());
+        }
+        let mut out = vec![0.0f32; n];
+        for _ in 0..20 {
+            gemv_bytes_f32(&w, m, n, &x, &mut out).expect("warm");
+        }
+        let reps = 200;
+        let mut x = x;
+        let t = Instant::now();
+        for _ in 0..reps {
+            // Perturb one input per rep: without this the optimizer can hoist
+            // the whole invariant loop out and report a fictitious rate.
+            x[0] += 1e-6;
+            gemv_bytes_f32(&w, m, n, &x, &mut out).expect("gemv");
+            std::hint::black_box(&out);
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        println!(
+            "router gemv {n}x{m}: {us:.1} us  ({:.2} GB/s, {:.2} GMAC/s)",
+            (n * m * 4) as f64 / 1e9 / (us / 1e6),
+            (n * m) as f64 / 1e9 / (us / 1e6)
+        );
+    }
+
+    /// The router matvec is a *discrete* decision input, so the rewrite that
+    /// removed its four per-element bounds checks must not have reassociated a
+    /// single add. Compare against the naive loop bit for bit, not to a
+    /// tolerance: `PartialEq` on f32 is exact here, and every value is finite.
+    #[test]
+    fn unpacked_f32_gemv_is_bit_identical_to_the_naive_loop() {
+        // 256 is a multiple of the four-row lane width and 7 is not, so the
+        // remainder loop is compared as well as the interleaved one.
+        for &(m, n) in &[(2048usize, 256usize), (2048, 7), (5, 6)] {
+            let mut s: u32 = 0x9E37_79B9;
+            let mut next = || {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 8) as f32 / 8_388_608.0 - 1.0
+            };
+            let x: Vec<f32> = (0..m).map(|_| next()).collect();
+            let xf: Vec<f32> = (0..n * m).map(|_| next()).collect();
+            let mut w = Vec::with_capacity(n * m * 4);
+            for v in &xf {
+                w.extend_from_slice(&v.to_le_bytes());
+            }
+
+            let mut got = vec![0.0f32; n];
+            gemv_bytes_f32(&w, m, n, &x, &mut got).expect("gemv");
+
+            let mut want = vec![0.0f32; n];
+            for (j, o) in want.iter_mut().enumerate() {
+                let row = &w[j * m * 4..(j + 1) * m * 4];
+                let mut acc = 0.0f32;
+                for (i, &xi) in x.iter().enumerate().take(m) {
+                    let b = i * 4;
+                    acc += f32::from_le_bytes([row[b], row[b + 1], row[b + 2], row[b + 3]]) * xi;
+                }
+                *o = acc;
+            }
+
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "row {i}: {a} != {b}");
+            }
+        }
+    }
 
     /// A [`ByteOwner`] over a buffer the test owns, so a bank can be built over
     /// bytes that did not come out of a mapped file.

@@ -50,12 +50,27 @@ fn main() {
     let model = Qwen35Model::from_gguf(Path::new(&gguf)).expect("load model");
     eprintln!("model loaded in {:?}: {:?}", t0.elapsed(), model.cfg);
 
-    let tok = tokenizers::Tokenizer::from_file(&tok_path).expect("tokenizer");
-    let ids = tok
-        .encode(prompt.as_str(), true)
-        .expect("encode")
-        .get_ids()
-        .to_vec();
+    let tok = if tok_path == "-" {
+        None
+    } else {
+        Some(tokenizers::Tokenizer::from_file(&tok_path).expect("tokenizer"))
+    };
+    let ids = match &tok {
+        Some(t) => t
+            .encode(prompt.as_str(), true)
+            .expect("encode")
+            .get_ids()
+            .to_vec(),
+        // No tokenizer on this box (the GGUF carries tokens but not merges):
+        // take the ids straight from `KORE_IDS` so the *engine* can still be
+        // timed and gated. Decoding is skipped for the same reason.
+        None => std::env::var("KORE_IDS")
+            .expect("KORE_IDS=<id,id,...> is required when the tokenizer path is '-'")
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim().parse().expect("token id"))
+            .collect(),
+    };
     eprintln!("prompt tokens: {ids:?}");
     let max_ctx_arg = std::env::args().nth(6);
     let max_ctx: usize = max_ctx_arg
@@ -123,7 +138,26 @@ fn main() {
             "expert bank: {hits} hits, {misses} misses, {:.1} MB uploaded",
             bytes as f64 / 1e6
         );
-        println!("{}", tok.decode(&out, true).expect("decode"));
+        let t = gpu.moe_times();
+        if t.download_us + t.route_us + t.upload_us + t.compute_us > 0 {
+            let total = (t.download_us + t.route_us + t.upload_us + t.compute_us) as f64;
+            eprintln!(
+                "moe host: download {:.1} ms ({:.0}%) | router {:.1} ms ({:.0}%) | upload {:.1} ms ({:.0}%) | submit {:.1} ms ({:.0}%) | {:.1} ms/token",
+                t.download_us as f64 / 1e3,
+                100.0 * t.download_us as f64 / total,
+                t.route_us as f64 / 1e3,
+                100.0 * t.route_us as f64 / total,
+                t.upload_us as f64 / 1e3,
+                100.0 * t.upload_us as f64 / total,
+                t.compute_us as f64 / 1e3,
+                100.0 * t.compute_us as f64 / total,
+                total / 1e3 / out.len().max(1) as f64
+            );
+        }
+        match &tok {
+            Some(t) => println!("{}", t.decode(&out, true).expect("decode")),
+            None => println!("{out:?}"),
+        }
         return;
     }
 
@@ -139,8 +173,9 @@ fn main() {
         eprintln!("top-10 after prompt:");
         for &i in idx.iter().take(10) {
             let s = tok
-                .decode(&[i as u32], false)
-                .unwrap_or_else(|_| "?".into());
+                .as_ref()
+                .and_then(|t| t.decode(&[i as u32], false).ok())
+                .unwrap_or_else(|| "?".into());
             eprintln!("  {:>7} {:>9.3} {:?}", i, logits[i], s);
         }
     }
@@ -157,6 +192,8 @@ fn main() {
         out.len() as f64 / dt.as_secs_f64()
     );
     eprintln!("token ids: {out:?}");
-    let text = tok.decode(&out, true).expect("decode");
-    println!("{text}");
+    match &tok {
+        Some(t) => println!("{}", t.decode(&out, true).expect("decode")),
+        None => println!("{out:?}"),
+    }
 }
