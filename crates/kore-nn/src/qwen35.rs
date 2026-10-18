@@ -286,6 +286,10 @@ enum QKind {
     F16,
     /// GGML type 42, 64 weights per 18-byte block.
     Q2_0,
+    /// GGML type 2, 32 weights per 18-byte block. The single most common
+    /// legacy format on the Hub, and the fallback `Q2_K` reaches for when a row
+    /// is too short for a super-block.
+    Q4_0,
     /// GGML type 6, 32 weights per 22-byte block. Not a boutique format: a
     /// K-quant file falls back to it whenever a tensor's row width is not a
     /// multiple of 256, which is exactly what a routed expert's `down`
@@ -294,7 +298,11 @@ enum QKind {
     /// GGML type 8, 32 weights per 34-byte block. The other half of the same
     /// fallback: `Q4_K_M` picks Q8_0 for the tensors Q5_0 is too lossy for.
     Q8_0,
-    /// K-quants, 256 weights per super-block.
+    /// K-quants, 256 weights per super-block. Q2_K and Q3_K are here because
+    /// the checkpoint this engine is actually sized for -- a 35 B-A3B MoE whose
+    /// resident tier is 1.27 GB and whose experts are 11.66 GB -- ships them.
+    Q2K,
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
@@ -306,8 +314,11 @@ impl QKind {
             0 => Some(Self::F32),
             1 => Some(Self::F16),
             kore_kernels::q2_0::Q2_0_TYPE_ID => Some(Self::Q2_0),
+            2 => Some(Self::Q4_0),
             6 => Some(Self::Q5_0),
             8 => Some(Self::Q8_0),
+            10 => Some(Self::Q2K),
+            11 => Some(Self::Q3K),
             k_quant::Q4_K_TYPE_ID => Some(Self::Q4K),
             k_quant::Q5_K_TYPE_ID => Some(Self::Q5K),
             k_quant::Q6_K_TYPE_ID => Some(Self::Q6K),
@@ -320,8 +331,11 @@ impl QKind {
             Self::F32 => 0,
             Self::F16 => 1,
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_TYPE_ID,
+            Self::Q4_0 => 2,
             Self::Q5_0 => 6,
             Self::Q8_0 => 8,
+            Self::Q2K => 10,
+            Self::Q3K => 11,
             Self::Q4K => k_quant::Q4_K_TYPE_ID,
             Self::Q5K => k_quant::Q5_K_TYPE_ID,
             Self::Q6K => k_quant::Q6_K_TYPE_ID,
@@ -333,7 +347,7 @@ impl QKind {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_BLOCK,
-            Self::Q5_0 | Self::Q8_0 => 32,
+            Self::Q4_0 | Self::Q5_0 | Self::Q8_0 => 32,
             _ => k_quant::QK_K,
         }
     }
@@ -346,8 +360,14 @@ impl QKind {
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_BLOCK_BYTES,
             // Legacy 32-weight blocks: f16 scale plus 32 quantized values, and
             // above them 4 bytes of high bits for Q5_0.
+            // f16 scale plus 16 bytes of nibbles.
+            Self::Q4_0 => 2 + 16,
             Self::Q5_0 => 2 + 4 + 16,
             Self::Q8_0 => 2 + 32,
+            // 16 packed scales + 64 quants + f16 d + f16 dmin.
+            Self::Q2K => 84,
+            // 32 high-bit masks + 64 two-bit quants + 12 scales + f16 d.
+            Self::Q3K => 110,
             Self::Q4K => k_quant::Q4_K_BLOCK_BYTES,
             Self::Q5K => k_quant::Q5_K_BLOCK_BYTES,
             Self::Q6K => k_quant::Q6_K_BLOCK_BYTES,
@@ -362,8 +382,11 @@ impl QKind {
     /// value here is a placeholder.
     fn gguf(self) -> GgufTensorType {
         match self {
+            Self::Q4_0 => GgufTensorType::Q4_0,
             Self::Q5_0 => GgufTensorType::Q5_0,
             Self::Q8_0 => GgufTensorType::Q8_0,
+            Self::Q2K => GgufTensorType::Q2K,
+            Self::Q3K => GgufTensorType::Q3K,
             Self::Q4K => GgufTensorType::Q4K,
             Self::Q5K => GgufTensorType::Q5K,
             Self::Q6K => GgufTensorType::Q6K,
@@ -417,6 +440,34 @@ struct QW {
     /// The whole-tensor owner, kept so an expert window can be re-sliced
     /// without copying.
     owner: Arc<dyn ByteOwner>,
+}
+
+/// Fused GEMV for the K-quant formats unpacked by [`k_quant`].
+///
+/// One 256-element scratch buffer is reused for the whole matrix, so a row costs
+/// a block unpack plus a dot, not an allocation. Only Q2_K/Q3_K take this path:
+/// everything else with a kernel is served by `oxillama`, whose AVX2 code is
+/// faster and whose layouts are validated against the same fixtures.
+fn gemv_k_quant(w: &QW, x: &[f32], out: &mut [f32]) -> Result<()> {
+    let bb = w.kind.block_bytes();
+    let rb = w.row_bytes();
+    let mut scratch = [0.0f32; k_quant::QK_K];
+    for (o, row) in out.iter_mut().zip(w.bytes().chunks_exact(rb)) {
+        let mut acc = 0.0f32;
+        for (b, blk) in row.chunks_exact(bb).enumerate() {
+            k_quant::dequant_block(w.kind.type_id(), blk, &mut scratch)
+                .map_err(|e| err(&format!("'{}': dequant block: {e}", w.name)))?;
+            let base = b * k_quant::QK_K;
+            let take = (w.m - base).min(k_quant::QK_K);
+            acc += scratch[..take]
+                .iter()
+                .zip(&x[base..base + take])
+                .map(|(a, b)| a * b)
+                .sum::<f32>();
+        }
+        *o = acc;
+    }
+    Ok(())
 }
 
 impl QW {
@@ -475,6 +526,7 @@ impl QW {
             QKind::F32 => gemv_bytes_f32(self.bytes(), self.m, self.n, x, out),
             QKind::F16 => gemv_bytes_f16(self.bytes(), self.m, self.n, x, out),
             QKind::Q2_0 => gemv_q2_0(self.bytes(), self.m, self.n, x, out),
+            QKind::Q2K | QKind::Q3K => gemv_k_quant(self, x, out),
             kind => {
                 // The K-quants go through `oxillama`'s dispatcher. It already
                 // carries validated AVX2/AVX-512 kernels for all of them, and
@@ -512,7 +564,10 @@ impl QW {
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()),
             QKind::Q2_0 => kore_kernels::q2_0::dequantize_q2_0(row, self.m),
-            QKind::Q5_0 | QKind::Q8_0 => {
+            // Q2_K/Q3_K stay in `k_quant`: it is the written specification,
+            // and it is the only implementation that matches gguf-py for Q3_K
+            // (`oxillama` 0.1.4 decodes that scale packing wrongly).
+            QKind::Q4_0 | QKind::Q5_0 | QKind::Q8_0 => {
                 oxillama_quant::dequantize_to_f32(row, self.kind.gguf(), self.m)
                     .map_err(|e| err(&format!("'{}': dequantize: {e}", self.name)))
             }
@@ -816,8 +871,8 @@ impl Qwen35Model {
             let kind = QKind::from_type_id(t.type_id).ok_or_else(|| {
                 err(&format!(
                     "tensor '{name}' has GGML type {}, which this loader has no \
-                     kernel for (supported: F32=0, F16=1, Q5_0=6, Q8_0=8, Q4_K=12, \
-                     Q5_K=13, Q6_K=14, Q2_0=42)",
+                     kernel for (supported: F32=0, F16=1, Q4_0=2, Q5_0=6, Q8_0=8, Q2_K=10, \
+                     Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, Q2_0=42)",
                     t.type_id
                 ))
             })?;
@@ -1820,7 +1875,16 @@ impl Qwen35Gpu {
             // Refuse at load rather than on the first token. A quant with no
             // device kernel is a property of the lane, not of the file, and
             // discovering it mid-generation reads like a corrupt model.
-            if matches!(w.kind, QKind::F32 | QKind::F16 | QKind::Q5_0 | QKind::Q8_0) {
+            if matches!(
+                w.kind,
+                QKind::F32
+                    | QKind::F16
+                    | QKind::Q2K
+                    | QKind::Q3K
+                    | QKind::Q4_0
+                    | QKind::Q5_0
+                    | QKind::Q8_0
+            ) {
                 return Err(err(&format!(
                     "the gpu lane has no kernel for {:?} weights (tensor '{}'); run the CPU lane",
                     w.kind, w.name
@@ -1995,8 +2059,8 @@ impl Qwen35Gpu {
             QKind::F32 | QKind::F16 => Err(err(
                 "unpacked F32/F16 weights have no device kernel; run the CPU lane",
             )),
-            QKind::Q5_0 | QKind::Q8_0 => Err(err(
-                "Q5_0/Q8_0 weights have no device kernel yet; run the CPU lane",
+            QKind::Q2K | QKind::Q3K | QKind::Q4_0 | QKind::Q5_0 | QKind::Q8_0 => Err(err(
+                "Q2_K/Q3_K/Q4_0/Q5_0/Q8_0 weights have no device kernel yet; run the CPU lane",
             )),
         }
     }

@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Generate the K-quant dequantization fixtures used by `k_quant`'s tests.
+"""Generate the quantized-format fixtures used by the quant tests.
 
 The point of this file is to make KORE's K-quant unpacking provable against an
 *independent* implementation rather than against my reading of the format. The
 oracle is `gguf.quants` -- the reference implementation shipped with `gguf-py`,
 which is the same code llama.cpp's Python tooling uses. Anything KORE claims
-about Q4_K/Q5_K/Q6_K block layouts is checked against it here.
+about a block layout is checked against it here.
+
+Covered: the K-quants KORE unpacks itself (Q4_K/Q5_K/Q6_K) and the formats the
+CPU lane hands to `oxillama_quant` (Q2_K, Q3_K, Q4_0, Q5_0, Q8_0). The legacy
+four are not boutique: a `Q4_K_M` file falls back to Q8_0/Q5_0 wherever a row is
+not a multiple of 256, and `Q2_K` falls back to Q4_0, so any real checkpoint
+mixes several of these.
 
 For each type we emit, as `<name>.raw` (payload bytes) and `<name>.f32`
 (reference dequantized f32, little-endian):
@@ -33,10 +39,21 @@ import sys
 import numpy as np
 
 from gguf import GGUFReader
-from gguf.quants import Q4_K, Q5_K, Q6_K
+from gguf.quants import Q2_K, Q3_K, Q4_0, Q4_K, Q5_0, Q5_K, Q6_K, Q8_0
 
 # ggml type ids, matching gguf_min::type_block.
-TYPES = {12: ("q4_k", Q4_K), 13: ("q5_k", Q5_K), 14: ("q6_k", Q6_K)}
+# Insertion order matters: the random-block generator draws from a single RNG
+# stream, so new types must be *appended* or every committed fixture changes.
+TYPES = {
+    12: ("q4_k", Q4_K),
+    13: ("q5_k", Q5_K),
+    14: ("q6_k", Q6_K),
+    2: ("q4_0", Q4_0),
+    6: ("q5_0", Q5_0),
+    8: ("q8_0", Q8_0),
+    10: ("q2_k", Q2_K),
+    11: ("q3_k", Q3_K),
+}
 
 # Number of 256-weight blocks per fixture. Small: these get committed.
 N_BLOCKS = 8
@@ -74,11 +91,19 @@ def finite_random_blocks(type_size: int, n_blocks: int, rng: np.random.Generator
     blocks = rng.integers(0, 256, size=(n_blocks, type_size), dtype=np.uint8)
     for lo, hi in scale_bytes:
         # f16 exponents 0x1c..0x2c are ordinary small magnitudes (2^-3 .. 2^4).
-        exp = rng.integers(0x1C, 0x2C, size=(n_blocks, 1)).astype(np.uint8)
+        exp = rng.integers(12, 28, size=(n_blocks, 1)).astype(np.uint8)  # 2^-3 .. 2^12
         sign = rng.integers(0, 2, size=(n_blocks, 1)).astype(np.uint8) << 7
-        mant = rng.integers(0, 256, size=(n_blocks, 1)).astype(np.uint8)
-        blocks[:, lo] = (sign | exp)[:, 0]
-        blocks[:, hi] = mant[:, 0]
+        mant_hi = rng.integers(0, 4, size=(n_blocks, 1)).astype(np.uint8)
+        mant_lo = rng.integers(0, 256, size=(n_blocks, 1)).astype(np.uint8)
+        # An f16 is little-endian: the *high* byte carries the sign, the
+        # exponent and the top mantissa bits; the low byte carries the rest.
+        # This used to write the exponent into the low byte, which left the
+        # exponent random -- so "forced finite" was not true, and a random
+        # inf/NaN scale silently made every *arithmetic* test vacuous (the
+        # dequantization comparisons still passed, because both sides read the
+        # same bytes).
+        blocks[:, hi] = (sign | (exp << 2) | mant_hi)[:, 0]
+        blocks[:, lo] = mant_lo[:, 0]
     return blocks
 
 
@@ -99,10 +124,18 @@ def main() -> int:
     # Where the f16 scale fields live inside a block, per type.
     #   Q4_K/Q5_K: d at [0,2), dmin at [2,4)   -> force both finite
     #   Q6_K:      d at [208,210)              -> force that one
+    #   Q2_K:      d at [80,82), dmin at [82,84)
+    #   Q3_K:      d at [108,110)
+    #   Q4_0/Q5_0/Q8_0: d at [0,2)
     scale_fields = {
         12: [(0, 1), (2, 3)],
         13: [(0, 1), (2, 3)],
         14: [(208, 209)],
+        2: [(0, 1)],
+        6: [(0, 1)],
+        8: [(0, 1)],
+        10: [(80, 81), (82, 83)],
+        11: [(108, 109)],
     }
 
     readers: dict[str, GGUFReader] = {}

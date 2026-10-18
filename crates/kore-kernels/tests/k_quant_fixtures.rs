@@ -23,6 +23,10 @@ const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/kquan
 
 /// Every fixture case: (name, GGML type id).
 const CASES: &[(&str, u32)] = &[
+    ("rand_q2_k", 10),
+    ("zero_q2_k", 10),
+    ("rand_q3_k", 11),
+    ("zero_q3_k", 11),
     ("real_q4_k", 12),
     ("real2_q4_k", 12),
     ("rand_q4_k", 12),
@@ -94,6 +98,12 @@ fn oxillama_kernel_matches_the_same_reference() {
     // Guards the assumption that the third-party kernels the CPU lane uses agree
     // with the layout we document and test against.
     for &(name, type_id) in CASES {
+        // Q2_K/Q3_K are unpacked by `k_quant` itself, not by `oxillama`
+        // (0.1.4's Q3_K mis-decodes the scale packing), so there is nothing to
+        // compare here for them.
+        if matches!(type_id, 10 | 11) {
+            continue;
+        }
         let raw = read_fixture(name, "raw");
         let want = expected_f32(name);
         let kernel = kernel_for(type_id);
@@ -116,6 +126,12 @@ fn fused_gemv_equals_dequant_then_dot() {
     // [1, K] weight matrix. A fused GEMV must agree with explicitly
     // dequantizing and dot-producting.
     for &(name, type_id) in CASES {
+        // Q2_K/Q3_K are unpacked by `k_quant` itself, not by `oxillama`
+        // (0.1.4's Q3_K mis-decodes the scale packing), so there is nothing to
+        // compare here for them.
+        if matches!(type_id, 10 | 11) {
+            continue;
+        }
         let raw = read_fixture(name, "raw");
         let deq = k_quant::dequantize(
             type_id,
@@ -127,7 +143,13 @@ fn fused_gemv_equals_dequant_then_dot() {
         let x: Vec<f32> = (0..k)
             .map(|i| ((i as f32) * 0.017 - 1.0).sin() * (1.0 + (i % 7) as f32 * 0.1))
             .collect();
-        let want: f32 = deq.iter().zip(&x).map(|(w, a)| w * a).sum();
+        // f64 reference: a random-byte fixture can hold magnitudes whose f32
+        // dot overflows, and `inf - inf` would report NaN for a good kernel.
+        let want: f64 = deq
+            .iter()
+            .zip(&x)
+            .map(|(w, a)| f64::from(*w) * f64::from(*a))
+            .sum();
 
         let ty = GgufTensorType::from_u32(type_id).unwrap();
         let qt = QuantTensor::new(raw.clone(), vec![1, k], ty);
@@ -138,11 +160,87 @@ fn fused_gemv_equals_dequant_then_dot() {
             .unwrap_or_else(|e| panic!("{name}: gemv failed: {e}"));
 
         let tol = 1e-4 * want.abs().max(1.0);
+        let diff = (f64::from(got[0]) - want).abs();
         assert!(
-            (got[0] - want).abs() <= tol,
-            "{name}: gemv {} vs dequant-dot {} (tol {tol:e})",
-            got[0],
-            want
+            diff <= tol,
+            "{name}: gemv {} vs dequant-dot {want} (|diff| {diff:e} > {tol:e})",
+            got[0]
+        );
+    }
+}
+
+/// Formats KORE does **not** unpack itself: the CPU lane hands them straight to
+/// `oxillama_quant`. Q2_K and Q3_K are **not** in this list even though the lane
+/// could route them there -- `oxillama` 0.1.4's Q3_K decodes the 12-byte scale
+/// packing as a Q4_K-style six-bit layout, and `rand_q3_k` catches it (the first
+/// sub-block matches, then it diverges: 1409/2048 elements). They are implemented
+/// in `k_quant` and covered by `CASES` instead. There are two reasons they are still in this file. First, a
+/// real checkpoint is a *mix*: `Q4_K_M` falls back to Q8_0/Q5_0 wherever a row
+/// is not a multiple of 256 (`ffn_down_exps` of a routed expert is exactly
+/// that), and `Q2_K` falls back to Q4_0. Second, they are the only proof that the
+/// third-party kernels agree with llama.cpp's reference on these layouts, which
+/// a token-level comparison cannot localize when it fails.
+const DISPATCHED: &[(&str, u32)] = &[
+    ("rand_q4_0", 2),
+    ("zero_q4_0", 2),
+    ("rand_q5_0", 6),
+    ("zero_q5_0", 6),
+    ("rand_q8_0", 8),
+    ("zero_q8_0", 8),
+];
+
+#[test]
+fn dispatched_formats_match_the_reference() {
+    for &(name, type_id) in DISPATCHED {
+        let raw = read_fixture(name, "raw");
+        let want = expected_f32(name);
+        let ty = GgufTensorType::from_u32(type_id).expect("known gguf type");
+        let (block_bytes, block_size) = (ty.block_bytes(), ty.block_size());
+        assert_eq!(raw.len(), want.len() / block_size * block_bytes, "{name}");
+        let kernel = kernel_for(type_id);
+        let mut got = vec![0.0f32; want.len()];
+        for b in 0..want.len() / block_size {
+            let blk = &raw[b * block_bytes..(b + 1) * block_bytes];
+            kernel
+                .dequant_block(blk, &mut got[b * block_size..(b + 1) * block_size])
+                .unwrap_or_else(|e| panic!("{name}: dequant_block failed: {e}"));
+        }
+        assert_bit_exact(name, &got, &want);
+    }
+}
+
+#[test]
+fn dispatched_formats_gemv_equals_dequant_then_dot() {
+    for &(name, type_id) in DISPATCHED {
+        let raw = read_fixture(name, "raw");
+        let want_f32 = expected_f32(name);
+        let k = want_f32.len();
+        let x: Vec<f32> = (0..k)
+            .map(|i| ((i as f32) * 0.017 - 1.0).sin() * (1.0 + (i % 7) as f32 * 0.1))
+            .collect();
+        // Accumulate the reference in f64: a random-byte fixture can hold
+        // magnitudes whose f32 dot overflows to inf, and `inf - inf` would
+        // report NaN for a perfectly good kernel.
+        let want: f64 = want_f32
+            .iter()
+            .zip(&x)
+            .map(|(w, a)| f64::from(*w) * f64::from(*a))
+            .sum();
+
+        let ty = GgufTensorType::from_u32(type_id).unwrap();
+        let qt = QuantTensor::new(raw.clone(), vec![1, k], ty);
+        let kernel = kernel_for(type_id);
+        let mut got = vec![0.0f32; 1];
+        kernel
+            .gemv(&qt, &x, &mut got)
+            .unwrap_or_else(|e| panic!("{name}: gemv failed: {e}"));
+
+        let tol = 1e-4 * want.abs().max(1.0);
+        let diff = (f64::from(got[0]) - want).abs();
+        assert!(
+            diff <= tol,
+            "{name}: gemv {} vs dequant-dot {want} (|diff| {diff:e} > {tol:e})",
+            got[0]
         );
     }
 }

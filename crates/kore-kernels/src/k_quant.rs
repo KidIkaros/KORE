@@ -33,10 +33,14 @@ use kore_core::KoreError;
 pub const QK_K: usize = 256;
 
 /// GGML type ids, matching [`crate::gguf`]-style readers (`gguf_min::type_block`).
+pub const Q2_K_TYPE_ID: u32 = 10;
+pub const Q3_K_TYPE_ID: u32 = 11;
 pub const Q4_K_TYPE_ID: u32 = 12;
 pub const Q5_K_TYPE_ID: u32 = 13;
 pub const Q6_K_TYPE_ID: u32 = 14;
 
+pub const Q2_K_BLOCK_BYTES: usize = 84;
+pub const Q3_K_BLOCK_BYTES: usize = 110;
 pub const Q4_K_BLOCK_BYTES: usize = 144;
 pub const Q5_K_BLOCK_BYTES: usize = 176;
 pub const Q6_K_BLOCK_BYTES: usize = 210;
@@ -45,6 +49,8 @@ pub const Q6_K_BLOCK_BYTES: usize = 210;
 /// is not one this module knows.
 pub const fn block_bytes(type_id: u32) -> Option<usize> {
     match type_id {
+        Q2_K_TYPE_ID => Some(Q2_K_BLOCK_BYTES),
+        Q3_K_TYPE_ID => Some(Q3_K_BLOCK_BYTES),
         Q4_K_TYPE_ID => Some(Q4_K_BLOCK_BYTES),
         Q5_K_TYPE_ID => Some(Q5_K_BLOCK_BYTES),
         Q6_K_TYPE_ID => Some(Q6_K_BLOCK_BYTES),
@@ -114,6 +120,145 @@ pub fn unpack_scales_min(scales: &[u8]) -> ([f32; 8], [f32; 8]) {
 
 /// Dequantize `n` elements of packed Q4_K. `n` need not be a multiple of 256;
 /// the tail block is truncated, which is how GGUF pads the final row.
+/// Unpack one Q2_K block (84 bytes, 256 weights).
+///
+/// Sixteen sub-blocks of 16 weights. `scales[i]` is the low nibble for the scale
+/// and the high nibble for the minimum; `qs` packs four 2-bit weights per byte,
+/// with the sub-block's byte *offset* (not a shift) selecting which quarter of
+/// the 32-byte half it lives in.
+fn q2_k_block(blk: &[u8], out: &mut [f32]) {
+    let d = f16::from_le_bytes([blk[80], blk[81]]).to_f32();
+    let dmin = f16::from_le_bytes([blk[82], blk[83]]).to_f32();
+    let scales = &blk[0..16];
+    let qs = &blk[16..80];
+
+    for i in 0..16 {
+        let dl = d * f32::from(scales[i] & 0x0F);
+        let ml = dmin * f32::from(scales[i] >> 4);
+        // Sub-blocks 0..8 live in the first 32-byte half of `qs`, 8..16 in the
+        // second; within a half the shift cycles every two sub-blocks and the
+        // 16-byte window alternates.
+        let bank = (i / 8) * 32;
+        let window = (i % 2) * 16;
+        let shift = ((i % 8) / 2) * 2;
+        for l in 0..16 {
+            let q = f32::from((qs[bank + window + l] >> shift) & 0x03);
+            out[i * 16 + l] = dl * q - ml;
+        }
+    }
+}
+
+/// Unpack one Q3_K block (110 bytes, 256 weights).
+///
+/// Sixteen sub-blocks of 16 weights, three bits each: two bits from `qs` and one
+/// from `hmask`, where a **set** mask bit means the high bit is zero (llama.cpp
+/// calls this "strangely, the offset is zero when the bitmask is 1"). The six-bit
+/// scales are split four low / two high: the first eight bytes hold sixteen
+/// nibbles in order and the last four bytes hold sixteen two-bit high parts,
+/// four per byte.
+fn q3_k_block(blk: &[u8], out: &mut [f32]) {
+    let hmask = &blk[0..32];
+    let qs = &blk[32..96];
+    let scales = &blk[96..108];
+    let d = f16::from_le_bytes([blk[108], blk[109]]).to_f32();
+
+    let mut sc = [0i32; 16];
+    for (i, s) in sc.iter_mut().enumerate() {
+        // The twelve scale bytes are laid out as (llama.cpp's own comment):
+        //    0: IIIIAAAA    4: MMMMEEEE    8: MMIIEEAA
+        //    1: JJJJBBBB    5: NNNNFFFF    9: NNJJFFBB
+        //    2: KKKKCCCC    6: OOOOGGGG   10: OOKKGGCC
+        //    3: LLLLDDDD    7: PPPPHHHH   11: PPLLHHDD
+        // so scales 0..8 are the *low* nibbles of bytes 0..8 and scales 8..16 the
+        // *high* nibbles of those same bytes -- not interleaved per byte.
+        let lo = if i < 8 {
+            scales[i] & 0x0F
+        } else {
+            scales[i - 8] >> 4
+        };
+        let hi = (scales[8 + i % 4] >> (2 * (i / 4))) & 0x03;
+        *s = i32::from(lo | (hi << 4)) - 32;
+    }
+
+    for (i, &s) in sc.iter().enumerate() {
+        let dl = d * s as f32;
+        let bank = (i / 8) * 32;
+        let window = (i % 2) * 16;
+        let shift = ((i % 8) / 2) * 2;
+        for l in 0..16 {
+            let idx = i * 16 + l;
+            let hi = (hmask[idx % 32] >> (idx / 32)) & 1;
+            let qh = i32::from(hi ^ 1);
+            let ql = i32::from((qs[bank + window + l] >> shift) & 0x03);
+            out[idx] = dl * (ql - (qh << 2)) as f32;
+        }
+    }
+}
+
+pub fn dequantize_q2_k(data: &[u8], n: usize) -> Result<Vec<f32>, KoreError> {
+    let nb = block_count("Q2_K", data, n, Q2_K_BLOCK_BYTES)?;
+    let mut out = vec![0.0f32; nb * QK_K];
+    for b in 0..nb {
+        let blk = &data[b * Q2_K_BLOCK_BYTES..(b + 1) * Q2_K_BLOCK_BYTES];
+        q2_k_block(blk, &mut out[b * QK_K..(b + 1) * QK_K]);
+    }
+    out.truncate(n);
+    Ok(out)
+}
+
+pub fn dequantize_q3_k(data: &[u8], n: usize) -> Result<Vec<f32>, KoreError> {
+    let nb = block_count("Q3_K", data, n, Q3_K_BLOCK_BYTES)?;
+    let mut out = vec![0.0f32; nb * QK_K];
+    for b in 0..nb {
+        let blk = &data[b * Q3_K_BLOCK_BYTES..(b + 1) * Q3_K_BLOCK_BYTES];
+        q3_k_block(blk, &mut out[b * QK_K..(b + 1) * QK_K]);
+    }
+    out.truncate(n);
+    Ok(out)
+}
+
+/// Unpack exactly one block into `out` (which must hold at least [`QK_K`] f32).
+///
+/// The CPU lane's GEMV uses this so a row can be unpacked into a single reused
+/// 256-element scratch buffer instead of allocating per row. Q4_K/Q5_K/Q6_K
+/// route through the whole-buffer entry point, since nothing needs them
+/// per-block yet.
+pub fn dequant_block(type_id: u32, block: &[u8], out: &mut [f32]) -> Result<(), KoreError> {
+    if out.len() < QK_K {
+        return Err(err(format!(
+            "k_quant: dequant_block needs {QK_K} outputs, got {}",
+            out.len()
+        )));
+    }
+    match type_id {
+        Q2_K_TYPE_ID => {
+            if block.len() < Q2_K_BLOCK_BYTES {
+                return Err(err(format!(
+                    "k_quant: Q2_K block needs {Q2_K_BLOCK_BYTES} bytes, got {}",
+                    block.len()
+                )));
+            }
+            q2_k_block(&block[..Q2_K_BLOCK_BYTES], &mut out[..QK_K]);
+            Ok(())
+        }
+        Q3_K_TYPE_ID => {
+            if block.len() < Q3_K_BLOCK_BYTES {
+                return Err(err(format!(
+                    "k_quant: Q3_K block needs {Q3_K_BLOCK_BYTES} bytes, got {}",
+                    block.len()
+                )));
+            }
+            q3_k_block(&block[..Q3_K_BLOCK_BYTES], &mut out[..QK_K]);
+            Ok(())
+        }
+        other => {
+            let vals = dequantize(other, block, QK_K)?;
+            out[..QK_K].copy_from_slice(&vals);
+            Ok(())
+        }
+    }
+}
+
 pub fn dequantize_q4_k(data: &[u8], n: usize) -> Result<Vec<f32>, KoreError> {
     let nb = block_count("Q4_K", data, n, Q4_K_BLOCK_BYTES)?;
     let mut out = vec![0.0f32; nb * QK_K];
@@ -220,11 +365,13 @@ pub fn dequantize_q6_k(data: &[u8], n: usize) -> Result<Vec<f32>, KoreError> {
 /// Q3_K, which are sized by the reader but have no kernel anywhere in KORE yet).
 pub fn dequantize(type_id: u32, data: &[u8], n: usize) -> Result<Vec<f32>, KoreError> {
     match type_id {
+        Q2_K_TYPE_ID => dequantize_q2_k(data, n),
+        Q3_K_TYPE_ID => dequantize_q3_k(data, n),
         Q4_K_TYPE_ID => dequantize_q4_k(data, n),
         Q5_K_TYPE_ID => dequantize_q5_k(data, n),
         Q6_K_TYPE_ID => dequantize_q6_k(data, n),
         other => Err(err(format!(
-            "k_quant: no dequantizer for GGML type {other} (only Q4_K=12, Q5_K=13, Q6_K=14)"
+            "k_quant: no dequantizer for GGML type {other} (Q2_K=10, Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14)"
         ))),
     }
 }
@@ -256,6 +403,8 @@ mod tests {
     #[test]
     fn zero_block_dequantizes_to_zero() {
         for (id, bytes) in [
+            (Q2_K_TYPE_ID, Q2_K_BLOCK_BYTES),
+            (Q3_K_TYPE_ID, Q3_K_BLOCK_BYTES),
             (Q4_K_TYPE_ID, Q4_K_BLOCK_BYTES),
             (Q5_K_TYPE_ID, Q5_K_BLOCK_BYTES),
             (Q6_K_TYPE_ID, Q6_K_BLOCK_BYTES),
@@ -272,7 +421,8 @@ mod tests {
     fn short_payload_is_an_error_not_a_panic() {
         let e = dequantize_q4_k(&[0u8; 100], QK_K).unwrap_err();
         assert!(format!("{e}").contains("payload too small"));
-        let e = dequantize(11, &[0u8; 256], QK_K).unwrap_err(); // Q3_K
+        // 15 is Q8_K, which this module deliberately does not unpack.
+        let e = dequantize(15, &[0u8; 256], QK_K).unwrap_err();
         assert!(format!("{e}").contains("no dequantizer"));
     }
 
