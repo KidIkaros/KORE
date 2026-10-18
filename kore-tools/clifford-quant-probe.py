@@ -168,8 +168,10 @@ def q4k_anchor(truth: np.ndarray):
 # same assumption the Hadamard arm has always made.
 
 
-def to_blocks(x: np.ndarray, width: int, cap: int = 1 << 20) -> np.ndarray:
-    flat = x.reshape(-1)[:cap]
+def to_blocks(x: np.ndarray, width: int, cap: int | None = 1 << 20) -> np.ndarray:
+    flat = x.reshape(-1)
+    if cap is not None:
+        flat = flat[:cap]
     n = (flat.size // width) * width
     return flat[:n].reshape(-1, width).astype(np.float64)
 
@@ -285,6 +287,23 @@ def rot_hadamard(b: np.ndarray) -> np.ndarray:
     return b @ h.T
 
 
+def rot_signs(b: np.ndarray, seed: int = 0) -> np.ndarray:
+    """The random diagonal `D` of the usual `H D` incoherence rotation."""
+    return np.random.default_rng(seed).choice(np.array([-1.0, 1.0]), size=b.shape[1])
+
+
+def rot_hadamard_signed(b: np.ndarray, seed: int = 0) -> np.ndarray:
+    """`H D x`: a plain WHT can *worsen* a structured input (worst case the
+    transform aligns with the data), which is why QuaRot/SpinQuant randomise the
+    signs. Cheap to check here whether real K/V care."""
+    return (b * rot_signs(b, seed)) @ hadamard(b.shape[1]).T
+
+
+def rot_hadamard_signed_inv(b: np.ndarray, seed: int = 0) -> np.ndarray:
+    """`D H y` -- the exact inverse, since `H` is symmetric and self-inverse."""
+    return (b @ hadamard(b.shape[1]).T) * rot_signs(b, seed)
+
+
 def report_rotations(tag: str, x: np.ndarray):
     b = to_blocks(x, 128)
     print(f"\n== {tag}  ({b.size} values, {b.shape[0]} x 128) ==")
@@ -313,7 +332,152 @@ def report_rotations(tag: str, x: np.ndarray):
     return rows
 
 
+# ================================================================ KV (P6.6a)
+# Same arm-C question, asked of the vectors the attention kernel actually
+# quantizes: post-RoPE K and raw V, dumped from the engine by
+# `cargo run --release -p kore-nn --example kv_dump`.
+#
+# Width matters here in a way it does not for weights. For weights the rotation
+# is free at any width (the transform is folded into the matmul input), so
+# `report_rotations` can just compare widths. For the KV cache a wide transform
+# *inside* the attention kernel costs `log2 d` per key-value pair -- which is why
+# the literature sits at 4 -- and the way out is to rotate at *append*, where it
+# commutes with the weighted sum and is therefore free at full width
+# (sum_j a_j (R v_j) = R sum_j a_j v_j). So the numbers below are what decides
+# whether the append-time route is worth the kernel work: if a 128-wide Hadamard
+# does not beat a 4-wide/quaternion one on real K and V, the cheap in-kernel
+# scheme wins and the append-time machinery is not justified.
+
+
+def read_kv(path: str):
+    """Parse the `KVDU` dump. Returns ([ (k, v), ... ], folded)."""
+    import struct as _s
+
+    with open(path, "rb") as f:
+        magic = f.read(4)
+        if magic != b"KVDU":
+            raise ValueError(f"{path}: bad magic {magic!r}")
+        ver, n_layers, folded = _s.unpack("<III", f.read(12))
+        if ver != 1:
+            raise ValueError(f"{path}: unsupported version {ver}")
+        out = []
+        for _ in range(n_layers):
+            kv_dim, ln = _s.unpack("<II", f.read(8))
+            k = np.frombuffer(f.read(ln * kv_dim * 4), dtype="<f4").reshape(ln, kv_dim)
+            v = np.frombuffer(f.read(ln * kv_dim * 4), dtype="<f4").reshape(ln, kv_dim)
+            out.append((k, v))
+    return out, bool(folded)
+
+
+def armc(b: np.ndarray, bits: int):
+    """The rotation arms at one bit rate: (rate, {name: rel RMSE}).
+
+    `b` is `[n, width]`, and the width is the whole point -- pass 128 for the
+    append-time scheme and 4 for the in-kernel compromise.
+    """
+    rate = bits + 16.0 / b.shape[1]
+    h = rot_hadamard(b)
+    hd = rot_hadamard_signed(b)
+    q = rot_quat4(b)
+    p = rot_givens2(b)
+    return rate, {
+        "AFF": rel(b, sym_aff_rows(b, bits)),
+        "had": rel(b, rot_hadamard(sym_aff_rows(h, bits))),
+        "hadD": rel(b, rot_hadamard_signed_inv(sym_aff_rows(hd, bits))),
+        "quat4": rel(b, rot_quat4_inv(sym_aff_rows(q, bits))),
+        "givens2": rel(b, rot_givens2(sym_aff_rows(p, bits), inverse=True)),
+    }
+
+
+def excess_kurtosis(b: np.ndarray) -> float:
+    m = b.mean(axis=1, keepdims=True)
+    var = ((b - m) ** 2).mean(axis=1)
+    return float(((b - m) ** 4).mean() / max((var ** 2).mean(), 1e-30)) - 3.0
+
+
+def report_kv(path: str, bits: int = 4, width: int = 128):
+    layers, folded = read_kv(path)
+    n_layers = len(layers)
+    ln, kv_dim = layers[0][0].shape
+    print(
+        f"\n== KV dump {path}\n   {n_layers} full-attention layers, kv_dim {kv_dim}, "
+        f"len {ln}, folded={folded}, {bits} adjustable bits + one f16 scale per block =="
+    )
+
+    # The width sweep is the part that is *not* the same as the weight question.
+    # A wider block is also a *cheaper* block: one f16 scale per `width` values,
+    # so widening lowers the rate as well as the error. The consumer decides how
+    # wide it can afford to be -- for the KV cache, in-kernel costs log2(width)
+    # per key-value pair and append-time costs nothing -- so this prints both the
+    # quality and the price for each width and leaves the trade explicit.
+    #
+    # Averaged per layer rather than pooled: pooling concatenates layers and a
+    # cap then silently truncates to the first layer, which hid a layer that
+    # improves 2.6x behind a mean that said 1.2x.
+    arms = ("AFF", "had", "hadD", "quat4", "givens2")
+    widths = (32, 64, 128, 256)
+    for half, which in (("K", 0), ("V", 1)):
+        print(f"\n-- {half} width sweep (mean over {n_layers} layers, all values)")
+        print(f"{'width':>6}{'b/w':>8}" + "".join(f"{n:>10}" for n in arms) + f"{'kurt':>8}")
+        stats: dict[int, dict[str, float]] = {}
+        for w in widths:
+            acc: dict[str, list[float]] = {n: [] for n in arms}
+            kurts = []
+            for k, v in layers:
+                b = to_blocks((k, v)[which], w, None)
+                _, r = armc(b, bits)
+                for n in acc:
+                    acc[n].append(r[n])
+                kurts.append(excess_kurtosis(b))
+            m = {n: float(np.mean(acc[n])) for n in acc}
+            stats[w] = m
+            print(
+                f"{w:>6}{bits + 16.0 / w:>8.3f}"
+                + "".join(f"{m[n]:>10.4%}" for n in arms)
+                + f"{np.mean(kurts):>8.2f}"
+            )
+        # The in-kernel arms are what the plan is choosing against, so price them
+        # properly: of the log-error reduction a full-width append-time rotation
+        # buys at this width, how much does an in-kernel one buy for the same
+        # dots? A quarter of the gain is the whole reason this question is asked.
+        print(f"{'':>6}{'append':>10}{'SO(4)':>10}{'pair':>10}  (share of the log-error gain)")
+        for w in widths:
+            m = stats[w]
+            total = np.log(m["AFF"] / m["had"])
+            print(
+                f"{w:>6}{'100%':>10}"
+                + "".join(f"{np.log(m['AFF'] / m[n]) / total:>9.0%}" for n in ("quat4", "givens2"))
+            )
+
+    print(f"\n-- per layer at {width}-wide blocks, {bits + 16.0 / width:.3f} b/w")
+    for half, which in (("K", 0), ("V", 1)):
+        per = [armc(to_blocks((k, v)[which], width, None), bits) for k, v in layers]
+        kurt = np.mean([excess_kurtosis(to_blocks((k, v)[which], width, None)) for k, v in layers])
+        print(f"\n{half}: mean excess kurtosis {kurt:+.2f}")
+        names = ("AFF", "had", "hadD", "quat4", "givens2")
+        print(f"{'layer':<8}" + "".join(f"{n:>10}" for n in names))
+        for i, (_, r) in enumerate(per):
+            print(f"{i:<8}" + "".join(f"{r[n]:>10.4%}" for n in names))
+        mean = {n: float(np.mean([r[n] for _, r in per])) for n in names}
+        best = min(mean, key=lambda n: mean[n])
+        print(f"{'mean':<8}" + "".join(f"{mean[n]:>10.4%}" for n in names))
+        print(
+            f"{'vs AFF':<8}"
+            + "".join(f"{mean['AFF'] / mean[n]:>9.2f}x" for n in names)
+            + f"   best {best} ({mean['AFF'] / mean[best]:.2f}x)"
+        )
+
+
 if __name__ == "__main__":
+    import sys
+
+    # KV mode is standalone: it needs a dump, not the models the default sweep
+    # dequantizes, and it is the P6.6a measurement rather than the arm-B/C weight
+    # probe.
+    if len(sys.argv) > 2 and sys.argv[1] == "--kv":
+        report_kv(sys.argv[2], bits=int(sys.argv[3]) if len(sys.argv) > 3 else 4)
+        raise SystemExit(0)
+
     pocket = "/tmp/opencode/pocket-35b-q2k.gguf"
     ornith = "/home/ikaaros/Coding/Gold/kore/models/ornith-9b/Ornith-1.0-9B-Q4_K_M.gguf"
 

@@ -757,6 +757,27 @@ pub struct AttnState {
     len: usize,
 }
 
+impl AttnState {
+    /// The appended keys and values, `[len * kv_dim]` each.
+    ///
+    /// `k` is post-RoPE and `v` is raw, i.e. exactly what a KV quantizer is
+    /// handed. That is why the KV probe (plan §14.22, P6.6a) reads the cache
+    /// instead of recomputing the projections and hoping they agree.
+    pub fn kv(&self) -> (&[f32], &[f32]) {
+        (&self.k, &self.v)
+    }
+
+    /// Rows appended so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing has been appended yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 pub struct Qwen35Model {
     pub cfg: Qwen35Config,
     emb: QW,
