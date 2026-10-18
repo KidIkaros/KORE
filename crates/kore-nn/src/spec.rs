@@ -25,6 +25,9 @@
 //!   distribution (`draft_headroom`) is what picks `min_match`; firing on any
 //!   match at all is *worse* than not drafting.
 
+use std::collections::VecDeque;
+use std::time::Instant;
+
 use kore_core::{KoreError, Result};
 
 use crate::qwen35::{Qwen35Gpu, Qwen35Model, MAX_BATCH_COLS};
@@ -51,6 +54,11 @@ pub struct DraftPolicy {
     /// on a very long context; past this the odds of a still-valid continuation
     /// are not worth the microseconds.
     pub search_back: usize,
+    /// Whether to keep checking that drafting is paying for itself (see
+    /// [`PayoffGuard`]). On by default: it cannot change the output, only which
+    /// steps are batched, and it is the thing that keeps a policy tuned for one
+    /// device from being a net loss on another.
+    pub guard: bool,
 }
 
 impl Default for DraftPolicy {
@@ -63,6 +71,7 @@ impl Default for DraftPolicy {
             min_match: 4,
             max_match: 16,
             search_back: 16384,
+            guard: true,
         }
     }
 }
@@ -78,6 +87,7 @@ impl DraftPolicy {
             min_match,
             max_match: self.max_match.max(min_match),
             search_back: self.search_back.max(1),
+            guard: self.guard,
         }
     }
 
@@ -183,6 +193,108 @@ impl SpecStats {
     }
 }
 
+/// Keeps a spec run honest about whether drafting is still paying for itself.
+///
+/// A fired step over `m` columns costs `C(m)`, a plain step `C(1)`, and a fired
+/// step emits `1 + j` tokens against a plain step's 1. So a fire is worth taking
+/// iff `1 + j̄ > C(m)/C(1)` — on this box about **1.33 accepted drafts at
+/// `m = 4`**, which the measured trigger clears with room to spare (94–100% of
+/// drafts accepted, against the ~75% rejection rate that would break even).
+///
+/// But `C(m)/C(1)` is a property of the *device*, not of the trigger. A backend
+/// whose batched pass is relatively more expensive — or a device where it is
+/// relatively cheaper, and the trigger is therefore too timid — can turn the
+/// same policy into the wrong answer. So the guard does not assume the ratio.
+/// It keeps the passes' own **tokens per millisecond** and pauses drafting when
+/// a fired step stops beating a plain one.
+///
+/// That comparison is the objective itself, and it is what makes the guard safe
+/// to leave on: it is not a proxy for whether drafting pays, it *is* whether
+/// drafting pays, measured on the machine currently running rather than on a
+/// cost model tuned for this laptop.
+///
+/// Two more properties matter:
+///
+/// * **It cannot change the output.** It only chooses which steps run batched,
+///   and a batched step that a draft does not survive is rewound; the token
+///   stream is the plain-greedy one either way. `bench_draft`'s identity gate
+///   therefore still applies verbatim.
+/// * **It cannot lock out.** A paused guard re-probes every
+///   [`GUARD_REPROBE`] plain steps, so a workload that turns repetitive halfway
+///   through is picked up again. A guard that never re-probed would be the more
+///   dangerous design — it would silently keep paying the tax on a run that had
+///   started to win.
+struct PayoffGuard {
+    /// `(tokens, ms)` for the most recent plain steps: the bar to clear.
+    plain: VecDeque<(f64, f64)>,
+    /// `(tokens, ms)` for the most recent fires, including the rewind a partial
+    /// acceptance costs — that copy is part of what a fire actually spends.
+    fires: VecDeque<(f64, f64)>,
+    /// Plain steps taken since the last fire, so a paused guard re-probes.
+    since_fire: usize,
+}
+
+/// Plain steps remembered. Long enough to average out the noise in a
+/// millisecond-scale measurement, short enough to track a growing context.
+const GUARD_PLAIN_WINDOW: usize = 16;
+/// Fires remembered. Shorter than the plain window because fires are rarer and
+/// the thing being detected is a persistent bias, not a single bad draw.
+const GUARD_FIRE_WINDOW: usize = 6;
+/// How many fires to observe before the guard is willing to have an opinion.
+const GUARD_MIN_FIRES: usize = 3;
+/// Plain steps a paused guard waits before spending one fire to re-check.
+const GUARD_REPROBE: usize = 16;
+/// A fire must beat a plain step by this much. Below 1.0 so that measurement
+/// noise cannot pause drafting over a difference that is not real.
+const GUARD_TOLERANCE: f64 = 0.98;
+
+impl PayoffGuard {
+    fn new() -> Self {
+        Self {
+            plain: VecDeque::with_capacity(GUARD_PLAIN_WINDOW),
+            fires: VecDeque::with_capacity(GUARD_FIRE_WINDOW),
+            since_fire: 0,
+        }
+    }
+
+    fn record_plain(&mut self, emitted: usize, cost_ms: f64) {
+        push_windowed(&mut self.plain, GUARD_PLAIN_WINDOW, emitted, cost_ms);
+        self.since_fire += 1;
+    }
+
+    fn record_fire(&mut self, emitted: usize, cost_ms: f64) {
+        push_windowed(&mut self.fires, GUARD_FIRE_WINDOW, emitted, cost_ms);
+        self.since_fire = 0;
+    }
+
+    /// Whether the next step is allowed to draft. Optimistic until there is
+    /// enough evidence either way, and it re-probes rather than locking out, so
+    /// the answer is never "no forever".
+    fn may_fire(&self) -> bool {
+        if self.fires.len() < GUARD_MIN_FIRES || self.plain.is_empty() {
+            return true;
+        }
+        if self.since_fire >= GUARD_REPROBE {
+            return true;
+        }
+        let fire_tokens: f64 = self.fires.iter().map(|(e, _)| e).sum();
+        let fire_ms: f64 = self.fires.iter().map(|(_, c)| c).sum();
+        let plain_tokens: f64 = self.plain.iter().map(|(e, _)| e).sum();
+        let plain_ms: f64 = self.plain.iter().map(|(_, c)| c).sum();
+        // Same units on both sides -- tokens per millisecond -- so this is a
+        // statement about throughput and not about cost ratios. Cross-multiplied
+        // to keep it to integers and one division.
+        fire_tokens * plain_ms >= GUARD_TOLERANCE * plain_tokens * fire_ms
+    }
+}
+
+fn push_windowed(w: &mut VecDeque<(f64, f64)>, cap: usize, emitted: usize, cost_ms: f64) {
+    if w.len() == cap {
+        w.pop_front();
+    }
+    w.push_back((emitted as f64, cost_ms));
+}
+
 impl Qwen35Gpu {
     /// Greedy decode with prompt-lookup drafting.
     ///
@@ -207,6 +319,7 @@ impl Qwen35Gpu {
         let mut states = self.new_state(max_ctx)?;
         let mut arena = self.new_rewind()?;
         let mut stats = SpecStats::default();
+        let mut guard = PayoffGuard::new();
         let mut out: Vec<u32> = Vec::with_capacity(n_new);
         let mut hist: Vec<u32> = tokens.to_vec();
         let mut pos = tokens.len();
@@ -220,12 +333,18 @@ impl Qwen35Gpu {
             if next == eos {
                 break;
             }
-            let drafts = policy.drafts(&hist, next);
+            let drafts = if policy.guard && !guard.may_fire() {
+                Vec::new()
+            } else {
+                policy.drafts(&hist, next)
+            };
             let m = 1 + drafts.len();
             if drafts.is_empty() || pos + m > max_ctx {
                 out.push(next);
                 hist.push(next);
+                let t = Instant::now();
                 next = self.forward(cpu, next, pos, &mut states)?;
+                guard.record_plain(1, t.elapsed().as_secs_f64() * 1e3);
                 pos += 1;
                 stats.plain += 1;
                 continue;
@@ -237,6 +356,7 @@ impl Qwen35Gpu {
             let mut batch = Vec::with_capacity(m);
             batch.push(next);
             batch.extend_from_slice(&drafts);
+            let t = Instant::now();
             let outs = self.forward_verify(cpu, &batch, pos, &mut states, &mut arena)?;
 
             // Longest prefix of drafts the model reproduced.
@@ -248,6 +368,9 @@ impl Qwen35Gpu {
             if j < drafts.len() {
                 self.rewind(&mut states, &arena, 1 + j)?;
             }
+            // Timed through the rewind: a fire that gets cut short really does
+            // spend that copy, and the guard must see it.
+            let fire_ms = t.elapsed().as_secs_f64() * 1e3;
             stats.fired += 1;
             stats.drafts += drafts.len();
             stats.accepted += j;
@@ -256,11 +379,13 @@ impl Qwen35Gpu {
             let committed = &batch[..1 + j];
             match committed.iter().position(|&t| t == eos) {
                 Some(stop) => {
+                    guard.record_fire(stop, fire_ms);
                     out.extend_from_slice(&committed[..stop]);
                     hist.extend_from_slice(&committed[..stop]);
                     break;
                 }
                 None => {
+                    guard.record_fire(committed.len(), fire_ms);
                     out.extend_from_slice(committed);
                     hist.extend_from_slice(committed);
                 }
@@ -374,5 +499,66 @@ mod tests {
         }
         .clamped();
         assert_eq!(p.k, MAX_BATCH_COLS - 1);
+    }
+
+    /// The guard is optimistic until it has seen enough fires to have an
+    /// opinion, and it never pauses on a run it has no baseline for.
+    #[test]
+    fn the_guard_lets_drafting_through_until_it_has_evidence() {
+        let mut g = PayoffGuard::new();
+        assert!(g.may_fire(), "nothing measured yet");
+        g.record_plain(1, 10.0);
+        assert!(g.may_fire(), "one plain step is not evidence about fires");
+        g.record_fire(1, 23.3);
+        g.record_fire(1, 23.3);
+        assert!(g.may_fire(), "still under GUARD_MIN_FIRES");
+    }
+
+    /// The test is throughput, not a cost ratio: a plain step makes 1 token in
+    /// 10 ms, a 3-draft fire that lands none makes 1 in 23.3 ms. 0.043 tokens/ms
+    /// against 0.100 is not close.
+    #[test]
+    fn a_fire_that_is_slower_than_a_plain_step_pauses_drafting() {
+        let mut g = PayoffGuard::new();
+        for _ in 0..GUARD_PLAIN_WINDOW {
+            g.record_plain(1, 10.0);
+        }
+        for _ in 0..GUARD_MIN_FIRES {
+            g.record_fire(1, 23.3);
+        }
+        assert!(!g.may_fire(), "1 token per 23.3 ms loses to 1 per 10 ms");
+    }
+
+    /// The same cost, three drafts accepted: 4 tokens per 23.3 ms is 0.172
+    /// tokens/ms, comfortably ahead of the plain step's 0.100.
+    #[test]
+    fn a_fire_that_is_faster_than_a_plain_step_keeps_drafting() {
+        let mut g = PayoffGuard::new();
+        for _ in 0..GUARD_PLAIN_WINDOW {
+            g.record_plain(1, 10.0);
+        }
+        for _ in 0..GUARD_MIN_FIRES {
+            g.record_fire(4, 23.3);
+        }
+        assert!(g.may_fire());
+    }
+
+    /// A paused guard spends one fire every `GUARD_REPROBE` plain steps to
+    /// re-check, so a workload that turns repetitive halfway through is picked
+    /// up again with no external signal.
+    #[test]
+    fn a_paused_guard_re_probes_instead_of_locking_out() {
+        let mut g = PayoffGuard::new();
+        for _ in 0..GUARD_PLAIN_WINDOW {
+            g.record_plain(1, 10.0);
+        }
+        for _ in 0..GUARD_MIN_FIRES {
+            g.record_fire(1, 23.3);
+        }
+        assert!(!g.may_fire());
+        for _ in 0..GUARD_REPROBE {
+            g.record_plain(1, 10.0);
+        }
+        assert!(g.may_fire(), "the next fire is the re-probe");
     }
 }

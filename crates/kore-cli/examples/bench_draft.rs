@@ -14,8 +14,10 @@
 //! worth anything).
 //!
 //! Usage: `bench_draft <gguf> <tokenizer> <prompt> <n_new> <rounds> [policies]`
-//! `policies` is a comma separated list of `k:min_match`; default `3:4`, which
-//! `draft_headroom` measures as the optimum. `3:4,2:4,1:4` compares k.
+//! `policies` is a comma separated list of `k:min_match[:guard]`; default
+//! `3:4`, which `draft_headroom` measures as the optimum. `3:4,2:4,1:4`
+//! compares k, and `3:1:1,3:1:0` compares the payoff guard on a policy whose
+//! trigger is deliberately too weak.
 
 use kore_nn::qwen35::Qwen35Gpu;
 use kore_nn::qwen35::Qwen35Model;
@@ -47,9 +49,16 @@ fn parse_policy(s: &str) -> DraftPolicy {
     let mut it = s.split(':');
     let k = it.next().and_then(|x| x.parse().ok()).unwrap_or(3);
     let min_match = it.next().and_then(|x| x.parse().ok()).unwrap_or(4);
+    // Optional third field: the payoff guard, so a run can carry guarded and
+    // unguarded arms of the same policy and compare them under one clock.
+    let guard = match it.next() {
+        Some(g) => g != "0" && g != "off",
+        None => true,
+    };
     DraftPolicy {
         k,
         min_match,
+        guard,
         ..Default::default()
     }
     .clamped()
@@ -86,7 +95,7 @@ fn main() {
         rounds,
         policies
             .iter()
-            .map(|p| format!("k={}/n>={}", p.k, p.min_match))
+            .map(|p| format!("k={}/n>={}{}", p.k, p.min_match, if p.guard { "" } else { "/noguard" }))
             .collect::<Vec<_>>()
             .join(" ")
     );
@@ -157,7 +166,12 @@ fn main() {
         let st = &stats[arm];
         println!(
             "  {:>10} {:>9.3} {:>9.1} {:>7.3}x {:>7.1}% {:>6.1}%  {}/{}/{}/{}",
-            format!("k={} n>={}", policies[arm - 1].k, policies[arm - 1].min_match),
+            format!(
+                "k={} n>={}{}",
+                policies[arm - 1].k,
+                policies[arm - 1].min_match,
+                if policies[arm - 1].guard { "" } else { " noguard" }
+            ),
             s / n_new as f64,
             1e3 / (s / n_new as f64),
             p / s,

@@ -26,7 +26,7 @@
 > all 9 paired rounds favouring the pooled arm and tokens byte-identical.
 >
 > The levers that were left have since landed: **chunked prefill** (2.13×, §2d)
-> and **prompt-lookup speculative decoding** (1.29–1.50×, §2e, byte-identical to
+> and **prompt-lookup speculative decoding** (1.29–1.64×, §2e, byte-identical to
 > greedy). `had_pre`'s row-wide reduction is measured and **refuted** as a lever
 > (0.28 ms / 3.2% ceiling). The **MoE expert-offload engine now exists and is
 > verified at synthetic
@@ -706,7 +706,7 @@ m=1 figure inside a chunk. A chunked parallel scan would collapse that to ~1×,
 worth roughly 10% of a chunk. `GpuState` snapshot/restore is still the missing
 piece for a prefill that is *re-run*.
 
-#### 2e. Prompt-lookup speculative decoding — LANDED, bit-identical, 1.29–1.50×
+#### 2e. Prompt-lookup speculative decoding — LANDED, bit-identical, 1.29–1.64×
 
 §2c/§2d built the batched pass; §2e is its second consumer, and the one that
 attacks the *per-token* cost instead of the per-prompt one. A verify pass over
@@ -722,7 +722,7 @@ small model is asked to do — rewrites, summaries, extractions, code edits, and
 (measured, repeatedly) anything the model has fallen into a repetition loop
 about.
 
-**Two properties make it safe to ship.**
+**Three properties make it safe to ship.**
 
 - **Greedy acceptance is exact.** A pass is bit-identical to sequential
   decoding column by column, and it is `Head::Every`, so column `r`'s argmax
@@ -730,10 +730,13 @@ about.
   is accepted iff it equals that argmax. A wrong draft can therefore only waste
   a pass; it can never change the output.
 - **The trigger decides whether it pays.** A fired step at `m = 4` costs
-  ~22 ms against ~9 ms plain, so the *average* accepted prefix must clear ~1.7
+  ~22 ms against ~9 ms plain, so the *average* accepted prefix must clear ~1.33
   tokens for a fire to be worth it. Firing on any match at all is measurably
-  **worse than not drafting** (1.11× at `k=3, n≥1` on the story prompt);
-  requiring a 4-gram is what turns the same machinery into 1.29×.
+  **worse than not drafting** (1.08× at `k=3, n≥1` on the story prompt);
+  requiring a 4-gram is what turns the same machinery into 1.30×.
+- **And a guard checks the arithmetic against the machine actually running**
+  (below), so the fixed trigger is a *starting point* rather than an assumption
+  about the device.
 
 **Rewind.** Cutting a batch short needs two different mechanisms because the
 two kinds of state are different (`Rewind`, `forward_verify`, `rewind(keep)`):
@@ -768,6 +771,19 @@ plain greedy **element for element** before any timing is printed:
 | code continuation (19 → 192) | **1.495×** | | | |
 | paragraph rewrite (37 → 192) | 1.482× | 1.451× | 1.398× | |
 | list continuation (26 → 96) | 1.342× | | | |
+| register rewrite, longer loop (38 → 192) | **1.642×** | | | |
+
+The last row is the `m = 4` ceiling being approached: 92.2% of steps fired and
+**100%** of 47 fires landed all three drafts, because the model reproduced the
+instruction's own phrasing. That is the honest top of the envelope for a prompt
+whose continuation is largely its own echo, and it is checked against
+`generate_greedy` like every other row.
+
+`k=3, n≥4` on the story prompt: 29.3% of steps fired, 94.3% of drafts accepted,
+`P(j) = 2/0/1/38` — i.e. of 41 fired steps, 38 accepted all three drafts. The
+replay had projected 28.8% / 94.2% / 1.31× on the same prompt, so the shipped
+matcher and the scored matcher agree to the tenth of a percent. All arms,
+192–256 tokens, **byte-identical to `generate_greedy`**.
 
 `k=3, n≥4` on the story prompt: 29.3% of steps fired, 94.3% of drafts accepted,
 `P(j) = 2/0/1/38` — i.e. of 41 fired steps, 38 accepted all three drafts. The
@@ -797,15 +813,67 @@ matcher and the scored matcher agree to the tenth of a percent. All arms,
   caching* (re-running a prefill), which is a different feature from this one:
   spec decode rewinds *within* a pass, prefix caching rewinds *between* calls.
 
+**The payoff guard — the one part that is not tuned to this laptop.** The
+break-even condition above, `1 + j̄ > C(m)/C(1)`, depends on the *device*: the
+trigger is measured on this box, where an `m = 4` fire costs ~2.3 plain steps.
+On a device where a batched pass is relatively more expensive the same policy
+becomes a net loss, and on one where it is relatively *cheaper* the trigger is
+needlessly timid. Since the requirement is that this engine work anywhere, the
+policy does not get to assume the ratio. `generate_spec` instead measures
+**tokens per millisecond** for the last 16 plain steps and the last 6 fires, and
+pauses drafting while a fire is not beating a plain step. That comparison is
+the objective itself, so it cannot suppress a fire that is genuinely
+profitable, whatever the backend.
+
+This is worth shipping because of how it behaves at both ends, measured in one
+interleaved run on the story prompt (all six arms byte-identical to greedy):
+
+| policy | guarded | unguarded |
+|---|---|---|
+| `k=3, n≥4` (the tuned default) | **1.299×** | 1.289× |
+| `k=3, n≥1` (deliberately too weak) | **1.239×** | 1.077× |
+| `k=2, n≥1` (deliberately too weak) | **1.212×** | 1.135× |
+
+On the tuned policy the guard fires on *precisely the same steps* as the
+unguarded arm — same `fire%` (29.3%), same `P(j) = 2/0/1/38` — so the 1.299 vs
+1.289 is run-to-run noise and the guard costs nothing where drafting already
+wins. On the weak triggers it recovers most of the loss by refusing the
+fires that were being rejected, which is exactly the job. Two further
+properties: it can never change the output (it only chooses which steps are
+batched), and it can never lock out — a paused guard spends one fire every 16
+plain steps to re-probe, so a run that turns repetitive halfway through is
+picked up again with no external signal.
+
+Its correctness rests on a negative result worth recording, because the first
+two attempts got it wrong. Both an "emitted vs plain-step equivalents" window
+and an EMA baseline drifted *against* drafting on a rising-context run, for the
+same reason: normalising each sample by a baseline that includes or lags it
+makes a plain step look like it cost slightly more than one equivalent, and the
+error accumulates. On the tuned policy that artefact cost **3.5%** (1.284× →
+1.239×) and suppressed a quarter of the fires that should have fired. Comparing
+raw tokens-per-ms on both sides has no such bias. *A guard that is measured by
+proxy will find the proxy's bias.*
+
+**Reaching it.** `Qwen35Gpu::generate_spec` is wired into the `bonsai` smoke
+test as its third mode (`... <prompt> <n_new> spec [k:min_match]`), alongside
+the CPU reference and the plain GPU path, so the whole feature is one command
+away and its `SpecStats` are printed next to the tokens. All three modes still
+reproduce the saved token-id witness byte for byte. The policy is a runtime
+value, not a compile-time one, which is what the hardware-agnostic requirement
+asks for; `DraftPolicy::default()` is the measured `k=3, n≥4` with the guard on.
+
 **Gates.** `verify_m` grew a rewind leg: for every `keep` in `1..=cols`, and for
 `cols ∈ {m, m-1}` so the arena is filled by two passes of *different* widths
 back to back, a probe step from the truncated state must agree with an
 independently built sequential state. Green at `m = 1, 2, 4` (7 keep-points at
-`m=4`). `spec.rs` carries 9 host-side unit tests for the matcher (longest wins,
-ties go to the most recent, `k` caps the draft but not the reported length, a
-match at the very end drafts nothing, `search_back` bounds the scan).
+`m=4`). `spec.rs` carries 13 host-side unit tests: 9 for the matcher (longest
+wins, ties go to the most recent, `k` caps the draft but not the reported
+length, a match at the very end drafts nothing, `search_back` bounds the scan)
+and 4 for the guard (optimistic until it has evidence, a fire slower than a
+plain step pauses drafting, a faster one does not, and a paused guard re-probes
+rather than locking out).
 `bench_draft` is the end-to-end token-identity gate. `cargo test -p kore-nn`
-159 pass, `-p kore-core` 91, `-p kore-vulkan` 22.
+163 pass, `-p kore-core` 91, `-p kore-vulkan` 22.
 
 ### 3. Small-op fusion/parallelisation (~25% of the token)
 
@@ -998,7 +1066,7 @@ byte-identical to that many single-token steps (`verify_m`, 325/325 at
 `m = 1, 2, 4`). **Chunked prefill is the first real consumer of it, and it
 landed at 2.13×** (§2d) — prefill is the one place the batch is free, because
 there is no draft that has to be accepted. **Spec decode is the second, and it
-landed at 1.29–1.50×** (§2e): a prompt-lookup drafter whose drafts are accepted
+landed at 1.29–1.64×** (§2e): a prompt-lookup drafter whose drafts are accepted
 on the batched argmax, rewound column by column when they are not, so the
 output is byte-identical to plain greedy and a wrong draft can only cost a
 wasted pass.
@@ -1045,7 +1113,7 @@ and it is now fixed):
    snapshot/restore is still the missing piece for a prefill that is *re-run*
    (prefix caching), which is a different feature from §2e: spec decode rewinds
    *within* a pass, prefix caching rewinds *between* calls.
-3. **Spec decode (the per-token lever) — LANDED at 1.29–1.50×, and it is the
+3. **Spec decode (the per-token lever) — LANDED at 1.29–1.64×, and it is the
    last ungated decode lever.** Prompt-lookup drafting over the text itself:
    the context's last 4-gram, last seen earlier in the prompt-or-output,
    proposes what followed it there. `rewind` restores the DeltaNet state per
