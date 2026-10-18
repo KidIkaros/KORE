@@ -64,7 +64,14 @@ struct Walk {
     ms: f64,
 }
 
-fn walk(all: &[u32], start: usize, k: usize, max_len: usize, t: &Trigger, step_ms: &[f64; 5]) -> Walk {
+fn walk(
+    all: &[u32],
+    start: usize,
+    k: usize,
+    max_len: usize,
+    t: &Trigger,
+    step_ms: &[f64; 5],
+) -> Walk {
     let mut w = Walk {
         steps: 0,
         fires: 0,
@@ -150,7 +157,8 @@ fn main() {
                 break;
             }
             v.push(next);
-            next = gpu.forward(&model, next, n_prefill + k, &mut st)
+            next = gpu
+                .forward(&model, next, n_prefill + k, &mut st)
                 .expect("forward");
         }
         v
@@ -187,7 +195,8 @@ fn main() {
             let t = Instant::now();
             for _ in 0..n_calls {
                 if m == 1 {
-                    gpu.forward(&model, timing[*pos], *pos, st).expect("forward");
+                    gpu.forward(&model, timing[*pos], *pos, st)
+                        .expect("forward");
                     *pos += 1;
                 } else {
                     gpu.forward_batch(&model, &timing[*pos..*pos + m], *pos, st)
@@ -200,14 +209,16 @@ fn main() {
         // warm every width (clock ramp) before any timing
         for &m in &widths {
             let mut st = gpu.new_state(max_ctx).expect("state");
-            gpu.prefill(&model, &timing[..ctx0], 0, &mut st).expect("prefill");
+            gpu.prefill(&model, &timing[..ctx0], 0, &mut st)
+                .expect("prefill");
             let mut pos = ctx0;
             let _ = run(m, &mut st, &mut pos);
         }
         for _ in 0..rounds {
             for (i, &m) in widths.iter().enumerate() {
                 let mut st = gpu.new_state(max_ctx).expect("state");
-                gpu.prefill(&model, &timing[..ctx0], 0, &mut st).expect("prefill");
+                gpu.prefill(&model, &timing[..ctx0], 0, &mut st)
+                    .expect("prefill");
                 let mut pos = ctx0;
                 samples[i].push(run(m, &mut st, &mut pos));
             }
@@ -230,12 +241,36 @@ fn main() {
     // of the time. The two knobs trade off, so sweep both.
     let max_len = 16usize;
     let triggers = [
-        Trigger { name: "n>=1", min_match: 1, min_drafts: 1 },
-        Trigger { name: "n>=2", min_match: 2, min_drafts: 1 },
-        Trigger { name: "n>=3", min_match: 3, min_drafts: 1 },
-        Trigger { name: "n>=4", min_match: 4, min_drafts: 1 },
-        Trigger { name: "n>=6", min_match: 6, min_drafts: 1 },
-        Trigger { name: "n>=8", min_match: 8, min_drafts: 1 },
+        Trigger {
+            name: "n>=1",
+            min_match: 1,
+            min_drafts: 1,
+        },
+        Trigger {
+            name: "n>=2",
+            min_match: 2,
+            min_drafts: 1,
+        },
+        Trigger {
+            name: "n>=3",
+            min_match: 3,
+            min_drafts: 1,
+        },
+        Trigger {
+            name: "n>=4",
+            min_match: 4,
+            min_drafts: 1,
+        },
+        Trigger {
+            name: "n>=6",
+            min_match: 6,
+            min_drafts: 1,
+        },
+        Trigger {
+            name: "n>=8",
+            min_match: 8,
+            min_drafts: 1,
+        },
     ];
     let base = step_ms[1];
     println!(

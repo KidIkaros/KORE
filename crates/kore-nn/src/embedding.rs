@@ -93,7 +93,11 @@ impl Embedding {
             return Tensor::from_f32(&result, &[ids.len(), dim]);
         }
 
-        let w = self.weight.as_ref().expect("Embedding has neither weight nor raw_q4_k").contiguous();
+        let w = self
+            .weight
+            .as_ref()
+            .expect("Embedding has neither weight nor raw_q4_k")
+            .contiguous();
         let w_data = w
             .as_f32_slice()
             .expect("Embedding: weight tensor must be F32");

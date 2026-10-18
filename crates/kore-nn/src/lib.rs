@@ -9,12 +9,12 @@ pub mod conv;
 pub mod dropout;
 pub mod embedding;
 pub mod geometric;
+pub mod gguf_min;
 pub mod layer_norm;
 pub mod linear;
+pub mod llama;
 pub mod lora;
 pub mod moe;
-pub mod gguf_min;
-pub mod llama;
 pub mod qwen35;
 pub mod spec;
 pub use spec::{DraftPolicy, SpecStats};
@@ -37,11 +37,15 @@ pub use embedding::Embedding;
 pub use kore_attention::kv_cache::KvCache;
 pub use layer_norm::LayerNorm;
 pub use linear::Linear;
-pub use llama::{LlamaAttention, LlamaConfig, LlamaDecoderLayer, LlamaKvCacheLayer, LlamaMlp, LlamaModel};
+pub use llama::{
+    LlamaAttention, LlamaConfig, LlamaDecoderLayer, LlamaKvCacheLayer, LlamaMlp, LlamaModel,
+};
 pub use lora::{LoraLinear, QLoraLinear};
-pub use moe::{route, CacheOutcome, ExpertCache, ExpertMats, MoeConfig, MoeLayer, MoeStats, Routing};
 pub use loss::{cross_entropy_loss, l1_loss, mse_loss, nll_loss, FusedSoftmaxBackward};
 pub use module::Module;
+pub use moe::{
+    route, CacheOutcome, ExpertCache, ExpertMats, MoeConfig, MoeLayer, MoeStats, Routing,
+};
 pub use pool::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d};
 pub use quat_linear::QuatLinear;
 pub use rms_norm::RMSNorm;

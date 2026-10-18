@@ -102,7 +102,12 @@ impl Linear {
 
     /// Create an inference-optimized Linear layer directly from raw Q4_K packed bytes.
     /// Eliminates CPU dequantization and stores weights in 4.5 bits/weight directly in GPU VRAM.
-    pub fn from_q4_k(raw_bytes: Vec<u8>, in_features: usize, out_features: usize, bias: Option<Tensor>) -> Self {
+    pub fn from_q4_k(
+        raw_bytes: Vec<u8>,
+        in_features: usize,
+        out_features: usize,
+        bias: Option<Tensor>,
+    ) -> Self {
         let storage = kore_core::Storage::from_packed_bytes(DType::U8, raw_bytes.len(), raw_bytes);
         let raw = Tensor::from_storage(storage, &[out_features, (in_features / 256) * 144]);
         Self {
@@ -118,7 +123,12 @@ impl Linear {
 
     /// Create an inference-optimized Linear layer directly from raw Q6_K packed bytes.
     /// Eliminates CPU dequantization and stores weights in 6.5 bits/weight directly in GPU VRAM.
-    pub fn from_q6_k(raw_bytes: Vec<u8>, in_features: usize, out_features: usize, bias: Option<Tensor>) -> Self {
+    pub fn from_q6_k(
+        raw_bytes: Vec<u8>,
+        in_features: usize,
+        out_features: usize,
+        bias: Option<Tensor>,
+    ) -> Self {
         let storage = kore_core::Storage::from_packed_bytes(DType::U8, raw_bytes.len(), raw_bytes);
         let raw = Tensor::from_storage(storage, &[out_features, (in_features / 256) * 210]);
         Self {
@@ -168,7 +178,9 @@ impl Linear {
     pub fn in_features(&self) -> usize {
         match &self.kind {
             LinearKind::F32 { weight_t, .. } => weight_t.shape().dims()[0],
-            LinearKind::Q4K { in_features, .. } | LinearKind::Q6K { in_features, .. } => *in_features,
+            LinearKind::Q4K { in_features, .. } | LinearKind::Q6K { in_features, .. } => {
+                *in_features
+            }
         }
     }
 
@@ -176,7 +188,9 @@ impl Linear {
     pub fn out_features(&self) -> usize {
         match &self.kind {
             LinearKind::F32 { weight_t, .. } => weight_t.shape().dims()[1],
-            LinearKind::Q4K { out_features, .. } | LinearKind::Q6K { out_features, .. } => *out_features,
+            LinearKind::Q4K { out_features, .. } | LinearKind::Q6K { out_features, .. } => {
+                *out_features
+            }
         }
     }
 
@@ -201,8 +215,13 @@ impl Linear {
         let (ka, ra) = a.packed()?;
         let (kb, rb) = b.packed()?;
         let (kc, rc) = c.packed()?;
-        if ka != kb || kb != kc || a.has_bias() || b.has_bias() || c.has_bias()
-            || a.in_features() != b.in_features() || b.in_features() != c.in_features()
+        if ka != kb
+            || kb != kc
+            || a.has_bias()
+            || b.has_bias()
+            || c.has_bias()
+            || a.in_features() != b.in_features()
+            || b.in_features() != c.in_features()
         {
             return None;
         }
@@ -219,10 +238,7 @@ impl Linear {
         let rows = a.out_features() + b.out_features() + c.out_features();
         let row_bytes = ba.len() / a.out_features();
         let storage = kore_core::Storage::from_packed_bytes(DType::U8, combined.len(), combined);
-        Some((
-            Tensor::from_storage(storage, &[rows, row_bytes]),
-            ka,
-        ))
+        Some((Tensor::from_storage(storage, &[rows, row_bytes]), ka))
     }
 
     /// Attempt to fuse two Linear layers sharing the same input `[M, K]` into a single
@@ -295,25 +311,51 @@ impl Module for Linear {
     fn forward(&self, input: &Tensor) -> kore_core::Result<Tensor> {
         let mut output = match &self.kind {
             LinearKind::F32 { weight_t, .. } => input.matmul(weight_t)?,
-            LinearKind::Q4K { raw, in_features, out_features } => {
+            LinearKind::Q4K {
+                raw,
+                in_features,
+                out_features,
+            } => {
                 if input.device().is_cpu() {
                     let raw_bytes = raw.storage_ref().as_bytes();
-                    kore_kernels::cpu_matmul::gemv_q4_k_cpu(input, raw_bytes, *out_features, *in_features)?
+                    kore_kernels::cpu_matmul::gemv_q4_k_cpu(
+                        input,
+                        raw_bytes,
+                        *out_features,
+                        *in_features,
+                    )?
                 } else {
-                    let backend = kore_core::device::get_backend(input.device()).ok_or_else(|| {
-                        kore_core::KoreError::StorageError(format!("No backend for {}", input.device()))
-                    })?;
+                    let backend =
+                        kore_core::device::get_backend(input.device()).ok_or_else(|| {
+                            kore_core::KoreError::StorageError(format!(
+                                "No backend for {}",
+                                input.device()
+                            ))
+                        })?;
                     backend.gemv_q4_k(input, raw, *out_features, *in_features)?
                 }
             }
-            LinearKind::Q6K { raw, in_features, out_features } => {
+            LinearKind::Q6K {
+                raw,
+                in_features,
+                out_features,
+            } => {
                 if input.device().is_cpu() {
                     let raw_bytes = raw.storage_ref().as_bytes();
-                    kore_kernels::cpu_matmul::gemv_q6_k_cpu(input, raw_bytes, *out_features, *in_features)?
+                    kore_kernels::cpu_matmul::gemv_q6_k_cpu(
+                        input,
+                        raw_bytes,
+                        *out_features,
+                        *in_features,
+                    )?
                 } else {
-                    let backend = kore_core::device::get_backend(input.device()).ok_or_else(|| {
-                        kore_core::KoreError::StorageError(format!("No backend for {}", input.device()))
-                    })?;
+                    let backend =
+                        kore_core::device::get_backend(input.device()).ok_or_else(|| {
+                            kore_core::KoreError::StorageError(format!(
+                                "No backend for {}",
+                                input.device()
+                            ))
+                        })?;
                     backend.gemv_q6_k(input, raw, *out_features, *in_features)?
                 }
             }

@@ -410,50 +410,96 @@ fn test_vulkan_gemv_q4_k_correctness() {
     // 128 weights = 2.0 * 2 * 5 - 1.0 * 1 = 20 - 1 = 19.0
     // 128 weights = 2.0 * 2 * 7 - 1.0 * 1 = 28 - 1 = 27.0
     // dot = 128 * 19.0 + 128 * 27.0 = 2432.0 + 3456.0 = 5888.0
-    let y = backend.gemv_q4_k(&x, &w_tensor, 2, 256).expect("gemv_q4_k failed");
+    let y = backend
+        .gemv_q4_k(&x, &w_tensor, 2, 256)
+        .expect("gemv_q4_k failed");
     assert_eq!(y.shape().dims(), &[1, 2]);
 
     let y_cpu = y.to(kore_core::Device::Cpu).expect("to CPU");
     let y_slice = y_cpu.as_f32_slice().expect("f32 slice");
-    assert!((y_slice[0] - 640.0).abs() < 1e-3, "Row 0 mismatch: got {}", y_slice[0]);
-    assert!((y_slice[1] - 5888.0).abs() < 1e-3, "Row 1 mismatch: got {}", y_slice[1]);
+    assert!(
+        (y_slice[0] - 640.0).abs() < 1e-3,
+        "Row 0 mismatch: got {}",
+        y_slice[0]
+    );
+    assert!(
+        (y_slice[1] - 5888.0).abs() < 1e-3,
+        "Row 1 mismatch: got {}",
+        y_slice[1]
+    );
 
     // Test with N=3 rows (odd row count) and K=512 (2 blocks per row)
     // Total bytes = 3 rows * 2 blocks * 144 bytes = 864 bytes.
     let mut raw_bytes_3x512 = vec![0u8; 864];
     // Block 0 of row 0: d=1.0, qs=0x11 (all nibbles = 1, sc=1, mn=0)
     raw_bytes_3x512[1] = 0x3C;
-    for i in 4..8 { raw_bytes_3x512[i] = 1; }
-    for i in 12..16 { raw_bytes_3x512[i] = 1; }
-    for i in 16..144 { raw_bytes_3x512[i] = 0x11; }
+    for i in 4..8 {
+        raw_bytes_3x512[i] = 1;
+    }
+    for i in 12..16 {
+        raw_bytes_3x512[i] = 1;
+    }
+    for i in 16..144 {
+        raw_bytes_3x512[i] = 0x11;
+    }
     // Block 1 of row 0 (offset 144): d=1.0, qs=0x11
     raw_bytes_3x512[144 + 1] = 0x3C;
-    for i in 148..152 { raw_bytes_3x512[i] = 1; }
-    for i in 156..160 { raw_bytes_3x512[i] = 1; }
-    for i in 160..288 { raw_bytes_3x512[i] = 0x11; }
+    for i in 148..152 {
+        raw_bytes_3x512[i] = 1;
+    }
+    for i in 156..160 {
+        raw_bytes_3x512[i] = 1;
+    }
+    for i in 160..288 {
+        raw_bytes_3x512[i] = 0x11;
+    }
 
     // Row 2 (offset 2 * 288 = 576): block 0 has d=2.0 (0x4000), qs=0x22 (nibbles=2, sc=1, mn=0)
     raw_bytes_3x512[576 + 1] = 0x40;
-    for i in 580..584 { raw_bytes_3x512[i] = 1; }
-    for i in 588..592 { raw_bytes_3x512[i] = 1; }
-    for i in 592..720 { raw_bytes_3x512[i] = 0x22; }
+    for i in 580..584 {
+        raw_bytes_3x512[i] = 1;
+    }
+    for i in 588..592 {
+        raw_bytes_3x512[i] = 1;
+    }
+    for i in 592..720 {
+        raw_bytes_3x512[i] = 0x22;
+    }
 
-    let w3_storage = kore_core::Storage::from_packed_bytes(kore_core::DType::U8, 864, raw_bytes_3x512);
+    let w3_storage =
+        kore_core::Storage::from_packed_bytes(kore_core::DType::U8, 864, raw_bytes_3x512);
     let w3_tensor = Tensor::from_storage(w3_storage, &[864]);
     let x512 = Tensor::from_f32(&vec![1.0f32; 512], &[1, 512]);
 
-    let y3 = backend.gemv_q4_k(&x512, &w3_tensor, 3, 512).expect("gemv_q4_k 3x512 failed");
+    let y3 = backend
+        .gemv_q4_k(&x512, &w3_tensor, 3, 512)
+        .expect("gemv_q4_k 3x512 failed");
     assert_eq!(y3.shape().dims(), &[1, 3]);
     let y3_cpu = y3.to(kore_core::Device::Cpu).expect("to CPU");
     let y3_slice = y3_cpu.as_f32_slice().expect("f32 slice");
     // Row 0: 512 weights * 1.0 = 512.0
     // Row 1: all 0.0
     // Row 2: block 0 has 256 weights * 4.0 = 1024.0, block 1 has 0.0 -> total 1024.0
-    assert!((y3_slice[0] - 512.0).abs() < 1e-3, "Row 0: got {}", y3_slice[0]);
-    assert!((y3_slice[1] - 0.0).abs() < 1e-3, "Row 1: got {}", y3_slice[1]);
-    assert!((y3_slice[2] - 1024.0).abs() < 1e-3, "Row 2: got {}", y3_slice[2]);
+    assert!(
+        (y3_slice[0] - 512.0).abs() < 1e-3,
+        "Row 0: got {}",
+        y3_slice[0]
+    );
+    assert!(
+        (y3_slice[1] - 0.0).abs() < 1e-3,
+        "Row 1: got {}",
+        y3_slice[1]
+    );
+    assert!(
+        (y3_slice[2] - 1024.0).abs() < 1e-3,
+        "Row 2: got {}",
+        y3_slice[2]
+    );
 
-    println!("All Q4_K GPU GEMV tests passed! Row 0 = {}, Row 1 = {}, Row 2 = {}", y3_slice[0], y3_slice[1], y3_slice[2]);
+    println!(
+        "All Q4_K GPU GEMV tests passed! Row 0 = {}, Row 1 = {}, Row 2 = {}",
+        y3_slice[0], y3_slice[1], y3_slice[2]
+    );
 }
 
 #[test]
@@ -544,9 +590,21 @@ fn test_vulkan_gemv_q5_k_correctness() {
     assert_eq!(y2.shape().dims(), &[2, 2]);
     let y2_cpu = y2.to(kore_core::Device::Cpu).expect("to CPU");
     let y2_slice = y2_cpu.as_f32_slice().expect("f32 slice");
-    assert!((y2_slice[0] - 640.0).abs() < 1e-3, "m2 row0: got {}", y2_slice[0]);
-    assert!((y2_slice[1] - 22272.0).abs() < 1e-3, "m2 row1: got {}", y2_slice[1]);
-    assert!((y2_slice[2] - 1280.0).abs() < 1e-3, "m2 row0 x2: got {}", y2_slice[2]);
+    assert!(
+        (y2_slice[0] - 640.0).abs() < 1e-3,
+        "m2 row0: got {}",
+        y2_slice[0]
+    );
+    assert!(
+        (y2_slice[1] - 22272.0).abs() < 1e-3,
+        "m2 row1: got {}",
+        y2_slice[1]
+    );
+    assert!(
+        (y2_slice[2] - 1280.0).abs() < 1e-3,
+        "m2 row0 x2: got {}",
+        y2_slice[2]
+    );
     assert!(
         (y2_slice[3] - 44544.0).abs() < 1e-3,
         "m2 row1 x2: got {}",
@@ -600,9 +658,15 @@ fn test_vulkan_kv_append_q8_and_decode_matches_reference() {
     let kv_dim = num_kv_heads * head_dim;
     let scale = 1.0 / (head_dim as f32).sqrt();
 
-    let q_data: Vec<f32> = (0..(seq_q * q_dim)).map(|i| (i as f32 * 0.19).sin()).collect();
-    let k_data: Vec<f32> = (0..(seq_k * kv_dim)).map(|i| (i as f32 * 0.23).cos() * 3.0).collect();
-    let v_data: Vec<f32> = (0..(seq_k * kv_dim)).map(|i| (i as f32 * 0.31).sin() * 2.0).collect();
+    let q_data: Vec<f32> = (0..(seq_q * q_dim))
+        .map(|i| (i as f32 * 0.19).sin())
+        .collect();
+    let k_data: Vec<f32> = (0..(seq_k * kv_dim))
+        .map(|i| (i as f32 * 0.23).cos() * 3.0)
+        .collect();
+    let v_data: Vec<f32> = (0..(seq_k * kv_dim))
+        .map(|i| (i as f32 * 0.31).sin() * 2.0)
+        .collect();
 
     // Quantize K/V per token row and build the reference dequantized tensors.
     let mut k_bytes = Vec::with_capacity(seq_k * kv_dim);
@@ -629,8 +693,12 @@ fn test_vulkan_kv_append_q8_and_decode_matches_reference() {
     let mut vc = Tensor::zeros(&[max_ctx, kv_dim], kore_core::DType::U8)
         .to(dev)
         .unwrap();
-    let k_scales = Tensor::from_f32(&k_scales_host, &[max_ctx]).to(dev).unwrap();
-    let v_scales = Tensor::from_f32(&v_scales_host, &[max_ctx]).to(dev).unwrap();
+    let k_scales = Tensor::from_f32(&k_scales_host, &[max_ctx])
+        .to(dev)
+        .unwrap();
+    let v_scales = Tensor::from_f32(&v_scales_host, &[max_ctx])
+        .to(dev)
+        .unwrap();
 
     // Append in two chunks to exercise a non-zero row_offset.
     let split = 5usize;
@@ -657,11 +725,17 @@ fn test_vulkan_kv_append_q8_and_decode_matches_reference() {
         )
         .to(dev)
         .unwrap();
-        let ks_new = Tensor::from_f32(&k_scales_host[off..off + len], &[len]).to(dev).unwrap();
-        let vs_new = Tensor::from_f32(&v_scales_host[off..off + len], &[len]).to(dev).unwrap();
+        let ks_new = Tensor::from_f32(&k_scales_host[off..off + len], &[len])
+            .to(dev)
+            .unwrap();
+        let vs_new = Tensor::from_f32(&v_scales_host[off..off + len], &[len])
+            .to(dev)
+            .unwrap();
 
         let (kv_view, vv_view) = backend
-            .kv_cache_append_q8(&kc, &vc, &k_scales, &v_scales, &k_new, &v_new, &ks_new, &vs_new, off)
+            .kv_cache_append_q8(
+                &kc, &vc, &k_scales, &v_scales, &k_new, &v_new, &ks_new, &vs_new, off,
+            )
             .expect("kv_cache_append_q8");
         assert_eq!(kv_view.shape().dims(), &[off + len, kv_dim]);
         assert_eq!(vv_view.shape().dims(), &[off + len, kv_dim]);
@@ -705,7 +779,16 @@ fn test_vulkan_kv_append_q8_and_decode_matches_reference() {
     let q = Tensor::from_f32(&q_data, &[seq_q, q_dim]).to(dev).unwrap();
     let actual = backend
         .fused_attention_decode_gqa_q8(
-            &q, &kc, &vc, &k_scales, &v_scales, num_heads, num_kv_heads, head_dim, scale, seq_k,
+            &q,
+            &kc,
+            &vc,
+            &k_scales,
+            &v_scales,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            seq_k,
         )
         .expect("fused_attention_decode_gqa_q8")
         .to(kore_core::Device::Cpu)
@@ -793,7 +876,16 @@ fn test_vulkan_split_attention_matches_single_group() {
     let q = Tensor::from_f32(&q_data, &[1, q_dim]).to(dev).unwrap();
     let single = backend
         .fused_attention_decode_gqa_q8(
-            &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale, seq_k,
+            &q,
+            &kc,
+            &vc,
+            &ks_buf,
+            &vs_buf,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            seq_k,
         )
         .expect("single-group attention")
         .to(kore_core::Device::Cpu)
@@ -803,8 +895,17 @@ fn test_vulkan_split_attention_matches_single_group() {
     for &n_splits in &[1usize, 3, 7, 11, 64] {
         let got = backend
             .fused_attention_decode_gqa_q8_split(
-                &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale,
-                n_splits, seq_k,
+                &q,
+                &kc,
+                &vc,
+                &ks_buf,
+                &vs_buf,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                n_splits,
+                seq_k,
             )
             .expect("split attention")
             .to(kore_core::Device::Cpu)
@@ -823,7 +924,16 @@ fn test_vulkan_split_attention_matches_single_group() {
     assert!(
         backend
             .fused_attention_decode_gqa_q8_split(
-                &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, scale, 0,
+                &q,
+                &kc,
+                &vc,
+                &ks_buf,
+                &vs_buf,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                scale,
+                0,
                 seq_k,
             )
             .is_err(),
@@ -835,7 +945,16 @@ fn test_vulkan_split_attention_matches_single_group() {
     assert!(
         backend
             .fused_attention_decode_gqa_q8_split(
-                &q, &kc, &vc, &ks_buf, &vs_buf, num_heads, num_kv_heads, head_dim, -scale, 4,
+                &q,
+                &kc,
+                &vc,
+                &ks_buf,
+                &vs_buf,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                -scale,
+                4,
                 seq_k,
             )
             .is_err(),
@@ -853,7 +972,17 @@ fn test_vulkan_split_attention_matches_single_group() {
     assert!(
         backend
             .fused_attention_decode_gqa_q8_split(
-                &q48, &k48, &k48, &s48, &s48, num_heads, num_kv_heads, hd48, scale, 4, 8,
+                &q48,
+                &k48,
+                &k48,
+                &s48,
+                &s48,
+                num_heads,
+                num_kv_heads,
+                hd48,
+                scale,
+                4,
+                8,
             )
             .is_err(),
         "head_dim % 32 != 0 must be rejected"
@@ -957,7 +1086,6 @@ fn test_vulkan_gemv_q2_0_matches_cpu_reference() {
     }
 }
 
-
 /// `had_pre` must be *bit-identical* to running the standalone kernels in
 /// sequence, so the fused decode path can't perturb token selection.
 #[test]
@@ -976,7 +1104,13 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     let w_data: Vec<f32> = (0..cols).map(|i| 0.5 + phase(i + 5) * 0.5).collect();
     // Random-ish deterministic ±1 sign table.
     let signs_data: Vec<f32> = (0..cols)
-        .map(|i| if (i * 2654435761usize) % 3 == 0 { -1.0 } else { 1.0 })
+        .map(|i| {
+            if (i * 2654435761usize) % 3 == 0 {
+                -1.0
+            } else {
+                1.0
+            }
+        })
         .collect();
 
     let a = Tensor::from_f32(&a_data, &[1, cols]).to(dev).unwrap();
@@ -993,7 +1127,9 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     };
 
     // ---- mode 0: add + rms_norm + hadamard ----
-    let (res, norm, had) = backend.had_pre(0, true, &a, &b, &w, &signs, eps).expect("had_pre 0");
+    let (res, norm, had) = backend
+        .had_pre(0, true, &a, &b, &w, &signs, eps)
+        .expect("had_pre 0");
     let (ref_res, ref_norm) = backend.add_rms_norm(&a, &b, &w, eps).expect("add_rms_norm");
     let ref_had = backend
         .hadamard_signed(&ref_norm, &signs, 512, 0)
@@ -1004,15 +1140,21 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     assert_eq!(to_cpu(&had), to_cpu(&ref_had), "mode 0 hadamard differs");
 
     // ---- mode 2: swiglu + hadamard ----
-    let (_r, _n, had2) = backend.had_pre(2, true, &a, &b, &signs, &signs, eps).expect("had_pre 2");
+    let (_r, _n, had2) = backend
+        .had_pre(2, true, &a, &b, &signs, &signs, eps)
+        .expect("had_pre 2");
     let act = backend.swiglu(&a, &b).expect("swiglu");
     let ref_had2 = backend.hadamard_signed(&act, &signs, 512, 0).expect("had2");
     assert_eq!(to_cpu(&had2), to_cpu(&ref_had2), "mode 2 hadamard differs");
 
     // ---- mode 3: sigmoid_mul + hadamard ----
-    let (_r, _n, had3) = backend.had_pre(3, true, &a, &b, &signs, &signs, eps).expect("had_pre 3");
+    let (_r, _n, had3) = backend
+        .had_pre(3, true, &a, &b, &signs, &signs, eps)
+        .expect("had_pre 3");
     let gated = backend.sigmoid_mul(&a, &b).expect("sigmoid_mul");
-    let ref_had3 = backend.hadamard_signed(&gated, &signs, 512, 0).expect("had3");
+    let ref_had3 = backend
+        .hadamard_signed(&gated, &signs, 512, 0)
+        .expect("had3");
     assert_eq!(to_cpu(&had3), to_cpu(&ref_had3), "mode 3 hadamard differs");
 
     // ---- multi-row: one workgroup per (row, 512-block). The sign table covers a
@@ -1028,7 +1170,13 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     let ra: Vec<f32> = (0..n).map(|i| phase(i) * 1.3).collect();
     let rb: Vec<f32> = (0..n).map(|i| phase(i + 7) * 0.6).collect();
     let rs: Vec<f32> = (0..rcols)
-        .map(|i| if (i * 2654435761usize) % 5 < 2 { -1.0 } else { 1.0 })
+        .map(|i| {
+            if (i * 2654435761usize) % 5 < 2 {
+                -1.0
+            } else {
+                1.0
+            }
+        })
         .collect();
     let ra = Tensor::from_f32(&ra, &[rows, rcols]).to(dev).unwrap();
     let rb = Tensor::from_f32(&rb, &[rows, rcols]).to(dev).unwrap();
@@ -1092,7 +1240,13 @@ fn test_vulkan_had_pre_without_hadamard() {
     // Deliberately a *non-trivial* sign table: if the kernel applied it when
     // `had = false` the third output would differ from the second.
     let signs: Vec<f32> = (0..cols)
-        .map(|i| if (i * 2654435761usize) % 5 < 2 { -1.0 } else { 1.0 })
+        .map(|i| {
+            if (i * 2654435761usize) % 5 < 2 {
+                -1.0
+            } else {
+                1.0
+            }
+        })
         .collect();
     let eps = 1e-6f32;
     let a = Tensor::from_f32(&a, &[rows, cols]).to(dev).unwrap();
@@ -1176,7 +1330,13 @@ fn test_vulkan_hadamard_signed_multi_row_bit_identical() {
     let x: Vec<f32> = (0..rows * cols).map(|i| phase(i) * 2.1).collect();
     // Single-row, non-periodic sign table.
     let signs: Vec<f32> = (0..cols)
-        .map(|i| if (i * 2246822519usize) % 7 < 3 { -1.0 } else { 1.0 })
+        .map(|i| {
+            if (i * 2246822519usize) % 7 < 3 {
+                -1.0
+            } else {
+                1.0
+            }
+        })
         .collect();
     let x = Tensor::from_f32(&x, &[rows, cols]).to(dev).unwrap();
     let signs = Tensor::from_f32(&signs, &[cols]).to(dev).unwrap();
@@ -1295,14 +1455,18 @@ fn test_vulkan_gemv_q2_0_batch_invariance() {
     let ws = kore_core::Storage::from_bytes(kore_core::DType::U8, nb, packed).unwrap();
     let wt = Tensor::from_storage(ws, &[nb]).to(dev).unwrap();
 
-    let x: Vec<f32> = (0..(m * k)).map(|i| (i as f32 * 0.23 - 1.1).cos()).collect();
+    let x: Vec<f32> = (0..(m * k))
+        .map(|i| (i as f32 * 0.23 - 1.1).cos())
+        .collect();
     let xm = Tensor::from_f32(&x, &[m, k]).to(dev).unwrap();
     let wide = backend.gemv_q2_0(&xm, &wt, n, k).expect("m=4");
     let wide_cpu = wide.to(kore_core::Device::Cpu).unwrap();
     let wv = wide_cpu.as_f32_slice().unwrap();
 
     for row in 0..m {
-        let x1 = Tensor::from_f32(&x[row * k..(row + 1) * k], &[1, k]).to(dev).unwrap();
+        let x1 = Tensor::from_f32(&x[row * k..(row + 1) * k], &[1, k])
+            .to(dev)
+            .unwrap();
         let single = backend.gemv_q2_0(&x1, &wt, n, k).expect("m=1");
         let sc = single.to(kore_core::Device::Cpu).unwrap();
         let sv = sc.as_f32_slice().unwrap();
@@ -1356,7 +1520,9 @@ fn test_vulkan_qknorm_rope_per_row_positions_bit_identical() {
     let qg = Tensor::from_f32(&qg_data, &[rows, qg_dim]).to(dev).unwrap();
     let kk = Tensor::from_f32(&kk_data, &[rows, kk_dim]).to(dev).unwrap();
     let (q_b, k_b, g_b) = backend
-        .qknorm_rope(&qg, &kk, &qn, &kn, n_heads, n_kv, head_dim, rope_dim, pos0, theta, eps)
+        .qknorm_rope(
+            &qg, &kk, &qn, &kn, n_heads, n_kv, head_dim, rope_dim, pos0, theta, eps,
+        )
         .expect("rows = 3");
     let (q_b, k_b, g_b) = (to_cpu(&q_b), to_cpu(&k_b), to_cpu(&g_b));
 
@@ -1433,8 +1599,12 @@ fn test_vulkan_kv_cache_append_q8_multi_row_bit_identical() {
     let rows = 3usize;
     let row_offset = 4usize;
 
-    let k_data: Vec<f32> = (0..rows * kv_dim).map(|i| (i as f32 * 0.23).cos() * 3.0).collect();
-    let v_data: Vec<f32> = (0..rows * kv_dim).map(|i| (i as f32 * 0.31).sin() * 2.0).collect();
+    let k_data: Vec<f32> = (0..rows * kv_dim)
+        .map(|i| (i as f32 * 0.23).cos() * 3.0)
+        .collect();
+    let v_data: Vec<f32> = (0..rows * kv_dim)
+        .map(|i| (i as f32 * 0.31).sin() * 2.0)
+        .collect();
     let mut k_all = Vec::new();
     let mut v_all = Vec::new();
     let mut k_scales = Vec::new();
@@ -1450,7 +1620,8 @@ fn test_vulkan_kv_cache_append_q8_multi_row_bit_identical() {
 
     let u8_rows = |bytes: &[u8], n: usize| {
         Tensor::from_storage(
-            kore_core::Storage::from_bytes(kore_core::DType::U8, bytes.len(), bytes.to_vec()).unwrap(),
+            kore_core::Storage::from_bytes(kore_core::DType::U8, bytes.len(), bytes.to_vec())
+                .unwrap(),
             &[n, kv_dim],
         )
         .to(dev)
@@ -1460,10 +1631,18 @@ fn test_vulkan_kv_cache_append_q8_multi_row_bit_identical() {
     // A fresh full-capacity cache pair, so the whole underlying buffer is comparable.
     let fresh = || {
         (
-            Tensor::zeros(&[max_ctx, kv_dim], kore_core::DType::U8).to(dev).unwrap(),
-            Tensor::zeros(&[max_ctx, kv_dim], kore_core::DType::U8).to(dev).unwrap(),
-            Tensor::from_f32(&vec![0.0f32; max_ctx], &[max_ctx]).to(dev).unwrap(),
-            Tensor::from_f32(&vec![0.0f32; max_ctx], &[max_ctx]).to(dev).unwrap(),
+            Tensor::zeros(&[max_ctx, kv_dim], kore_core::DType::U8)
+                .to(dev)
+                .unwrap(),
+            Tensor::zeros(&[max_ctx, kv_dim], kore_core::DType::U8)
+                .to(dev)
+                .unwrap(),
+            Tensor::from_f32(&vec![0.0f32; max_ctx], &[max_ctx])
+                .to(dev)
+                .unwrap(),
+            Tensor::from_f32(&vec![0.0f32; max_ctx], &[max_ctx])
+                .to(dev)
+                .unwrap(),
         )
     };
 
@@ -1505,11 +1684,33 @@ fn test_vulkan_kv_cache_append_q8_multi_row_bit_identical() {
     let (kv_b, vv_b) = last.expect("rows > 0");
 
     // Compare raw storage bytes: U8 cache and f32 scales alike, bit for bit.
-    let raw = |t: &Tensor| t.to(kore_core::Device::Cpu).unwrap().storage_ref().as_bytes().to_vec();
-    assert_eq!(raw(&kv_a), raw(&kv_b), "K cache bytes differ: batched m={rows} vs {rows} single-row appends");
-    assert_eq!(raw(&vv_a), raw(&vv_b), "V cache bytes differ: batched m={rows} vs {rows} single-row appends");
-    assert_eq!(raw(&ks_a), raw(&ks_b), "K scales differ: batched m={rows} vs {rows} single-row appends");
-    assert_eq!(raw(&vs_a), raw(&vs_b), "V scales differ: batched m={rows} vs {rows} single-row appends");
+    let raw = |t: &Tensor| {
+        t.to(kore_core::Device::Cpu)
+            .unwrap()
+            .storage_ref()
+            .as_bytes()
+            .to_vec()
+    };
+    assert_eq!(
+        raw(&kv_a),
+        raw(&kv_b),
+        "K cache bytes differ: batched m={rows} vs {rows} single-row appends"
+    );
+    assert_eq!(
+        raw(&vv_a),
+        raw(&vv_b),
+        "V cache bytes differ: batched m={rows} vs {rows} single-row appends"
+    );
+    assert_eq!(
+        raw(&ks_a),
+        raw(&ks_b),
+        "K scales differ: batched m={rows} vs {rows} single-row appends"
+    );
+    assert_eq!(
+        raw(&vs_a),
+        raw(&vs_b),
+        "V scales differ: batched m={rows} vs {rows} single-row appends"
+    );
 
     // Non-vacuous: the appended window must actually contain the rows.
     let kc_bytes = raw(&kv_a);
@@ -1597,14 +1798,18 @@ fn test_vulkan_copy_buffer_is_a_real_copy() {
     // Clear `dst` on device and copy again -- if the first copy had aliased the
     // two storages, `src` would have been clobbered by this point.
     let zeros = Tensor::zeros(&[n], kore_core::DType::F32).to(dev).unwrap();
-    backend.copy_buffer(&dst, &zeros).expect("copy_buffer zeros");
+    backend
+        .copy_buffer(&dst, &zeros)
+        .expect("copy_buffer zeros");
     backend.copy_buffer(&dst, &src).expect("copy_buffer again");
 
     let got2 = dst.to(kore_core::Device::Cpu).unwrap();
     assert_eq!(got2.as_f32_slice().unwrap(), src_data.as_slice());
 
     // A mismatched length is a caller bug, not a silent partial copy.
-    let short = Tensor::zeros(&[n - 1], kore_core::DType::F32).to(dev).unwrap();
+    let short = Tensor::zeros(&[n - 1], kore_core::DType::F32)
+        .to(dev)
+        .unwrap();
     assert!(backend.copy_buffer(&dst, &short).is_err());
 }
 

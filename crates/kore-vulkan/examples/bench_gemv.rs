@@ -12,13 +12,17 @@ fn bench(b: &VulkanBackend, name: &str, q: &str, n: usize, k: usize, m: usize) {
     };
     let dev = Device::Vulkan(0);
     let w_len = w.len();
-    let x = Tensor::from_f32(&vec![0.5f32; m * k], &[m, k]).to(dev).unwrap();
+    let x = Tensor::from_f32(&vec![0.5f32; m * k], &[m, k])
+        .to(dev)
+        .unwrap();
     let wt = if is_f32 {
         let f: Vec<f32> = vec![0.25f32; w_len / 4];
         Tensor::from_f32(&f, &[k, n]).to(dev).unwrap()
     } else {
         let storage = kore_core::Storage::from_packed_bytes(kore_core::DType::U8, w_len, w);
-        Tensor::from_storage(storage, &[n, row_bytes]).to(dev).unwrap()
+        Tensor::from_storage(storage, &[n, row_bytes])
+            .to(dev)
+            .unwrap()
     };
     let f = |x: &Tensor, w: &Tensor| match q {
         "q4k" => b.gemv_q4_k(x, w, n, k).unwrap(),
@@ -28,19 +32,27 @@ fn bench(b: &VulkanBackend, name: &str, q: &str, n: usize, k: usize, m: usize) {
         _ => unreachable!(),
     };
     // warmup + ramp clocks
-    for _ in 0..3 { let y = f(&x, &wt); let _ = y.cpu().unwrap(); }
+    for _ in 0..3 {
+        let y = f(&x, &wt);
+        let _ = y.cpu().unwrap();
+    }
 
     // pipelined: record all reps, single sync
     let reps = 10;
     let t0 = Instant::now();
     let mut ys = Vec::new();
-    for _ in 0..reps { ys.push(f(&x, &wt)); }
+    for _ in 0..reps {
+        ys.push(f(&x, &wt));
+    }
     let _ = ys.last().unwrap().cpu().unwrap();
     let ms_pipe = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
 
     // serialized: sync per iter
     let t0 = Instant::now();
-    for _ in 0..reps { let y = f(&x, &wt); let _ = y.cpu().unwrap(); }
+    for _ in 0..reps {
+        let y = f(&x, &wt);
+        let _ = y.cpu().unwrap();
+    }
     let ms_ser = t0.elapsed().as_secs_f64() * 1000.0 / reps as f64;
 
     let mb = w_len as f64 / 1e6;

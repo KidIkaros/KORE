@@ -73,7 +73,9 @@ fn main() {
     }
     // Continue greedily, pushing each predicted token back in as the next input.
     for k in 0..n_new {
-        next = gpu.forward(&model, next, plen + k, &mut st_ref).expect("fwd");
+        next = gpu
+            .forward(&model, next, plen + k, &mut st_ref)
+            .expect("fwd");
         ref_out.push(next);
     }
     // The stream both paths consume: prompt followed by the greedy continuation.

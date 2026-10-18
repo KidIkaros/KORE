@@ -102,7 +102,10 @@ struct Rd<'a> {
 
 impl<'a> Rd<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).ok_or_else(|| err("offset overflow"))?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| err("offset overflow"))?;
         if end > self.d.len() {
             return Err(err("read past end of file"));
         }
@@ -287,7 +290,11 @@ fn read_value(rd: &mut Rd, vtype: u32, store: bool) -> Result<Option<MetaVal>> {
                 4 | 10 => {
                     let mut v = Vec::with_capacity(count.min(1 << 24));
                     for _ in 0..count {
-                        v.push(if et == 4 { rd.u32()? as i64 } else { rd.u64()? as i64 });
+                        v.push(if et == 4 {
+                            rd.u32()? as i64
+                        } else {
+                            rd.u64()? as i64
+                        });
                     }
                     MetaVal::I64Arr(v)
                 }
@@ -322,11 +329,10 @@ impl MiniGguf {
     /// Parse GGUF header, metadata and tensor table; mmap the file.
     /// Tensor payloads are not touched.
     pub fn load(path: &Path) -> Result<Arc<Self>> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| err(&format!("open {}: {e}", path.display())))?;
-        let map = unsafe {
-            Mmap::map(&file).map_err(|e| err(&format!("mmap {}: {e}", path.display())))?
-        };
+        let file =
+            std::fs::File::open(path).map_err(|e| err(&format!("open {}: {e}", path.display())))?;
+        let map =
+            unsafe { Mmap::map(&file).map_err(|e| err(&format!("mmap {}: {e}", path.display())))? };
         let mut rd = Rd { d: &map, pos: 0 };
 
         if rd.u32()? != 0x4655_4747 {

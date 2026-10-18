@@ -117,7 +117,12 @@ fn fused_gemv_equals_dequant_then_dot() {
     // dequantizing and dot-producting.
     for &(name, type_id) in CASES {
         let raw = read_fixture(name, "raw");
-        let deq = k_quant::dequantize(type_id, &raw, raw.len() / k_quant::block_bytes(type_id).unwrap() * k_quant::QK_K).unwrap();
+        let deq = k_quant::dequantize(
+            type_id,
+            &raw,
+            raw.len() / k_quant::block_bytes(type_id).unwrap() * k_quant::QK_K,
+        )
+        .unwrap();
         let k = deq.len();
         let x: Vec<f32> = (0..k)
             .map(|i| ((i as f32) * 0.017 - 1.0).sin() * (1.0 + (i % 7) as f32 * 0.1))

@@ -18,11 +18,19 @@ fn fp16_to_f32(h: u16) -> f32 {
     let f = if exp == 0 {
         (mant as f32) * (2f32.powi(-24))
     } else if exp == 31 {
-        if mant == 0 { f32::INFINITY } else { f32::NAN }
+        if mant == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
     } else {
         (1024.0 + mant as f32) * (2f32.powi(exp as i32 - 25))
     };
-    if sign == 1 { -f } else { f }
+    if sign == 1 {
+        -f
+    } else {
+        f
+    }
 }
 
 /// Dequantize `n` elements of Q2_0 data into f32.
@@ -55,9 +63,17 @@ pub fn dequantize_q2_0(data: &[u8], n: usize) -> Result<Vec<f32>, KoreError> {
 
 /// Packed GEMV: out[n] = sum_m w[m, n] * x[m], weights stored GGUF-style
 /// [m, n] with m contiguous: `n` rows of `m` packed Q2_0 values each.
-pub fn gemv_q2_0(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> Result<(), KoreError> {
+pub fn gemv_q2_0(
+    w: &[u8],
+    m: usize,
+    n: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<(), KoreError> {
     if m % Q2_0_BLOCK != 0 {
-        return Err(KoreError::StorageError(format!("q2_0 in-dim {m} not multiple of 64")));
+        return Err(KoreError::StorageError(format!(
+            "q2_0 in-dim {m} not multiple of 64"
+        )));
     }
     let bpr = m / Q2_0_BLOCK;
     let row_bytes = bpr * Q2_0_BLOCK_BYTES;

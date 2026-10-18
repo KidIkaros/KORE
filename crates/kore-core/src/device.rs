@@ -391,7 +391,16 @@ pub trait DeviceBackend: Send + Sync {
         seq_k: usize,
     ) -> crate::Result<crate::Tensor> {
         self.fused_attention_decode_gqa_q8(
-            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale, seq_k,
+            q,
+            k_q8,
+            v_q8,
+            k_scales,
+            v_scales,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            seq_k,
         )
     }
 
@@ -647,11 +656,7 @@ pub trait DeviceBackend: Send + Sync {
     }
 
     /// Elementwise attention gating: `C = A * sigmoid(B)`.
-    fn sigmoid_mul(
-        &self,
-        _a: &crate::Tensor,
-        _b: &crate::Tensor,
-    ) -> crate::Result<crate::Tensor> {
+    fn sigmoid_mul(&self, _a: &crate::Tensor, _b: &crate::Tensor) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
             "sigmoid_mul not implemented for backend '{}'",
             self.device_name()

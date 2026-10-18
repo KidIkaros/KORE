@@ -126,7 +126,9 @@ fn main() {
 
     // ---- prefill (discarded for timing: its only job is to reach the context) ----
     let t_pre = Instant::now();
-    let mut next = gpu.prefill(&model, &prefill, 0, &mut states).expect("prefill");
+    let mut next = gpu
+        .prefill(&model, &prefill, 0, &mut states)
+        .expect("prefill");
     let pre_s = t_pre.elapsed().as_secs_f64();
 
     // ---- cool the die (VRAM state survives) ----

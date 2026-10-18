@@ -126,7 +126,12 @@ fn dequantize_tensor(model: &GgufModel, tensor_name: &str) -> Result<Vec<u8>, St
 
     let n_elements: usize = info.dimensions.iter().map(|&d| d as usize).product();
     let f32_data = oxillama_quant::dequantize_to_f32(raw_bytes, info.tensor_type, n_elements)
-        .map_err(|e| format!("failed to dequantize '{tensor_name}' ({:?}): {e}", info.tensor_type))?;
+        .map_err(|e| {
+            format!(
+                "failed to dequantize '{tensor_name}' ({:?}): {e}",
+                info.tensor_type
+            )
+        })?;
 
     Ok(bytemuck::cast_slice::<f32, u8>(&f32_data).to_vec())
 }

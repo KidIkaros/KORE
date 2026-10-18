@@ -28,7 +28,10 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(256);
 
-    if std::env::var("KORE_OP_COUNT").map(|v| v == "0").unwrap_or(true) {
+    if std::env::var("KORE_OP_COUNT")
+        .map(|v| v == "0")
+        .unwrap_or(true)
+    {
         eprintln!("note: set KORE_OP_COUNT=1 or the census stays empty");
     }
     // The tokenizer is unused here, but the argument is kept so the call shape
@@ -44,7 +47,9 @@ fn main() {
     // shapes are all one-off costs that would otherwise land in the census.
     let mut next = 1u32;
     for i in 0..2 {
-        next = gpu.forward(&model, next, i, &mut states).expect("warmup fwd");
+        next = gpu
+            .forward(&model, next, i, &mut states)
+            .expect("warmup fwd");
     }
 
     kore_vulkan::reset_op_counts();

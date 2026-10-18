@@ -58,7 +58,12 @@ fn err(msg: impl Into<String>) -> KoreError {
 
 /// Number of blocks needed for `n` elements, validating that `data` is long
 /// enough to actually hold them.
-fn block_count(type_name: &str, data: &[u8], n: usize, block_bytes: usize) -> Result<usize, KoreError> {
+fn block_count(
+    type_name: &str,
+    data: &[u8],
+    n: usize,
+    block_bytes: usize,
+) -> Result<usize, KoreError> {
     if block_bytes == 0 {
         return Err(err(format!("{type_name}: zero-size block")));
     }
@@ -237,8 +242,8 @@ mod tests {
         s[0] = 0b11_111111; // A = 63, plus EE = 0b11
         s[4] = 0b00_000001; // a = 1
         s[8] = 0b0010_1010; // sc[4] low nibble = 0b1010, mn[4] low nibble = 0b0010 >> ...
-        // Bytes 8..12 hold both the low nibbles and, in their high nibbles, the
-        // mins' upper bits; the scales' upper bits live in bytes 0..4 (bits 6..8).
+                            // Bytes 8..12 hold both the low nibbles and, in their high nibbles, the
+                            // mins' upper bits; the scales' upper bits live in bytes 0..4 (bits 6..8).
         let (sc, mn) = unpack_scales_min(&s);
         assert_eq!(sc[0], 63.0);
         assert_eq!(mn[0], 1.0);
@@ -256,7 +261,10 @@ mod tests {
             (Q6_K_TYPE_ID, Q6_K_BLOCK_BYTES),
         ] {
             let out = dequantize(id, &vec![0u8; bytes], QK_K).unwrap();
-            assert!(out.iter().all(|v| *v == 0.0), "type {id} zero block nonzero");
+            assert!(
+                out.iter().all(|v| *v == 0.0),
+                "type {id} zero block nonzero"
+            );
         }
     }
 
@@ -293,10 +301,10 @@ mod tests {
         blk[208] = 0x00;
         blk[209] = 0x3C; // d = 1.0
         blk[192] = 1; // scales[0] = 1 (applies to indices 0..16)
-        // All 63 for the first 16 weights: ql nibbles 0xF, qh bits 0b11.
+                      // All 63 for the first 16 weights: ql nibbles 0xF, qh bits 0b11.
         blk[..8].fill(0xFF); // ql low-nibble plane for indices 0..8
-        // qh[0..8] carry the high bits for the 0..64 weight range; bit pairs
-        // 0b11 for plane2 = 0 (indices 0..8) and plane2 = 1 (indices 32..40).
+                             // qh[0..8] carry the high bits for the 0..64 weight range; bit pairs
+                             // 0b11 for plane2 = 0 (indices 0..8) and plane2 = 1 (indices 32..40).
         for b in blk[128..136].iter_mut() {
             *b = 0b0000_0011;
         }

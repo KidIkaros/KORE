@@ -95,7 +95,12 @@ fn main() {
         rounds,
         policies
             .iter()
-            .map(|p| format!("k={}/n>={}{}", p.k, p.min_match, if p.guard { "" } else { "/noguard" }))
+            .map(|p| format!(
+                "k={}/n>={}{}",
+                p.k,
+                p.min_match,
+                if p.guard { "" } else { "/noguard" }
+            ))
             .collect::<Vec<_>>()
             .join(" ")
     );
@@ -170,7 +175,11 @@ fn main() {
                 "k={} n>={}{}",
                 policies[arm - 1].k,
                 policies[arm - 1].min_match,
-                if policies[arm - 1].guard { "" } else { " noguard" }
+                if policies[arm - 1].guard {
+                    ""
+                } else {
+                    " noguard"
+                }
             ),
             s / n_new as f64,
             1e3 / (s / n_new as f64),

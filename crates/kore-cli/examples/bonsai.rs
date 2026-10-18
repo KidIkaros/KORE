@@ -36,8 +36,13 @@ fn main() {
     let tok_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "models/bonsai2-2b/tokenizer.json".into());
-    let prompt = std::env::args().nth(3).unwrap_or_else(|| "The capital of France is".into());
-    let n_new: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(20);
+    let prompt = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "The capital of France is".into());
+    let n_new: usize = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let mode = std::env::args().nth(5).unwrap_or_default();
     let use_gpu = mode == "gpu" || mode == "spec";
 
@@ -59,7 +64,11 @@ fn main() {
         .unwrap_or(ids.len() + n_new + 8);
     // arg6 doubles as the policy when it is not a number, so `... <prompt> <n>
     // spec 2:8` works without having to spell out `max_ctx` first.
-    let policy_arg = if max_ctx_arg.as_deref().and_then(|s| s.parse::<usize>().ok()).is_some() {
+    let policy_arg = if max_ctx_arg
+        .as_deref()
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some()
+    {
         std::env::args().nth(7)
     } else {
         max_ctx_arg
@@ -68,7 +77,8 @@ fn main() {
     if use_gpu {
         kore_vulkan::register_vulkan_backend().expect("vulkan backend");
         let t_gpu = Instant::now();
-        let gpu = Qwen35Gpu::from_cpu(&model, kore_core::Device::Vulkan(0)).expect("gpu materialize");
+        let gpu =
+            Qwen35Gpu::from_cpu(&model, kore_core::Device::Vulkan(0)).expect("gpu materialize");
         eprintln!("weights uploaded in {:?}", t_gpu.elapsed());
 
         let t1 = Instant::now();
@@ -97,10 +107,16 @@ fn main() {
             );
             out
         } else {
-            gpu.generate_greedy(&model, &ids, n_new, max_ctx).expect("gpu generate")
+            gpu.generate_greedy(&model, &ids, n_new, max_ctx)
+                .expect("gpu generate")
         };
         let dt = t1.elapsed();
-        eprintln!("GPU generated {} tokens in {:?} ({:.2} tok/s)", out.len(), dt, out.len() as f64 / dt.as_secs_f64());
+        eprintln!(
+            "GPU generated {} tokens in {:?} ({:.2} tok/s)",
+            out.len(),
+            dt,
+            out.len() as f64 / dt.as_secs_f64()
+        );
         eprintln!("token ids: {out:?}");
         println!("{}", tok.decode(&out, true).expect("decode"));
         return;
@@ -117,15 +133,24 @@ fn main() {
         idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
         eprintln!("top-10 after prompt:");
         for &i in idx.iter().take(10) {
-            let s = tok.decode(&[i as u32], false).unwrap_or_else(|_| "?".into());
+            let s = tok
+                .decode(&[i as u32], false)
+                .unwrap_or_else(|_| "?".into());
             eprintln!("  {:>7} {:>9.3} {:?}", i, logits[i], s);
         }
     }
 
     let t1 = Instant::now();
-    let out = model.generate_greedy(&ids, n_new, model.cfg.eos).expect("generate");
+    let out = model
+        .generate_greedy(&ids, n_new, model.cfg.eos)
+        .expect("generate");
     let dt = t1.elapsed();
-    eprintln!("generated {} tokens in {:?} ({:.2} tok/s)", out.len(), dt, out.len() as f64 / dt.as_secs_f64());
+    eprintln!(
+        "generated {} tokens in {:?} ({:.2} tok/s)",
+        out.len(),
+        dt,
+        out.len() as f64 / dt.as_secs_f64()
+    );
     eprintln!("token ids: {out:?}");
     let text = tok.decode(&out, true).expect("decode");
     println!("{text}");

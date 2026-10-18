@@ -506,7 +506,11 @@ pub struct VulkanBackend {
     batch: Arc<parking_lot::Mutex<PendingBatch>>,
     /// Lazily padded Q6_K weight buffers (210B -> 224B blocks), keyed by source buffer
     /// pointer; the source Arc is held so its address can never be recycled by the pool.
-    q6k_pad_cache: Arc<parking_lot::Mutex<std::collections::HashMap<usize, (Arc<wgpu::Buffer>, Arc<wgpu::Buffer>)>>>,
+    q6k_pad_cache: Arc<
+        parking_lot::Mutex<
+            std::collections::HashMap<usize, (Arc<wgpu::Buffer>, Arc<wgpu::Buffer>)>,
+        >,
+    >,
 }
 
 impl VulkanBackend {
@@ -546,16 +550,14 @@ impl VulkanBackend {
         );
 
         let limits = adapter.limits();
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("KORE Vulkan Device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: limits,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
-            },
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("KORE Vulkan Device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+        }))
         .map_err(|e| VulkanError::Initialization(e.to_string()))?;
 
         let device = Arc::new(device);
@@ -711,10 +713,13 @@ impl VulkanBackend {
                 cache: None,
             },
         ));
-        let flash_decode_gqa_q8_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("kore_flash_decode_gqa_q8_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/flash_decode_gqa_q8.wgsl").into()),
-        });
+        let flash_decode_gqa_q8_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("kore_flash_decode_gqa_q8_shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/flash_decode_gqa_q8.wgsl").into(),
+                ),
+            });
         let flash_decode_gqa_q8_pipeline = Arc::new(device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some("kore_flash_decode_gqa_q8_pipeline"),
@@ -726,10 +731,13 @@ impl VulkanBackend {
             },
         ));
 
-        let flash_decode_gqa_q8_split_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("kore_flash_decode_gqa_q8_split_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/flash_decode_gqa_q8_split.wgsl").into()),
-        });
+        let flash_decode_gqa_q8_split_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("kore_flash_decode_gqa_q8_split_shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/flash_decode_gqa_q8_split.wgsl").into(),
+                ),
+            });
         let flash_decode_gqa_q8_split_pipeline = Arc::new(device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some("kore_flash_decode_gqa_q8_split_pipeline"),
@@ -741,10 +749,13 @@ impl VulkanBackend {
             },
         ));
 
-        let flash_decode_gqa_q8_combine_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("kore_flash_decode_gqa_q8_combine_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/flash_decode_gqa_q8_combine.wgsl").into()),
-        });
+        let flash_decode_gqa_q8_combine_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("kore_flash_decode_gqa_q8_combine_shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/flash_decode_gqa_q8_combine.wgsl").into(),
+                ),
+            });
         let flash_decode_gqa_q8_combine_pipeline = Arc::new(device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
                 label: Some("kore_flash_decode_gqa_q8_combine_pipeline"),
@@ -908,7 +919,9 @@ impl VulkanBackend {
 
         let kv_cache_append_q8_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kore_kv_cache_append_q8_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/kv_cache_append_q8.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/kv_cache_append_q8.wgsl").into(),
+            ),
         });
         let kv_cache_append_q8_pipeline = Arc::new(device.create_compute_pipeline(
             &wgpu::ComputePipelineDescriptor {
@@ -1275,11 +1288,19 @@ impl VulkanBackend {
         };
 
         let (pipeline, workgroups, label) = if (1..=4).contains(&m) {
-            (&self.gemv_pipeline, ((n as u32).div_ceil(64).max(1), 1, 1), "gemv_pass")
+            (
+                &self.gemv_pipeline,
+                ((n as u32).div_ceil(64).max(1), 1, 1),
+                "gemv_pass",
+            )
         } else {
             (
                 &self.gemm_pipeline,
-                ((n as u32).div_ceil(16).max(1), (m as u32).div_ceil(16).max(1), 1),
+                (
+                    (n as u32).div_ceil(16).max(1),
+                    (m as u32).div_ceil(16).max(1),
+                    1,
+                ),
                 "gemm_pass",
             )
         };
@@ -1429,12 +1450,8 @@ impl VulkanBackend {
         let dims = gate_up.shape().dims();
         let m = if dims.len() == 2 { dims[0] } else { 1 };
         let numel = m * intermediate_size;
-        let in_buf = KoreVulkanBuffer::from_storage(
-            gate_up.storage_ref(),
-            dims,
-            &self.device,
-            &self.queue,
-        )?;
+        let in_buf =
+            KoreVulkanBuffer::from_storage(gate_up.storage_ref(), dims, &self.device, &self.queue)?;
         let out_bytes = (numel * std::mem::size_of::<f32>()).max(4);
         let c_buffer =
             crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_swiglu_split_out");
@@ -1531,7 +1548,12 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.quantized_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[a_buf.arc_buffer(), b_buf.arc_buffer(), s_buf.arc_buffer(), &c_buffer],
+            &[
+                a_buf.arc_buffer(),
+                b_buf.arc_buffer(),
+                s_buf.arc_buffer(),
+                &c_buffer,
+            ],
             (workgroups_x, workgroups_y, 1),
             "quant_compute_pass",
         );
@@ -1678,7 +1700,7 @@ impl VulkanBackend {
             scalar: 0.0,
             a_numel: numel as u32,
             b_numel: numel as u32,
-             _pad0: 0,
+            _pad0: 0,
             _pad1: (start_row * cols) as u32,
             _pad2: 0,
         };
@@ -1774,10 +1796,18 @@ impl VulkanBackend {
                 "copy_buffer: numel exceeds the u32 index space".into(),
             ));
         }
-        let dst_buf =
-            KoreVulkanBuffer::from_storage(dst.storage_ref(), dst.shape().dims(), &self.device, &self.queue)?;
-        let src_buf =
-            KoreVulkanBuffer::from_storage(src.storage_ref(), src.shape().dims(), &self.device, &self.queue)?;
+        let dst_buf = KoreVulkanBuffer::from_storage(
+            dst.storage_ref(),
+            dst.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let src_buf = KoreVulkanBuffer::from_storage(
+            src.storage_ref(),
+            src.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
 
         let uniforms = ElementwiseUniforms {
             numel: numel as u32,
@@ -1854,7 +1884,11 @@ impl VulkanBackend {
             self.record_dispatch(
                 &self.elementwise_pipeline,
                 bytemuck::bytes_of(&uniforms),
-                &[src_buf.arc_buffer(), src_buf.arc_buffer(), dst_buf.arc_buffer()],
+                &[
+                    src_buf.arc_buffer(),
+                    src_buf.arc_buffer(),
+                    dst_buf.arc_buffer(),
+                ],
                 (workgroups, 1, 1),
                 "kv_cache_append_pass",
             );
@@ -1889,10 +1923,16 @@ impl VulkanBackend {
         let vn_shape = v_new.shape().dims();
         let ks_shape = k_scales_new.shape().dims();
         let vs_shape = v_scales_new.shape().dims();
-        if kc_shape.len() != 2 || vc_shape.len() != 2 || kn_shape.len() != 2
-            || vn_shape.len() != 2 || ks_shape.len() != 1 || vs_shape.len() != 1
-            || kn_shape[1] != kc_shape[1] || vn_shape[1] != vc_shape[1]
-            || kn_shape[0] != vn_shape[0] || kn_shape[0] != ks_shape[0]
+        if kc_shape.len() != 2
+            || vc_shape.len() != 2
+            || kn_shape.len() != 2
+            || vn_shape.len() != 2
+            || ks_shape.len() != 1
+            || vs_shape.len() != 1
+            || kn_shape[1] != kc_shape[1]
+            || vn_shape[1] != vc_shape[1]
+            || kn_shape[0] != vn_shape[0]
+            || kn_shape[0] != ks_shape[0]
         {
             return Err(VulkanError::ShapeMismatch {
                 op: "kv_cache_append_q8".into(),
@@ -1913,10 +1953,30 @@ impl VulkanBackend {
             ));
         }
 
-        let kc_buf = KoreVulkanBuffer::from_storage(k_cache_buf.storage_ref(), kc_shape, &self.device, &self.queue)?;
-        let vc_buf = KoreVulkanBuffer::from_storage(v_cache_buf.storage_ref(), vc_shape, &self.device, &self.queue)?;
-        let kn_buf = KoreVulkanBuffer::from_storage(k_new.storage_ref(), kn_shape, &self.device, &self.queue)?;
-        let vn_buf = KoreVulkanBuffer::from_storage(v_new.storage_ref(), vn_shape, &self.device, &self.queue)?;
+        let kc_buf = KoreVulkanBuffer::from_storage(
+            k_cache_buf.storage_ref(),
+            kc_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let vc_buf = KoreVulkanBuffer::from_storage(
+            v_cache_buf.storage_ref(),
+            vc_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let kn_buf = KoreVulkanBuffer::from_storage(
+            k_new.storage_ref(),
+            kn_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let vn_buf = KoreVulkanBuffer::from_storage(
+            v_new.storage_ref(),
+            vn_shape,
+            &self.device,
+            &self.queue,
+        )?;
 
         let numel_k = (num_new * cols_k) as u32;
         let numel_v = (num_new * cols_v) as u32;
@@ -1934,16 +1994,41 @@ impl VulkanBackend {
             self.record_dispatch(
                 &self.kv_cache_append_q8_pipeline,
                 bytemuck::bytes_of(&uniforms),
-                &[kn_buf.arc_buffer(), vn_buf.arc_buffer(), kc_buf.arc_buffer(), vc_buf.arc_buffer()],
+                &[
+                    kn_buf.arc_buffer(),
+                    vn_buf.arc_buffer(),
+                    kc_buf.arc_buffer(),
+                    vc_buf.arc_buffer(),
+                ],
                 (workgroups, 1, 1),
                 "kv_cache_append_q8_pass",
             );
         }
 
-        let ks_buf = KoreVulkanBuffer::from_storage(k_scales_buf.storage_ref(), ks_shape, &self.device, &self.queue)?;
-        let vs_buf = KoreVulkanBuffer::from_storage(v_scales_buf.storage_ref(), vs_shape, &self.device, &self.queue)?;
-        let kns = KoreVulkanBuffer::from_storage(k_scales_new.storage_ref(), ks_shape, &self.device, &self.queue)?;
-        let vns = KoreVulkanBuffer::from_storage(v_scales_new.storage_ref(), vs_shape, &self.device, &self.queue)?;
+        let ks_buf = KoreVulkanBuffer::from_storage(
+            k_scales_buf.storage_ref(),
+            ks_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let vs_buf = KoreVulkanBuffer::from_storage(
+            v_scales_buf.storage_ref(),
+            vs_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let kns = KoreVulkanBuffer::from_storage(
+            k_scales_new.storage_ref(),
+            ks_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let vns = KoreVulkanBuffer::from_storage(
+            v_scales_new.storage_ref(),
+            vs_shape,
+            &self.device,
+            &self.queue,
+        )?;
 
         if num_new > 0 {
             let eu = ElementwiseUniforms {
@@ -1984,9 +2069,20 @@ impl VulkanBackend {
         }
 
         let total_rows = row_offset + num_new;
-        let k_view = KoreVulkanBuffer::new(Arc::clone(kc_buf.arc_buffer()), DType::U8, vec![total_rows, cols_k]);
-        let v_view = KoreVulkanBuffer::new(Arc::clone(vc_buf.arc_buffer()), DType::U8, vec![total_rows, cols_v]);
-        Ok((self.make_tensor(k_view, &[total_rows, cols_k]), self.make_tensor(v_view, &[total_rows, cols_v])))
+        let k_view = KoreVulkanBuffer::new(
+            Arc::clone(kc_buf.arc_buffer()),
+            DType::U8,
+            vec![total_rows, cols_k],
+        );
+        let v_view = KoreVulkanBuffer::new(
+            Arc::clone(vc_buf.arc_buffer()),
+            DType::U8,
+            vec![total_rows, cols_v],
+        );
+        Ok((
+            self.make_tensor(k_view, &[total_rows, cols_k]),
+            self.make_tensor(v_view, &[total_rows, cols_v]),
+        ))
     }
 
     /// Quantize F32 rows to symmetric INT8 **on the GPU** (no host round-trip).
@@ -2024,7 +2120,8 @@ impl VulkanBackend {
         );
 
         if rows > 0 && cols > 0 {
-            let in_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), shape, &self.device, &self.queue)?;
+            let in_buf =
+                KoreVulkanBuffer::from_storage(x.storage_ref(), shape, &self.device, &self.queue)?;
             let uniforms = QuantQ8Uniforms {
                 rows: rows as u32,
                 cols: cols as u32,
@@ -2138,7 +2235,12 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.flash_decode_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[q_buf.arc_buffer(), k_buf.arc_buffer(), v_buf.arc_buffer(), &out_buffer],
+            &[
+                q_buf.arc_buffer(),
+                k_buf.arc_buffer(),
+                v_buf.arc_buffer(),
+                &out_buffer,
+            ],
             (seq_q as u32, 1, 1),
             "flash_decode_compute_pass",
         );
@@ -2189,8 +2291,11 @@ impl VulkanBackend {
             KoreVulkanBuffer::from_storage(v.storage_ref(), v_shape, &self.device, &self.queue)?;
 
         let out_bytes = (seq_q * q_dim * std::mem::size_of::<f32>()).max(4);
-        let out_buffer =
-            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_flash_decode_gqa_out");
+        let out_buffer = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            out_bytes,
+            "kore_flash_decode_gqa_out",
+        );
 
         let uniforms = FlashDecodeGqaUniforms {
             seq_q: seq_q as u32,
@@ -2206,7 +2311,12 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.flash_decode_gqa_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[q_buf.arc_buffer(), k_buf.arc_buffer(), v_buf.arc_buffer(), &out_buffer],
+            &[
+                q_buf.arc_buffer(),
+                k_buf.arc_buffer(),
+                v_buf.arc_buffer(),
+                &out_buffer,
+            ],
             (num_heads as u32, seq_q as u32, 1),
             "flash_decode_gqa_compute_pass",
         );
@@ -2237,8 +2347,11 @@ impl VulkanBackend {
         let v_shape = v_q8.shape().dims();
         let ks_shape = k_scales.shape().dims();
         let vs_shape = v_scales.shape().dims();
-        if q_shape.len() != 2 || k_shape.len() != 2 || v_shape.len() != 2
-            || ks_shape.len() != 1 || vs_shape.len() != 1
+        if q_shape.len() != 2
+            || k_shape.len() != 2
+            || v_shape.len() != 2
+            || ks_shape.len() != 1
+            || vs_shape.len() != 1
         {
             return Err(VulkanError::UnsupportedOperation(
                 "fused_attention_decode_gqa_q8 requires 2D Q/K/V + 1D scale buffers".into(),
@@ -2270,14 +2383,31 @@ impl VulkanBackend {
             ));
         }
 
-        let q_buf = KoreVulkanBuffer::from_storage(q.storage_ref(), q_shape, &self.device, &self.queue)?;
-        let k_buf = KoreVulkanBuffer::from_storage(k_q8.storage_ref(), k_shape, &self.device, &self.queue)?;
-        let v_buf = KoreVulkanBuffer::from_storage(v_q8.storage_ref(), v_shape, &self.device, &self.queue)?;
-        let ks_buf = KoreVulkanBuffer::from_storage(k_scales.storage_ref(), ks_shape, &self.device, &self.queue)?;
-        let vs_buf = KoreVulkanBuffer::from_storage(v_scales.storage_ref(), vs_shape, &self.device, &self.queue)?;
+        let q_buf =
+            KoreVulkanBuffer::from_storage(q.storage_ref(), q_shape, &self.device, &self.queue)?;
+        let k_buf =
+            KoreVulkanBuffer::from_storage(k_q8.storage_ref(), k_shape, &self.device, &self.queue)?;
+        let v_buf =
+            KoreVulkanBuffer::from_storage(v_q8.storage_ref(), v_shape, &self.device, &self.queue)?;
+        let ks_buf = KoreVulkanBuffer::from_storage(
+            k_scales.storage_ref(),
+            ks_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let vs_buf = KoreVulkanBuffer::from_storage(
+            v_scales.storage_ref(),
+            vs_shape,
+            &self.device,
+            &self.queue,
+        )?;
 
         let out_bytes = (seq_q * q_dim * std::mem::size_of::<f32>()).max(4);
-        let out_buffer = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_flash_decode_gqa_q8_out");
+        let out_buffer = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            out_bytes,
+            "kore_flash_decode_gqa_q8_out",
+        );
 
         let uniforms = Q8GqaUniforms {
             seq_q: seq_q as u32,
@@ -2293,7 +2423,14 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.flash_decode_gqa_q8_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[q_buf.arc_buffer(), k_buf.arc_buffer(), v_buf.arc_buffer(), ks_buf.arc_buffer(), vs_buf.arc_buffer(), &out_buffer],
+            &[
+                q_buf.arc_buffer(),
+                k_buf.arc_buffer(),
+                v_buf.arc_buffer(),
+                ks_buf.arc_buffer(),
+                vs_buf.arc_buffer(),
+                &out_buffer,
+            ],
             (num_heads as u32, seq_q as u32, 1),
             "flash_decode_gqa_q8_compute_pass",
         );
@@ -2331,8 +2468,11 @@ impl VulkanBackend {
         let v_shape = v_q8.shape().dims();
         let ks_shape = k_scales.shape().dims();
         let vs_shape = v_scales.shape().dims();
-        if q_shape.len() != 2 || k_shape.len() != 2 || v_shape.len() != 2
-            || ks_shape.len() != 1 || vs_shape.len() != 1
+        if q_shape.len() != 2
+            || k_shape.len() != 2
+            || v_shape.len() != 2
+            || ks_shape.len() != 1
+            || vs_shape.len() != 1
         {
             return Err(VulkanError::UnsupportedOperation(
                 "fused_attention_decode_gqa_q8_split requires 2D Q/K/V + 1D scale buffers".into(),
@@ -2387,11 +2527,24 @@ impl VulkanBackend {
             ));
         }
 
-        let q_buf = KoreVulkanBuffer::from_storage(q.storage_ref(), q_shape, &self.device, &self.queue)?;
-        let k_buf = KoreVulkanBuffer::from_storage(k_q8.storage_ref(), k_shape, &self.device, &self.queue)?;
-        let v_buf = KoreVulkanBuffer::from_storage(v_q8.storage_ref(), v_shape, &self.device, &self.queue)?;
-        let ks_buf = KoreVulkanBuffer::from_storage(k_scales.storage_ref(), ks_shape, &self.device, &self.queue)?;
-        let vs_buf = KoreVulkanBuffer::from_storage(v_scales.storage_ref(), vs_shape, &self.device, &self.queue)?;
+        let q_buf =
+            KoreVulkanBuffer::from_storage(q.storage_ref(), q_shape, &self.device, &self.queue)?;
+        let k_buf =
+            KoreVulkanBuffer::from_storage(k_q8.storage_ref(), k_shape, &self.device, &self.queue)?;
+        let v_buf =
+            KoreVulkanBuffer::from_storage(v_q8.storage_ref(), v_shape, &self.device, &self.queue)?;
+        let ks_buf = KoreVulkanBuffer::from_storage(
+            k_scales.storage_ref(),
+            ks_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let vs_buf = KoreVulkanBuffer::from_storage(
+            v_scales.storage_ref(),
+            vs_shape,
+            &self.device,
+            &self.queue,
+        )?;
 
         let n_shards = num_heads * n_splits;
         // Both streams are scratch: they are bound directly and never wrapped in
@@ -2559,13 +2712,7 @@ impl VulkanBackend {
     /// w_raw: [N * (K/256) * 144] in U8
     /// n: output dimension (number of rows in W)
     /// k: input dimension (number of columns in W)
-    pub fn gemv_q4_k(
-        &self,
-        x: &Tensor,
-        w_raw: &Tensor,
-        n: usize,
-        k: usize,
-    ) -> Result<Tensor> {
+    pub fn gemv_q4_k(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
         let x_shape = x.shape().dims();
         // A 1-D input is a single row: `m` is 1, not its length. Reading
         // `x_shape[0]` as `m` would turn a `[k]` activation vector into a
@@ -2588,11 +2735,18 @@ impl VulkanBackend {
             blocks_per_row,
         };
 
-        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
-        let w_buf = KoreVulkanBuffer::from_storage(w_raw.storage_ref(), w_raw.shape().dims(), &self.device, &self.queue)?;
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
 
         let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
-        let y_buffer = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q4_k_out");
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q4_k_out");
 
         let workgroups_x = (n as u32).div_ceil(4).max(1);
         let workgroups_y = (m as u32).div_ceil(4).max(1);
@@ -2613,13 +2767,7 @@ impl VulkanBackend {
     /// w_raw: [N * (K/256) * 176] in U8
     /// n: output dimension (number of rows in W)
     /// k: input dimension (number of columns in W)
-    pub fn gemv_q5_k(
-        &self,
-        x: &Tensor,
-        w_raw: &Tensor,
-        n: usize,
-        k: usize,
-    ) -> Result<Tensor> {
+    pub fn gemv_q5_k(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
         let x_shape = x.shape().dims();
         // A 1-D input is a single row: `m` is 1, not its length. Reading
         // `x_shape[0]` as `m` would turn a `[k]` activation vector into a
@@ -2642,11 +2790,18 @@ impl VulkanBackend {
             blocks_per_row,
         };
 
-        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
-        let w_buf = KoreVulkanBuffer::from_storage(w_raw.storage_ref(), w_raw.shape().dims(), &self.device, &self.queue)?;
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
 
         let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
-        let y_buffer = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q5_k_out");
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q5_k_out");
 
         let workgroups_x = (n as u32).div_ceil(4).max(1);
         let workgroups_y = (m as u32).div_ceil(4).max(1);
@@ -2667,13 +2822,7 @@ impl VulkanBackend {
     /// w_raw: [N * (K/256) * 210] in U8
     /// n: output dimension (number of rows in W)
     /// k: input dimension (number of columns in W)
-    pub fn gemv_q6_k(
-        &self,
-        x: &Tensor,
-        w_raw: &Tensor,
-        n: usize,
-        k: usize,
-    ) -> Result<Tensor> {
+    pub fn gemv_q6_k(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
         let x_shape = x.shape().dims();
         // A 1-D input is a single row: `m` is 1, not its length. Reading
         // `x_shape[0]` as `m` would turn a `[k]` activation vector into a
@@ -2696,12 +2845,19 @@ impl VulkanBackend {
             blocks_per_row,
         };
 
-        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
-        let w_buf = KoreVulkanBuffer::from_storage(w_raw.storage_ref(), w_raw.shape().dims(), &self.device, &self.queue)?;
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
         let padded_w = self.q6k_padded(w_buf.arc_buffer(), n, blocks_per_row);
 
         let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
-        let y_buffer = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q6_k_out");
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q6_k_out");
 
         let workgroups_x = (n as u32).div_ceil(4).max(1);
         let workgroups_y = (m as u32).div_ceil(4).max(1);
@@ -2720,9 +2876,19 @@ impl VulkanBackend {
     /// Get or create the 224B-block padded version of a packed Q6_K weight buffer.
     /// Repack is recorded once per source buffer into the pending submission;
     /// the source `Arc` is pinned in the cache so its pointer can't be recycled.
-    fn q6k_padded(&self, w_arc: &Arc<wgpu::Buffer>, n: usize, blocks_per_row: u32) -> Arc<wgpu::Buffer> {
+    fn q6k_padded(
+        &self,
+        w_arc: &Arc<wgpu::Buffer>,
+        n: usize,
+        blocks_per_row: u32,
+    ) -> Arc<wgpu::Buffer> {
         let key = Arc::as_ptr(w_arc) as usize;
-        let cached = { self.q6k_pad_cache.lock().get(&key).map(|(_, p)| Arc::clone(p)) };
+        let cached = {
+            self.q6k_pad_cache
+                .lock()
+                .get(&key)
+                .map(|(_, p)| Arc::clone(p))
+        };
         match cached {
             Some(p) => p,
             None => {
@@ -2762,7 +2928,16 @@ impl VulkanBackend {
         nv: usize,
         k: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        self.gemv_split3_dispatch(x, w_raw, nq, nk, nv, k, &self.gemv_q4_k_split3_pipeline, "q4_k")
+        self.gemv_split3_dispatch(
+            x,
+            w_raw,
+            nq,
+            nk,
+            nv,
+            k,
+            &self.gemv_q4_k_split3_pipeline,
+            "q4_k",
+        )
     }
 
     /// Fused Q|K|V projection over a concatenated Q6_K weight buffer (padded
@@ -2776,7 +2951,16 @@ impl VulkanBackend {
         nv: usize,
         k: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        self.gemv_split3_dispatch(x, w_raw, nq, nk, nv, k, &self.gemv_q6_k_split3_pipeline, "q6_k")
+        self.gemv_split3_dispatch(
+            x,
+            w_raw,
+            nq,
+            nk,
+            nv,
+            k,
+            &self.gemv_q6_k_split3_pipeline,
+            "q6_k",
+        )
     }
 
     fn gemv_split3_dispatch(
@@ -2817,8 +3001,14 @@ impl VulkanBackend {
             _pad1: 0,
         };
 
-        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
-        let w_buf = KoreVulkanBuffer::from_storage(w_raw.storage_ref(), w_raw.shape().dims(), &self.device, &self.queue)?;
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
 
         // Q6_K weights go through the padded-block repack; Q4_K bind raw.
         let w_arc = if label == "q6_k" {
@@ -2827,24 +3017,42 @@ impl VulkanBackend {
             Arc::clone(w_buf.arc_buffer())
         };
 
-        let yq_buffer = crate::buffer::alloc_storage_buffer(&self.device, (m * nq * 4).max(4), "kore_split3_q");
-        let yk_buffer = crate::buffer::alloc_storage_buffer(&self.device, (m * nk * 4).max(4), "kore_split3_k");
-        let yv_buffer = crate::buffer::alloc_storage_buffer(&self.device, (m * nv * 4).max(4), "kore_split3_v");
+        let yq_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, (m * nq * 4).max(4), "kore_split3_q");
+        let yk_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, (m * nk * 4).max(4), "kore_split3_k");
+        let yv_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, (m * nv * 4).max(4), "kore_split3_v");
 
         let workgroups_x = (n as u32).div_ceil(4).max(1);
         let workgroups_y = (m as u32).div_ceil(4).max(1);
         self.record_dispatch(
             pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[x_buf.arc_buffer(), &w_arc, &yq_buffer, &yk_buffer, &yv_buffer],
+            &[
+                x_buf.arc_buffer(),
+                &w_arc,
+                &yq_buffer,
+                &yk_buffer,
+                &yv_buffer,
+            ],
             (workgroups_x, workgroups_y, 1),
             "gemv_split3_compute_pass",
         );
 
         Ok((
-            self.make_tensor(KoreVulkanBuffer::new(yq_buffer, DType::F32, vec![m, nq]), &[m, nq]),
-            self.make_tensor(KoreVulkanBuffer::new(yk_buffer, DType::F32, vec![m, nk]), &[m, nk]),
-            self.make_tensor(KoreVulkanBuffer::new(yv_buffer, DType::F32, vec![m, nv]), &[m, nv]),
+            self.make_tensor(
+                KoreVulkanBuffer::new(yq_buffer, DType::F32, vec![m, nq]),
+                &[m, nq],
+            ),
+            self.make_tensor(
+                KoreVulkanBuffer::new(yk_buffer, DType::F32, vec![m, nk]),
+                &[m, nk],
+            ),
+            self.make_tensor(
+                KoreVulkanBuffer::new(yv_buffer, DType::F32, vec![m, nv]),
+                &[m, nv],
+            ),
         ))
     }
 
@@ -2873,10 +3081,20 @@ impl VulkanBackend {
             });
         }
 
-        let q_buf = KoreVulkanBuffer::from_storage(q.storage_ref(), q_shape, &self.device, &self.queue)?;
-        let k_buf = KoreVulkanBuffer::from_storage(k.storage_ref(), k_shape, &self.device, &self.queue)?;
-        let q_out = crate::buffer::alloc_storage_buffer(&self.device, (q.numel() * 4).max(4), "kore_rope_pair_q");
-        let k_out = crate::buffer::alloc_storage_buffer(&self.device, (k.numel() * 4).max(4), "kore_rope_pair_k");
+        let q_buf =
+            KoreVulkanBuffer::from_storage(q.storage_ref(), q_shape, &self.device, &self.queue)?;
+        let k_buf =
+            KoreVulkanBuffer::from_storage(k.storage_ref(), k_shape, &self.device, &self.queue)?;
+        let q_out = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (q.numel() * 4).max(4),
+            "kore_rope_pair_q",
+        );
+        let k_out = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (k.numel() * 4).max(4),
+            "kore_rope_pair_k",
+        );
 
         let uniforms = RopePairUniforms {
             pos: pos as u32,
@@ -2899,8 +3117,14 @@ impl VulkanBackend {
         );
 
         Ok((
-            self.make_tensor(KoreVulkanBuffer::new(q_out, DType::F32, q_shape.to_vec()), q_shape),
-            self.make_tensor(KoreVulkanBuffer::new(k_out, DType::F32, k_shape.to_vec()), k_shape),
+            self.make_tensor(
+                KoreVulkanBuffer::new(q_out, DType::F32, q_shape.to_vec()),
+                q_shape,
+            ),
+            self.make_tensor(
+                KoreVulkanBuffer::new(k_out, DType::F32, k_shape.to_vec()),
+                k_shape,
+            ),
         ))
     }
 
@@ -2918,8 +3142,12 @@ impl VulkanBackend {
         let vc_shape = v_cache.shape().dims();
         let kn_shape = k_new.shape().dims();
         let vn_shape = v_new.shape().dims();
-        if kc_shape.len() != 2 || vc_shape.len() != 2 || kn_shape.len() != 2 || vn_shape.len() != 2
-            || kn_shape[1] != kc_shape[1] || vn_shape[1] != vc_shape[1]
+        if kc_shape.len() != 2
+            || vc_shape.len() != 2
+            || kn_shape.len() != 2
+            || vn_shape.len() != 2
+            || kn_shape[1] != kc_shape[1]
+            || vn_shape[1] != vc_shape[1]
             || kn_shape[0] != vn_shape[0]
         {
             return Err(VulkanError::ShapeMismatch {
@@ -2933,10 +3161,30 @@ impl VulkanBackend {
         let cols_k = kc_shape[1];
         let cols_v = vc_shape[1];
 
-        let kc_buf = KoreVulkanBuffer::from_storage(k_cache.storage_ref(), kc_shape, &self.device, &self.queue)?;
-        let vc_buf = KoreVulkanBuffer::from_storage(v_cache.storage_ref(), vc_shape, &self.device, &self.queue)?;
-        let kn_buf = KoreVulkanBuffer::from_storage(k_new.storage_ref(), kn_shape, &self.device, &self.queue)?;
-        let vn_buf = KoreVulkanBuffer::from_storage(v_new.storage_ref(), vn_shape, &self.device, &self.queue)?;
+        let kc_buf = KoreVulkanBuffer::from_storage(
+            k_cache.storage_ref(),
+            kc_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let vc_buf = KoreVulkanBuffer::from_storage(
+            v_cache.storage_ref(),
+            vc_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let kn_buf = KoreVulkanBuffer::from_storage(
+            k_new.storage_ref(),
+            kn_shape,
+            &self.device,
+            &self.queue,
+        )?;
+        let vn_buf = KoreVulkanBuffer::from_storage(
+            v_new.storage_ref(),
+            vn_shape,
+            &self.device,
+            &self.queue,
+        )?;
 
         let numel_k = (num_new * cols_k) as u32;
         let numel_v = (num_new * cols_v) as u32;
@@ -2951,7 +3199,12 @@ impl VulkanBackend {
             self.record_dispatch(
                 &self.kv_append_pair_pipeline,
                 bytemuck::bytes_of(&uniforms),
-                &[kn_buf.arc_buffer(), vn_buf.arc_buffer(), kc_buf.arc_buffer(), vc_buf.arc_buffer()],
+                &[
+                    kn_buf.arc_buffer(),
+                    vn_buf.arc_buffer(),
+                    kc_buf.arc_buffer(),
+                    vc_buf.arc_buffer(),
+                ],
                 (workgroups, 1, 1),
                 "kv_append_pair_pass",
             );
@@ -3004,13 +3257,22 @@ impl VulkanBackend {
             });
         }
 
-        let a_buf = KoreVulkanBuffer::from_storage(a.storage_ref(), shape, &self.device, &self.queue)?;
-        let b_buf = KoreVulkanBuffer::from_storage(b.storage_ref(), shape, &self.device, &self.queue)?;
-        let w_buf = KoreVulkanBuffer::from_storage(weight.storage_ref(), weight.shape().dims(), &self.device, &self.queue)?;
+        let a_buf =
+            KoreVulkanBuffer::from_storage(a.storage_ref(), shape, &self.device, &self.queue)?;
+        let b_buf =
+            KoreVulkanBuffer::from_storage(b.storage_ref(), shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            weight.storage_ref(),
+            weight.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
 
         let out_bytes = (a.numel() * 4).max(4);
-        let res_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_addres_out");
-        let norm_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_addnorm_out");
+        let res_buf =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_addres_out");
+        let norm_buf =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_addnorm_out");
 
         let uniforms = AddRmsNormUniforms {
             rows: rows as u32,
@@ -3021,14 +3283,26 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.add_rms_norm_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[a_buf.arc_buffer(), b_buf.arc_buffer(), w_buf.arc_buffer(), &res_buf, &norm_buf],
+            &[
+                a_buf.arc_buffer(),
+                b_buf.arc_buffer(),
+                w_buf.arc_buffer(),
+                &res_buf,
+                &norm_buf,
+            ],
             (rows as u32, 1, 1),
             "add_rms_norm_pass",
         );
 
         Ok((
-            self.make_tensor(KoreVulkanBuffer::new(res_buf, DType::F32, shape.to_vec()), shape),
-            self.make_tensor(KoreVulkanBuffer::new(norm_buf, DType::F32, shape.to_vec()), shape),
+            self.make_tensor(
+                KoreVulkanBuffer::new(res_buf, DType::F32, shape.to_vec()),
+                shape,
+            ),
+            self.make_tensor(
+                KoreVulkanBuffer::new(norm_buf, DType::F32, shape.to_vec()),
+                shape,
+            ),
         ))
     }
 
@@ -3065,10 +3339,16 @@ impl VulkanBackend {
             ));
         }
 
-
-        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
-        let w_buf = KoreVulkanBuffer::from_storage(w_raw.storage_ref(), w_raw.shape().dims(), &self.device, &self.queue)?;
-        let out = crate::buffer::alloc_storage_buffer(&self.device, (m * n * 4).max(4), "kore_q2_out");
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let out =
+            crate::buffer::alloc_storage_buffer(&self.device, (m * n * 4).max(4), "kore_q2_out");
 
         let uniforms = Q2GemvUniforms {
             m: m as u32,
@@ -3114,9 +3394,20 @@ impl VulkanBackend {
                 rhs: vec![signs.numel(), block_size],
             });
         }
-        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x.shape().dims(), &self.device, &self.queue)?;
-        let s_buf = KoreVulkanBuffer::from_storage(signs.storage_ref(), signs.shape().dims(), &self.device, &self.queue)?;
-        let out = crate::buffer::alloc_storage_buffer(&self.device, (numel * 4).max(4), "kore_hads_out");
+        let x_buf = KoreVulkanBuffer::from_storage(
+            x.storage_ref(),
+            x.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let s_buf = KoreVulkanBuffer::from_storage(
+            signs.storage_ref(),
+            signs.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let out =
+            crate::buffer::alloc_storage_buffer(&self.device, (numel * 4).max(4), "kore_hads_out");
 
         let uniforms = HadamardSignedUniforms {
             total_blocks: (numel / block_size) as u32,
@@ -3138,7 +3429,10 @@ impl VulkanBackend {
         // Preserve the input's rank: the transform is per row, so an `[rows, cols]`
         // input yields `[rows, cols]` and the downstream matvecs see the same `m`
         // the caller passed. At `rows = 1` this is the old `[numel]`.
-        Ok(self.make_tensor(KoreVulkanBuffer::new(out, DType::F32, shape.to_vec()), shape))
+        Ok(self.make_tensor(
+            KoreVulkanBuffer::new(out, DType::F32, shape.to_vec()),
+            shape,
+        ))
     }
 
     /// Fused "pre-op + 512-point signed Hadamard" decode kernel.
@@ -3215,15 +3509,30 @@ impl VulkanBackend {
             });
         }
 
-        let a_buf = KoreVulkanBuffer::from_storage(a.storage_ref(), shape, &self.device, &self.queue)?;
-        let b_buf = KoreVulkanBuffer::from_storage(b.storage_ref(), shape, &self.device, &self.queue)?;
-        let w_buf = KoreVulkanBuffer::from_storage(weight.storage_ref(), weight.shape().dims(), &self.device, &self.queue)?;
-        let s_buf = KoreVulkanBuffer::from_storage(signs.storage_ref(), signs.shape().dims(), &self.device, &self.queue)?;
+        let a_buf =
+            KoreVulkanBuffer::from_storage(a.storage_ref(), shape, &self.device, &self.queue)?;
+        let b_buf =
+            KoreVulkanBuffer::from_storage(b.storage_ref(), shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            weight.storage_ref(),
+            weight.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let s_buf = KoreVulkanBuffer::from_storage(
+            signs.storage_ref(),
+            signs.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
 
         let out_bytes = (numel * 4).max(4);
-        let res_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_res");
-        let norm_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_norm");
-        let had_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_had");
+        let res_buf =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_res");
+        let norm_buf =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_norm");
+        let had_buf =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_had");
 
         let blocks = cols / 512;
         let uniforms = HadPreUniforms {
@@ -3253,9 +3562,18 @@ impl VulkanBackend {
         );
 
         Ok((
-            self.make_tensor(KoreVulkanBuffer::new(res_buf, DType::F32, shape.to_vec()), shape),
-            self.make_tensor(KoreVulkanBuffer::new(norm_buf, DType::F32, shape.to_vec()), shape),
-            self.make_tensor(KoreVulkanBuffer::new(had_buf, DType::F32, shape.to_vec()), shape),
+            self.make_tensor(
+                KoreVulkanBuffer::new(res_buf, DType::F32, shape.to_vec()),
+                shape,
+            ),
+            self.make_tensor(
+                KoreVulkanBuffer::new(norm_buf, DType::F32, shape.to_vec()),
+                shape,
+            ),
+            self.make_tensor(
+                KoreVulkanBuffer::new(had_buf, DType::F32, shape.to_vec()),
+                shape,
+            ),
         ))
     }
 
@@ -3269,10 +3587,29 @@ impl VulkanBackend {
         conv_dim: usize,
         conv_k: usize,
     ) -> Result<Tensor> {
-        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x.shape().dims(), &self.device, &self.queue)?;
-        let w_buf = KoreVulkanBuffer::from_storage(w.storage_ref(), w.shape().dims(), &self.device, &self.queue)?;
-        let h_buf = KoreVulkanBuffer::from_storage(hist.storage_ref(), hist.shape().dims(), &self.device, &self.queue)?;
-        let out = crate::buffer::alloc_storage_buffer(&self.device, (conv_dim * 4).max(4), "kore_gdn_conv_out");
+        let x_buf = KoreVulkanBuffer::from_storage(
+            x.storage_ref(),
+            x.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w.storage_ref(),
+            w.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let h_buf = KoreVulkanBuffer::from_storage(
+            hist.storage_ref(),
+            hist.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let out = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (conv_dim * 4).max(4),
+            "kore_gdn_conv_out",
+        );
 
         let uniforms = GdnConvUniforms {
             conv_dim: conv_dim as u32,
@@ -3283,11 +3620,19 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.gdn_conv_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[x_buf.arc_buffer(), w_buf.arc_buffer(), h_buf.arc_buffer(), &out],
+            &[
+                x_buf.arc_buffer(),
+                w_buf.arc_buffer(),
+                h_buf.arc_buffer(),
+                &out,
+            ],
             ((conv_dim as u32).div_ceil(256).max(1), 1, 1),
             "gdn_conv_pass",
         );
-        Ok(self.make_tensor(KoreVulkanBuffer::new(out, DType::F32, vec![conv_dim]), &[conv_dim]))
+        Ok(self.make_tensor(
+            KoreVulkanBuffer::new(out, DType::F32, vec![conv_dim]),
+            &[conv_dim],
+        ))
     }
 
     /// Fused alpha/beta gates: beta = sigmoid(W_b @ h),
@@ -3302,13 +3647,40 @@ impl VulkanBackend {
         hidden: usize,
         n_v: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let h_buf = KoreVulkanBuffer::from_storage(h.storage_ref(), h.shape().dims(), &self.device, &self.queue)?;
-        let wa_buf = KoreVulkanBuffer::from_storage(w_alpha.storage_ref(), w_alpha.shape().dims(), &self.device, &self.queue)?;
-        let wb_buf = KoreVulkanBuffer::from_storage(w_beta.storage_ref(), w_beta.shape().dims(), &self.device, &self.queue)?;
-        let dt_buf = KoreVulkanBuffer::from_storage(dt_bias.storage_ref(), dt_bias.shape().dims(), &self.device, &self.queue)?;
-        let a_buf = KoreVulkanBuffer::from_storage(ssm_a.storage_ref(), ssm_a.shape().dims(), &self.device, &self.queue)?;
-        let beta_out = crate::buffer::alloc_storage_buffer(&self.device, (n_v * 4).max(4), "kore_gdn_beta");
-        let gate_out = crate::buffer::alloc_storage_buffer(&self.device, (n_v * 4).max(4), "kore_gdn_gate");
+        let h_buf = KoreVulkanBuffer::from_storage(
+            h.storage_ref(),
+            h.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let wa_buf = KoreVulkanBuffer::from_storage(
+            w_alpha.storage_ref(),
+            w_alpha.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let wb_buf = KoreVulkanBuffer::from_storage(
+            w_beta.storage_ref(),
+            w_beta.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let dt_buf = KoreVulkanBuffer::from_storage(
+            dt_bias.storage_ref(),
+            dt_bias.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let a_buf = KoreVulkanBuffer::from_storage(
+            ssm_a.storage_ref(),
+            ssm_a.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let beta_out =
+            crate::buffer::alloc_storage_buffer(&self.device, (n_v * 4).max(4), "kore_gdn_beta");
+        let gate_out =
+            crate::buffer::alloc_storage_buffer(&self.device, (n_v * 4).max(4), "kore_gdn_gate");
 
         let uniforms = GdnGatesUniforms {
             hidden: hidden as u32,
@@ -3332,8 +3704,14 @@ impl VulkanBackend {
             "gdn_gates_pass",
         );
         Ok((
-            self.make_tensor(KoreVulkanBuffer::new(beta_out, DType::F32, vec![n_v]), &[n_v]),
-            self.make_tensor(KoreVulkanBuffer::new(gate_out, DType::F32, vec![n_v]), &[n_v]),
+            self.make_tensor(
+                KoreVulkanBuffer::new(beta_out, DType::F32, vec![n_v]),
+                &[n_v],
+            ),
+            self.make_tensor(
+                KoreVulkanBuffer::new(gate_out, DType::F32, vec![n_v]),
+                &[n_v],
+            ),
         ))
     }
 
@@ -3354,13 +3732,47 @@ impl VulkanBackend {
         d_v: usize,
         eps: f32,
     ) -> Result<Tensor> {
-        let qkv_buf = KoreVulkanBuffer::from_storage(qkv.storage_ref(), qkv.shape().dims(), &self.device, &self.queue)?;
-        let z_buf = KoreVulkanBuffer::from_storage(z.storage_ref(), z.shape().dims(), &self.device, &self.queue)?;
-        let s_buf = KoreVulkanBuffer::from_storage(state.storage_ref(), state.shape().dims(), &self.device, &self.queue)?;
-        let b_buf = KoreVulkanBuffer::from_storage(beta.storage_ref(), beta.shape().dims(), &self.device, &self.queue)?;
-        let g_buf = KoreVulkanBuffer::from_storage(gate.storage_ref(), gate.shape().dims(), &self.device, &self.queue)?;
-        let nw_buf = KoreVulkanBuffer::from_storage(norm_w.storage_ref(), norm_w.shape().dims(), &self.device, &self.queue)?;
-        let out = crate::buffer::alloc_storage_buffer(&self.device, (n_v * d_v * 4).max(4), "kore_gdn_step_out");
+        let qkv_buf = KoreVulkanBuffer::from_storage(
+            qkv.storage_ref(),
+            qkv.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let z_buf = KoreVulkanBuffer::from_storage(
+            z.storage_ref(),
+            z.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let s_buf = KoreVulkanBuffer::from_storage(
+            state.storage_ref(),
+            state.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let b_buf = KoreVulkanBuffer::from_storage(
+            beta.storage_ref(),
+            beta.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let g_buf = KoreVulkanBuffer::from_storage(
+            gate.storage_ref(),
+            gate.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let nw_buf = KoreVulkanBuffer::from_storage(
+            norm_w.storage_ref(),
+            norm_w.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let out = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (n_v * d_v * 4).max(4),
+            "kore_gdn_step_out",
+        );
 
         let uniforms = GdnStepUniforms {
             n_v: n_v as u32,
@@ -3415,10 +3827,30 @@ impl VulkanBackend {
                 "qknorm_rope requires head_dim 256".into(),
             ));
         }
-        let qg_buf = KoreVulkanBuffer::from_storage(qg.storage_ref(), qg.shape().dims(), &self.device, &self.queue)?;
-        let kk_buf = KoreVulkanBuffer::from_storage(kk.storage_ref(), kk.shape().dims(), &self.device, &self.queue)?;
-        let qn_buf = KoreVulkanBuffer::from_storage(q_norm.storage_ref(), q_norm.shape().dims(), &self.device, &self.queue)?;
-        let kn_buf = KoreVulkanBuffer::from_storage(k_norm.storage_ref(), k_norm.shape().dims(), &self.device, &self.queue)?;
+        let qg_buf = KoreVulkanBuffer::from_storage(
+            qg.storage_ref(),
+            qg.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let kk_buf = KoreVulkanBuffer::from_storage(
+            kk.storage_ref(),
+            kk.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let qn_buf = KoreVulkanBuffer::from_storage(
+            q_norm.storage_ref(),
+            q_norm.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let kn_buf = KoreVulkanBuffer::from_storage(
+            k_norm.storage_ref(),
+            k_norm.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
         // `rows` comes from the input shape, so a [1, ...] caller is unchanged
         // and a [m, ...] caller gets per-row positions `pos + row` for free.
         let rows = qg
@@ -3428,9 +3860,21 @@ impl VulkanBackend {
             .copied()
             .filter(|&r| r > 0)
             .unwrap_or(1);
-        let q_out = crate::buffer::alloc_storage_buffer(&self.device, (rows * n_heads * head_dim * 4).max(4), "kore_qknr_q");
-        let k_out = crate::buffer::alloc_storage_buffer(&self.device, (rows * n_kv * head_dim * 4).max(4), "kore_qknr_k");
-        let g_out = crate::buffer::alloc_storage_buffer(&self.device, (rows * n_heads * head_dim * 4).max(4), "kore_qknr_g");
+        let q_out = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (rows * n_heads * head_dim * 4).max(4),
+            "kore_qknr_q",
+        );
+        let k_out = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (rows * n_kv * head_dim * 4).max(4),
+            "kore_qknr_k",
+        );
+        let g_out = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (rows * n_heads * head_dim * 4).max(4),
+            "kore_qknr_g",
+        );
 
         let uniforms = QkNormRopeUniforms {
             n_heads: n_heads as u32,
@@ -3458,9 +3902,18 @@ impl VulkanBackend {
             "qknorm_rope_pass",
         );
         Ok((
-            self.make_tensor(KoreVulkanBuffer::new(q_out, DType::F32, vec![rows, n_heads * head_dim]), &[rows, n_heads * head_dim]),
-            self.make_tensor(KoreVulkanBuffer::new(k_out, DType::F32, vec![rows, n_kv * head_dim]), &[rows, n_kv * head_dim]),
-            self.make_tensor(KoreVulkanBuffer::new(g_out, DType::F32, vec![rows, n_heads * head_dim]), &[rows, n_heads * head_dim]),
+            self.make_tensor(
+                KoreVulkanBuffer::new(q_out, DType::F32, vec![rows, n_heads * head_dim]),
+                &[rows, n_heads * head_dim],
+            ),
+            self.make_tensor(
+                KoreVulkanBuffer::new(k_out, DType::F32, vec![rows, n_kv * head_dim]),
+                &[rows, n_kv * head_dim],
+            ),
+            self.make_tensor(
+                KoreVulkanBuffer::new(g_out, DType::F32, vec![rows, n_heads * head_dim]),
+                &[rows, n_heads * head_dim],
+            ),
         ))
     }
 
@@ -3499,11 +3952,7 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
     /// `copy_to_device` would work, but it forces the caller to hand over an
     /// owned `Vec` first -- a full-size copy and allocation on a path that an
     /// offloading engine walks on every expert miss.
-    fn upload_u8(
-        &self,
-        bytes: &[u8],
-        _target: Device,
-    ) -> kore_core::Result<kore_core::Storage> {
+    fn upload_u8(&self, bytes: &[u8], _target: Device) -> kore_core::Result<kore_core::Storage> {
         let buf = KoreVulkanBuffer::from_slice(
             bytes,
             DType::U8,
@@ -3605,12 +4054,7 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
-    fn scatter_row(
-        &self,
-        dst: &Tensor,
-        row: usize,
-        src: &Tensor,
-    ) -> kore_core::Result<()> {
+    fn scatter_row(&self, dst: &Tensor, row: usize, src: &Tensor) -> kore_core::Result<()> {
         self.scatter_row(dst, row, src)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
@@ -3902,8 +4346,10 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         theta: f32,
         eps: f32,
     ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
-        self.qknorm_rope(qg, kk, q_norm, k_norm, n_heads, n_kv, head_dim, rope_dim, pos, theta, eps)
-            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+        self.qknorm_rope(
+            qg, kk, q_norm, k_norm, n_heads, n_kv, head_dim, rope_dim, pos, theta, eps,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
     fn kv_cache_append_q8(
@@ -3919,8 +4365,15 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         row_offset: usize,
     ) -> kore_core::Result<(Tensor, Tensor)> {
         self.kv_cache_append_q8(
-            k_cache_buf, v_cache_buf, k_scales_buf, v_scales_buf, k_new, v_new,
-            k_scales_new, v_scales_new, row_offset,
+            k_cache_buf,
+            v_cache_buf,
+            k_scales_buf,
+            v_scales_buf,
+            k_new,
+            v_new,
+            k_scales_new,
+            v_scales_new,
+            row_offset,
         )
         .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
@@ -3939,7 +4392,16 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         seq_k: usize,
     ) -> kore_core::Result<Tensor> {
         self.fused_attention_decode_gqa_q8(
-            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale, seq_k,
+            q,
+            k_q8,
+            v_q8,
+            k_scales,
+            v_scales,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            seq_k,
         )
         .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
@@ -3965,8 +4427,17 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         seq_k: usize,
     ) -> kore_core::Result<Tensor> {
         self.fused_attention_decode_gqa_q8_split(
-            q, k_q8, v_q8, k_scales, v_scales, num_heads, num_kv_heads, head_dim, scale,
-            n_splits, seq_k,
+            q,
+            k_q8,
+            v_q8,
+            k_scales,
+            v_scales,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            n_splits,
+            seq_k,
         )
         .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }

@@ -152,18 +152,17 @@ fn tiled_matmul_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k:
 /// - `w_raw`: `[N * (K / 256) * 144]` packed Q4_K bytes
 /// - `n`: output features (rows of W)
 /// - `k`: input features (columns of W, multiple of 256)
-pub fn gemv_q4_k_cpu(
-    x: &Tensor,
-    w_raw: &[u8],
-    n: usize,
-    k: usize,
-) -> Result<Tensor, KoreError> {
+pub fn gemv_q4_k_cpu(x: &Tensor, w_raw: &[u8], n: usize, k: usize) -> Result<Tensor, KoreError> {
     use rayon::prelude::*;
 
     let x_cont = x.contiguous();
     let x_shape = x_cont.shape().dims();
     let m = if x_shape.is_empty() { 1 } else { x_shape[0] };
-    let k_in = if x_shape.len() > 1 { x_shape[1] } else { x_shape[0] };
+    let k_in = if x_shape.len() > 1 {
+        x_shape[1]
+    } else {
+        x_shape[0]
+    };
     if k_in != k || k % 256 != 0 {
         return Err(KoreError::ShapeMismatch {
             expected: vec![m, k],
@@ -308,7 +307,8 @@ unsafe fn dot_q4_k_row_batch_avx2(
                     shi = _mm256_add_ps(shi, xh);
                 }
                 sums[mi] += d_sc_lo * hsum256(dlo) - dm_mn_lo * hsum256(slo)
-                    + d_sc_hi * hsum256(dhi) - dm_mn_hi * hsum256(shi);
+                    + d_sc_hi * hsum256(dhi)
+                    - dm_mn_hi * hsum256(shi);
             }
         }
     }
@@ -361,7 +361,8 @@ fn dot_q4_k_row_batch(
                     dot_hi += ((qb >> 4) as f32) * xh;
                     sum_x_hi += xh;
                 }
-                sums[mi] += d_sc_lo * dot_lo - dm_mn_lo * sum_x_lo + d_sc_hi * dot_hi - dm_mn_hi * sum_x_hi;
+                sums[mi] +=
+                    d_sc_lo * dot_lo - dm_mn_lo * sum_x_lo + d_sc_hi * dot_hi - dm_mn_hi * sum_x_hi;
             }
         }
     }
@@ -373,18 +374,17 @@ fn dot_q4_k_row_batch(
 /// - `w_raw`: `[N * (K / 256) * 210]` packed Q6_K bytes
 /// - `n`: output features (rows of W)
 /// - `k`: input features (columns of W, multiple of 256)
-pub fn gemv_q6_k_cpu(
-    x: &Tensor,
-    w_raw: &[u8],
-    n: usize,
-    k: usize,
-) -> Result<Tensor, KoreError> {
+pub fn gemv_q6_k_cpu(x: &Tensor, w_raw: &[u8], n: usize, k: usize) -> Result<Tensor, KoreError> {
     use rayon::prelude::*;
 
     let x_cont = x.contiguous();
     let x_shape = x_cont.shape().dims();
     let m = if x_shape.is_empty() { 1 } else { x_shape[0] };
-    let k_in = if x_shape.len() > 1 { x_shape[1] } else { x_shape[0] };
+    let k_in = if x_shape.len() > 1 {
+        x_shape[1]
+    } else {
+        x_shape[0]
+    };
     if k_in != k || k % 256 != 0 {
         return Err(KoreError::ShapeMismatch {
             expected: vec![m, k],
@@ -515,17 +515,16 @@ unsafe fn dot_q6_k_row_batch_avx2(
                 for c in 0..4 {
                     let xc = xp.add(c * 32);
                     acc16[c][0] = _mm256_fmadd_ps(w[c][0], _mm256_loadu_ps(xc), acc16[c][0]);
-                    acc16[c][0] =
-                        _mm256_fmadd_ps(w[c][1], _mm256_loadu_ps(xc.add(8)), acc16[c][0]);
-                    acc16[c][1] = _mm256_fmadd_ps(w[c][2], _mm256_loadu_ps(xc.add(16)), acc16[c][1]);
+                    acc16[c][0] = _mm256_fmadd_ps(w[c][1], _mm256_loadu_ps(xc.add(8)), acc16[c][0]);
+                    acc16[c][1] =
+                        _mm256_fmadd_ps(w[c][2], _mm256_loadu_ps(xc.add(16)), acc16[c][1]);
                     acc16[c][1] =
                         _mm256_fmadd_ps(w[c][3], _mm256_loadu_ps(xc.add(24)), acc16[c][1]);
                 }
                 for c in 0..4 {
                     let s_a = d * (*sc_g.add(2 * c) as i8) as f32;
                     let s_b = d * (*sc_g.add(2 * c + 1) as i8) as f32;
-                    sums[mi] +=
-                        s_a * hsum256(acc16[c][0]) + s_b * hsum256(acc16[c][1]);
+                    sums[mi] += s_a * hsum256(acc16[c][0]) + s_b * hsum256(acc16[c][1]);
                 }
             }
         }

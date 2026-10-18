@@ -24,7 +24,10 @@ use std::time::Instant;
 
 fn gpu_temp_c() -> Option<u32> {
     let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .ok()?;
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
@@ -115,9 +118,7 @@ fn main() {
     // the untimed clock ramp plus the timed rounds.
     let span = warmup + chunk * rounds;
     let max_ctx = prefill_ctx + span + 64;
-    let prefill: Vec<u32> = (0..prefill_ctx)
-        .map(|i| base[i % base.len()])
-        .collect();
+    let prefill: Vec<u32> = (0..prefill_ctx).map(|i| base[i % base.len()]).collect();
     let stream: Vec<u32> = (0..span).map(|i| base[i % base.len()]).collect();
 
     kore_vulkan::register_vulkan_backend().expect("vulkan backend");
@@ -176,8 +177,13 @@ fn main() {
             while done < chunk {
                 let at = pos + done;
                 let c = m.min(chunk - done);
-                gpu.forward_batch(&model, &stream[at..at + c], prefill_ctx + at, &mut states[i])
-                    .expect("forward_batch");
+                gpu.forward_batch(
+                    &model,
+                    &stream[at..at + c],
+                    prefill_ctx + at,
+                    &mut states[i],
+                )
+                .expect("forward_batch");
                 done += c;
             }
             samples[i].push(t.elapsed().as_secs_f64() * 1e3 / chunk as f64);
@@ -187,11 +193,18 @@ fn main() {
     let clocks_after = gpu_clocks();
 
     println!("prefill_ctx={prefill_ctx} chunk={chunk} rounds={rounds} span={span}");
-    println!("prefill: {} states x {} tok in {:.3}s", widths.len(), prefill_ctx, pre_s);
+    println!(
+        "prefill: {} states x {} tok in {:.3}s",
+        widths.len(),
+        prefill_ctx,
+        pre_s
+    );
     println!(
         "cool   : {} C -> {} C in {:.0}s (target {cool_c} C)",
         hot.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
-        cooled_to.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+        cooled_to
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "?".into()),
         cool_s
     );
     println!("gpu@round0: {clocks_before}");

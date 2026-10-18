@@ -129,8 +129,19 @@ pub struct LlamaKvCacheLayer {
 }
 
 impl LlamaKvCacheLayer {
-    pub fn new(max_seq: usize, num_kv_heads: usize, head_dim: usize, device: Device) -> Result<Self> {
-        Self::with_quant_mode(max_seq, num_kv_heads, head_dim, device, KvCacheQuantMode::F32)
+    pub fn new(
+        max_seq: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        device: Device,
+    ) -> Result<Self> {
+        Self::with_quant_mode(
+            max_seq,
+            num_kv_heads,
+            head_dim,
+            device,
+            KvCacheQuantMode::F32,
+        )
     }
 
     pub fn with_quant_mode(
@@ -248,10 +259,10 @@ impl LlamaKvCacheLayer {
                 Err(KoreError::StorageError("fusion disabled".into()))
             }
             .or_else(|_| {
-                    let k = backend.kv_cache_append(&self.k, &k_eff, self.len);
-                    let v = backend.kv_cache_append(&self.v, &v_eff, self.len);
-                    k.and_then(|k| v.map(|v| (k, v)))
-                })?;
+                let k = backend.kv_cache_append(&self.k, &k_eff, self.len);
+                let v = backend.kv_cache_append(&self.v, &v_eff, self.len);
+                k.and_then(|k| v.map(|v| (k, v)))
+            })?;
             self.k = k;
             self.v = v;
         } else {
@@ -311,10 +322,14 @@ impl LlamaKvCacheLayer {
         match self.quant_mode {
             KvCacheQuantMode::F32 => self.len * self.dim * 2 * 4,
             KvCacheQuantMode::Q8_0 => {
-                self.q_keys.len() + self.q8_values.len() + (self.k_scales.len() + self.v_scales.len()) * 4
+                self.q_keys.len()
+                    + self.q8_values.len()
+                    + (self.k_scales.len() + self.v_scales.len()) * 4
             }
             KvCacheQuantMode::K8V4 => {
-                self.q_keys.len() + self.q4_values.len() + (self.k_scales.len() + self.v_scales.len()) * 4
+                self.q_keys.len()
+                    + self.q4_values.len()
+                    + (self.k_scales.len() + self.v_scales.len()) * 4
             }
         }
     }
@@ -388,9 +403,8 @@ impl LlamaAttention {
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
         if !device.is_cpu() {
-            let backend = kore_core::device::get_backend(device).ok_or_else(|| {
-                KoreError::StorageError(format!("No backend for {}", device))
-            })?;
+            let backend = kore_core::device::get_backend(device)
+                .ok_or_else(|| KoreError::StorageError(format!("No backend for {}", device)))?;
 
             // Fused Q|K|V projection when all three share a packed quant kind.
             let k_in = self.q_proj.in_features();
@@ -649,9 +663,8 @@ impl LlamaDecoderLayer {
         kv_cache: &mut LlamaKvCacheLayer,
         device: Device,
     ) -> Result<(Tensor, Tensor)> {
-        let backend = kore_core::device::get_backend(device).ok_or_else(|| {
-            KoreError::StorageError(format!("No backend for {}", device))
-        })?;
+        let backend = kore_core::device::get_backend(device)
+            .ok_or_else(|| KoreError::StorageError(format!("No backend for {}", device)))?;
         let attn = self.self_attn.forward(x_normed, pos, kv_cache, device)?;
         let (h, norm2) = match backend.add_rms_norm(
             x,
@@ -790,9 +803,7 @@ impl LlamaModel {
             }
             let n_in = match x_normed.take() {
                 Some(n) if n.device() == l_dev => Some(n),
-                _ if !l_dev.is_cpu() && fusion_enabled() => {
-                    layer.input_layernorm.forward(&x).ok()
-                }
+                _ if !l_dev.is_cpu() && fusion_enabled() => layer.input_layernorm.forward(&x).ok(),
                 _ => None,
             };
             let next_norm = if i + 1 < self.layers.len() {
@@ -912,7 +923,9 @@ impl LlamaModel {
         F: FnMut(usize),
     {
         if prompt_tokens.is_empty() {
-            return Err(KoreError::StorageError("prompt_tokens cannot be empty".into()));
+            return Err(KoreError::StorageError(
+                "prompt_tokens cannot be empty".into(),
+            ));
         }
 
         let max_seq = prompt_tokens.len() + max_new_tokens + 16;
@@ -1115,21 +1128,25 @@ impl LlamaModel {
     /// If `max_layers` is specified, loads up to `max_layers` (useful for fast verification
     /// or resource-bounded testing).
     pub fn from_gguf(path: &std::path::Path, max_layers: Option<usize>) -> Result<Self> {
-        let gguf = oxillama_gguf::GgufModel::load(path)
-            .map_err(|e| KoreError::StorageError(format!("failed to load GGUF {}: {e}", path.display())))?;
+        let gguf = oxillama_gguf::GgufModel::load(path).map_err(|e| {
+            KoreError::StorageError(format!("failed to load GGUF {}: {e}", path.display()))
+        })?;
         let meta = &gguf.file.metadata;
 
         let total_layers = meta
             .get("llama.block_count")
             .and_then(|v| v.as_u32())
-            .ok_or_else(|| KoreError::StorageError("missing llama.block_count in GGUF".into()))? as usize;
+            .ok_or_else(|| KoreError::StorageError("missing llama.block_count in GGUF".into()))?
+            as usize;
 
         let num_layers = max_layers.unwrap_or(total_layers).min(total_layers);
 
         let hidden_size = meta
             .get("llama.embedding_length")
             .and_then(|v| v.as_u32())
-            .ok_or_else(|| KoreError::StorageError("missing llama.embedding_length in GGUF".into()))? as usize;
+            .ok_or_else(|| {
+                KoreError::StorageError("missing llama.embedding_length in GGUF".into())
+            })? as usize;
 
         let vocab_size = meta
             .get("llama.vocab_size")
@@ -1144,7 +1161,9 @@ impl LlamaModel {
         let num_attention_heads = meta
             .get("llama.attention.head_count")
             .and_then(|v| v.as_u32())
-            .ok_or_else(|| KoreError::StorageError("missing llama.attention.head_count in GGUF".into()))? as usize;
+            .ok_or_else(|| {
+                KoreError::StorageError("missing llama.attention.head_count in GGUF".into())
+            })? as usize;
 
         let num_key_value_heads = meta
             .get("llama.attention.head_count_kv")
@@ -1183,10 +1202,13 @@ impl LlamaModel {
         };
 
         let dequant_to_tensor = |name: &str, shape: &[usize]| -> Result<Tensor> {
-            let info = gguf.file.tensors.get(name)
-                .map_err(|e| KoreError::StorageError(format!("missing tensor '{name}': {e}")))?;
-            let raw = gguf.tensor_data(name)
-                .map_err(|e| KoreError::StorageError(format!("cannot read tensor '{name}': {e}")))?;
+            let info =
+                gguf.file.tensors.get(name).map_err(|e| {
+                    KoreError::StorageError(format!("missing tensor '{name}': {e}"))
+                })?;
+            let raw = gguf.tensor_data(name).map_err(|e| {
+                KoreError::StorageError(format!("cannot read tensor '{name}': {e}"))
+            })?;
             let numel: usize = shape.iter().product();
             let f32_data = oxillama_quant::dequantize_to_f32(raw, info.tensor_type, numel)
                 .map_err(|e| KoreError::StorageError(format!("dequant '{name}' failed: {e}")))?;
@@ -1194,18 +1216,33 @@ impl LlamaModel {
         };
 
         let load_linear = |name: &str, in_features: usize, out_features: usize| -> Result<Linear> {
-            let info = gguf.file.tensors.get(name)
-                .map_err(|e| KoreError::StorageError(format!("missing tensor '{name}': {e}")))?;
-            let raw = gguf.tensor_data(name)
-                .map_err(|e| KoreError::StorageError(format!("cannot read tensor '{name}': {e}")))?;
+            let info =
+                gguf.file.tensors.get(name).map_err(|e| {
+                    KoreError::StorageError(format!("missing tensor '{name}': {e}"))
+                })?;
+            let raw = gguf.tensor_data(name).map_err(|e| {
+                KoreError::StorageError(format!("cannot read tensor '{name}': {e}"))
+            })?;
             if info.tensor_type == oxillama_gguf::GgufTensorType::Q4K {
-                Ok(Linear::from_q4_k(raw.to_vec(), in_features, out_features, None))
+                Ok(Linear::from_q4_k(
+                    raw.to_vec(),
+                    in_features,
+                    out_features,
+                    None,
+                ))
             } else if info.tensor_type == oxillama_gguf::GgufTensorType::Q6K {
-                Ok(Linear::from_q6_k(raw.to_vec(), in_features, out_features, None))
+                Ok(Linear::from_q6_k(
+                    raw.to_vec(),
+                    in_features,
+                    out_features,
+                    None,
+                ))
             } else {
                 let numel = in_features * out_features;
                 let f32_data = oxillama_quant::dequantize_to_f32(raw, info.tensor_type, numel)
-                    .map_err(|e| KoreError::StorageError(format!("dequant '{name}' failed: {e}")))?;
+                    .map_err(|e| {
+                        KoreError::StorageError(format!("dequant '{name}' failed: {e}"))
+                    })?;
                 let w = Tensor::from_f32(&f32_data, &[out_features, in_features]);
                 let w_t = w.transpose()?.contiguous();
                 Ok(Linear::from_weight_transposed(w_t, None))
@@ -1213,10 +1250,12 @@ impl LlamaModel {
         };
 
         let embed_tokens = {
-            let raw = gguf.tensor_data("token_embd.weight")
-                .map_err(|e| KoreError::StorageError(format!("cannot read token_embd.weight: {e}")))?;
-            let info = gguf.file.tensors.get("token_embd.weight")
-                .map_err(|e| KoreError::StorageError(format!("missing tensor token_embd.weight: {e}")))?;
+            let raw = gguf.tensor_data("token_embd.weight").map_err(|e| {
+                KoreError::StorageError(format!("cannot read token_embd.weight: {e}"))
+            })?;
+            let info = gguf.file.tensors.get("token_embd.weight").map_err(|e| {
+                KoreError::StorageError(format!("missing tensor token_embd.weight: {e}"))
+            })?;
             if info.tensor_type == oxillama_gguf::GgufTensorType::Q4K {
                 Embedding::from_q4_k(raw.to_vec(), vocab_size, hidden_size)
             } else {
@@ -1231,13 +1270,30 @@ impl LlamaModel {
         let layers: Vec<LlamaDecoderLayer> = (0..num_layers)
             .into_par_iter()
             .map(|i| -> Result<LlamaDecoderLayer> {
-                let in_norm_w = dequant_to_tensor(&format!("blk.{i}.attn_norm.weight"), &[hidden_size])?;
+                let in_norm_w =
+                    dequant_to_tensor(&format!("blk.{i}.attn_norm.weight"), &[hidden_size])?;
                 let input_layernorm = RMSNorm::from_weight(in_norm_w, rms_norm_eps);
 
-                let q_proj = load_linear(&format!("blk.{i}.attn_q.weight"), hidden_size, num_attention_heads * head_dim)?;
-                let k_proj = load_linear(&format!("blk.{i}.attn_k.weight"), hidden_size, num_key_value_heads * head_dim)?;
-                let v_proj = load_linear(&format!("blk.{i}.attn_v.weight"), hidden_size, num_key_value_heads * head_dim)?;
-                let o_proj = load_linear(&format!("blk.{i}.attn_output.weight"), num_attention_heads * head_dim, hidden_size)?;
+                let q_proj = load_linear(
+                    &format!("blk.{i}.attn_q.weight"),
+                    hidden_size,
+                    num_attention_heads * head_dim,
+                )?;
+                let k_proj = load_linear(
+                    &format!("blk.{i}.attn_k.weight"),
+                    hidden_size,
+                    num_key_value_heads * head_dim,
+                )?;
+                let v_proj = load_linear(
+                    &format!("blk.{i}.attn_v.weight"),
+                    hidden_size,
+                    num_key_value_heads * head_dim,
+                )?;
+                let o_proj = load_linear(
+                    &format!("blk.{i}.attn_output.weight"),
+                    num_attention_heads * head_dim,
+                    hidden_size,
+                )?;
 
                 let self_attn = LlamaAttention::new(
                     q_proj,
@@ -1251,12 +1307,25 @@ impl LlamaModel {
                     rope_inv_freq.clone(),
                 );
 
-                let post_norm_w = dequant_to_tensor(&format!("blk.{i}.ffn_norm.weight"), &[hidden_size])?;
+                let post_norm_w =
+                    dequant_to_tensor(&format!("blk.{i}.ffn_norm.weight"), &[hidden_size])?;
                 let post_attention_layernorm = RMSNorm::from_weight(post_norm_w, rms_norm_eps);
 
-                let gate_proj = load_linear(&format!("blk.{i}.ffn_gate.weight"), hidden_size, intermediate_size)?;
-                let up_proj = load_linear(&format!("blk.{i}.ffn_up.weight"), hidden_size, intermediate_size)?;
-                let down_proj = load_linear(&format!("blk.{i}.ffn_down.weight"), intermediate_size, hidden_size)?;
+                let gate_proj = load_linear(
+                    &format!("blk.{i}.ffn_gate.weight"),
+                    hidden_size,
+                    intermediate_size,
+                )?;
+                let up_proj = load_linear(
+                    &format!("blk.{i}.ffn_up.weight"),
+                    hidden_size,
+                    intermediate_size,
+                )?;
+                let down_proj = load_linear(
+                    &format!("blk.{i}.ffn_down.weight"),
+                    intermediate_size,
+                    hidden_size,
+                )?;
                 let mlp = LlamaMlp::new(gate_proj, up_proj, down_proj);
 
                 Ok(LlamaDecoderLayer {
@@ -1327,7 +1396,11 @@ fn sample_all_greedy(logits: &Tensor, vocab_size: usize) -> Result<Vec<usize>> {
 
 fn apply_rope(x: &Tensor, pos: usize, head_dim: usize, inv_freq: &[f32]) -> Result<Tensor> {
     let dev = x.device();
-    let cpu_x = if !dev.is_cpu() { x.to(Device::Cpu)? } else { x.clone() };
+    let cpu_x = if !dev.is_cpu() {
+        x.to(Device::Cpu)?
+    } else {
+        x.clone()
+    };
     let data = cpu_x.as_f32_slice().unwrap();
     let mut out = data.to_vec();
 
@@ -1367,10 +1440,19 @@ fn apply_rope(x: &Tensor, pos: usize, head_dim: usize, inv_freq: &[f32]) -> Resu
     }
 }
 
-fn slice_head(x: &Tensor, head_idx: usize, head_dim: usize, max_rows: Option<usize>) -> Result<Tensor> {
+fn slice_head(
+    x: &Tensor,
+    head_idx: usize,
+    head_dim: usize,
+    max_rows: Option<usize>,
+) -> Result<Tensor> {
     let start = head_idx * head_dim;
     let dev = x.device();
-    let cpu_x = if !dev.is_cpu() { x.to(Device::Cpu)? } else { x.clone() };
+    let cpu_x = if !dev.is_cpu() {
+        x.to(Device::Cpu)?
+    } else {
+        x.clone()
+    };
     let slice = cpu_x.as_f32_slice().unwrap();
     let total_rows = x.shape().dims()[0];
     let rows = max_rows.unwrap_or(total_rows).min(total_rows);
@@ -1383,16 +1465,29 @@ fn slice_head(x: &Tensor, head_idx: usize, head_dim: usize, max_rows: Option<usi
     }
 
     let res = Tensor::from_f32(&out, &[rows, head_dim]);
-    if !dev.is_cpu() { res.to(dev) } else { Ok(res) }
+    if !dev.is_cpu() {
+        res.to(dev)
+    } else {
+        Ok(res)
+    }
 }
 
-fn concat_heads(heads: &[Tensor], rows: usize, num_heads: usize, head_dim: usize) -> Result<Tensor> {
+fn concat_heads(
+    heads: &[Tensor],
+    rows: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<Tensor> {
     let total_dim = num_heads * head_dim;
     let mut result = vec![0.0f32; rows * total_dim];
     let dev = heads[0].device();
 
     for (h, head) in heads.iter().enumerate() {
-        let cpu_head = if !dev.is_cpu() { head.to(Device::Cpu)? } else { head.clone() };
+        let cpu_head = if !dev.is_cpu() {
+            head.to(Device::Cpu)?
+        } else {
+            head.clone()
+        };
         let slice = cpu_head.as_f32_slice().unwrap();
         for r in 0..rows {
             let src = r * head_dim;
@@ -1402,5 +1497,9 @@ fn concat_heads(heads: &[Tensor], rows: usize, num_heads: usize, head_dim: usize
     }
 
     let res = Tensor::from_f32(&result, &[rows, total_dim]);
-    if !dev.is_cpu() { res.to(dev) } else { Ok(res) }
+    if !dev.is_cpu() {
+        res.to(dev)
+    } else {
+        Ok(res)
+    }
 }

@@ -416,17 +416,18 @@ pub fn cmd_infer_gguf(
         if cand.exists() {
             cand
         } else {
-            eprintln!("Error: tokenizer.json not found adjacent to model. Specify --tokenizer <path>");
+            eprintln!(
+                "Error: tokenizer.json not found adjacent to model. Specify --tokenizer <path>"
+            );
             std::process::exit(1);
         }
     };
 
     println!("Loading tokenizer: {}", tokenizer_file.display());
-    let tokenizer = Tokenizer::from_file(&tokenizer_file)
-        .unwrap_or_else(|e| {
-            eprintln!("Error: failed to load tokenizer: {}", e);
-            std::process::exit(1);
-        });
+    let tokenizer = Tokenizer::from_file(&tokenizer_file).unwrap_or_else(|e| {
+        eprintln!("Error: failed to load tokenizer: {}", e);
+        std::process::exit(1);
+    });
 
     // arch dispatch: bounded header read, qwen35 takes the hybrid path
     if let Ok(gg) = kore_nn::gguf_min::MiniGguf::load(path) {
@@ -438,11 +439,10 @@ pub fn cmd_infer_gguf(
     // 2. Load GGUF model
     println!("Loading model from GGUF: {}", path.display());
     let t_load = Instant::now();
-    let mut model = kore_nn::llama::LlamaModel::from_gguf(path, layers)
-        .unwrap_or_else(|e| {
-            eprintln!("Error: failed to load GGUF model: {}", e);
-            std::process::exit(1);
-        });
+    let mut model = kore_nn::llama::LlamaModel::from_gguf(path, layers).unwrap_or_else(|e| {
+        eprintln!("Error: failed to load GGUF model: {}", e);
+        std::process::exit(1);
+    });
     let load_time = t_load.elapsed();
     println!("  Loaded model in {:.2}s", load_time.as_secs_f64());
 
@@ -467,7 +467,11 @@ pub fn cmd_infer_gguf(
                 std::process::exit(1);
             });
         }
-        println!("  Weights resident on {} in {:.2}s", device, t_trans.elapsed().as_secs_f64());
+        println!(
+            "  Weights resident on {} in {:.2}s",
+            device,
+            t_trans.elapsed().as_secs_f64()
+        );
     }
 
     let mtp_enabled = mtp || std::env::var("KORE_MTP").ok().as_deref() == Some("1");
@@ -487,7 +491,8 @@ pub fn cmd_infer_gguf(
     let prompt_str = prompt.unwrap_or_else(|| "Hello, my name is".to_string());
     println!("\nPrompt: \"{}\"", prompt_str);
 
-    let encoding = tokenizer.encode(prompt_str.as_str(), false)
+    let encoding = tokenizer
+        .encode(prompt_str.as_str(), false)
         .unwrap_or_else(|e| {
             eprintln!("Error: tokenization failed: {}", e);
             std::process::exit(1);
@@ -581,7 +586,11 @@ fn infer_gguf_qwen35(
         eprintln!("Error: failed to load qwen35 model: {}", e);
         std::process::exit(1);
     });
-    println!("  Loaded in {:.2}s: {:?}", t_load.elapsed().as_secs_f64(), model.cfg);
+    println!(
+        "  Loaded in {:.2}s: {:?}",
+        t_load.elapsed().as_secs_f64(),
+        model.cfg
+    );
 
     let prompt_str = prompt.unwrap_or_else(|| "Hello, my name is".to_string());
     println!("\nPrompt: \"{}\"", prompt_str);
@@ -603,10 +612,12 @@ fn infer_gguf_qwen35(
     let mut generated = 0usize;
     let mut logits = Vec::new();
     for (i, &t) in prompt_tokens.iter().enumerate() {
-        logits = model.forward(t, i, &mut dstate, &mut astate).unwrap_or_else(|e| {
-            eprintln!("\nError during prefill: {}", e);
-            std::process::exit(1);
-        });
+        logits = model
+            .forward(t, i, &mut dstate, &mut astate)
+            .unwrap_or_else(|e| {
+                eprintln!("\nError during prefill: {}", e);
+                std::process::exit(1);
+            });
     }
     let prefill_time = t_gen.elapsed();
     let mut pos = prompt_tokens.len();
@@ -620,10 +631,12 @@ fn infer_gguf_qwen35(
             print!("{}", text);
             let _ = std::io::stdout().flush();
         }
-        logits = model.forward(tok, pos, &mut dstate, &mut astate).unwrap_or_else(|e| {
-            eprintln!("\nError during decode: {}", e);
-            std::process::exit(1);
-        });
+        logits = model
+            .forward(tok, pos, &mut dstate, &mut astate)
+            .unwrap_or_else(|e| {
+                eprintln!("\nError during decode: {}", e);
+                std::process::exit(1);
+            });
         pos += 1;
     }
     let total = t_gen.elapsed();

@@ -45,13 +45,12 @@
 //! bonsai  tiny.gguf <tokenizer.json> "The capital of France is" 8 cpu
 //! ```
 
-
 use std::path::Path;
 use std::sync::Arc;
 
 use kore_core::{KoreError, Result};
 
-use crate::gguf_min::{MiniGguf, MetaVal};
+use crate::gguf_min::{MetaVal, MiniGguf};
 use kore_kernels::k_quant;
 use kore_kernels::q2_0::gemv_q2_0;
 use oxillama_gguf::{ByteOwner, GgufTensorType, SharedBytes};
@@ -461,11 +460,7 @@ impl QW {
                 // driving one implementation is what keeps the packed layouts
                 // honest: the same code that KORE's `k_quant` reference was
                 // cross-checked against is the code that runs here.
-                let qt = QuantTensor::from_shared(
-                    self.view()?,
-                    vec![self.n, self.m],
-                    kind.gguf(),
-                );
+                let qt = QuantTensor::from_shared(self.view()?, vec![self.n, self.m], kind.gguf());
                 let kernel = global_dispatcher()
                     .get_kernel(qt.tensor_type)
                     .map_err(|e| err(&format!("'{}': no kernel: {e}", self.name)))?;
@@ -544,15 +539,15 @@ fn gemv_bytes_f16(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> R
 struct DeltaLayer {
     attn_norm: Vec<f32>,
     post_norm: Vec<f32>,
-    qkv: QW,     // [hidden, qkv_dim]
-    z: QW,       // [hidden, hidden]
-    conv: Vec<f32>, // [conv_k, conv_ch] ne0=conv_k contiguous per channel
-    a: Vec<f32>,  // [dt_rank] stored as -exp(A_log)
-    alpha_w: Vec<f32>, // [hidden, dt_rank]
-    beta_w: Vec<f32>,  // [hidden, dt_rank]
-    dt_bias: Vec<f32>, // [dt_rank]
+    qkv: QW,            // [hidden, qkv_dim]
+    z: QW,              // [hidden, hidden]
+    conv: Vec<f32>,     // [conv_k, conv_ch] ne0=conv_k contiguous per channel
+    a: Vec<f32>,        // [dt_rank] stored as -exp(A_log)
+    alpha_w: Vec<f32>,  // [hidden, dt_rank]
+    beta_w: Vec<f32>,   // [hidden, dt_rank]
+    dt_bias: Vec<f32>,  // [dt_rank]
     ssm_norm: Vec<f32>, // [head_v_dim]
-    out: QW,     // [hidden, hidden]
+    out: QW,            // [hidden, hidden]
     ffn: FfnW,
 }
 
@@ -579,11 +574,7 @@ enum Layer {
 /// `n_experts` stacked experts, of which the top `n_experts_used` are evaluated,
 /// plus one always-on shared expert behind a sigmoid gate.
 enum FfnW {
-    Dense {
-        gate: QW,
-        up: QW,
-        down: QW,
-    },
+    Dense { gate: QW, up: QW, down: QW },
     Moe(MoeW),
 }
 
@@ -692,9 +683,11 @@ impl Qwen35Model {
         // drafter is the prompt-lookup one, so those blocks are not loaded.
         let nextn = get_uk("nextn_predict_layers").unwrap_or(0);
         let blocks = get_uk("block_count")?;
-        let n_layers = blocks
-            .checked_sub(nextn)
-            .ok_or_else(|| err(&format!("block_count {blocks} < nextn_predict_layers {nextn}")))?;
+        let n_layers = blocks.checked_sub(nextn).ok_or_else(|| {
+            err(&format!(
+                "block_count {blocks} < nextn_predict_layers {nextn}"
+            ))
+        })?;
 
         let cfg = Qwen35Config {
             prefix: arch.to_string(),
@@ -1253,7 +1246,13 @@ impl Qwen35Model {
         Ok(())
     }
 
-    fn full_attn_step(&self, l: &FullLayer, st: &mut AttnState, x: &mut [f32], pos: usize) -> Result<()> {
+    fn full_attn_step(
+        &self,
+        l: &FullLayer,
+        st: &mut AttnState,
+        x: &mut [f32],
+        pos: usize,
+    ) -> Result<()> {
         let cfg = &self.cfg;
         let hidden = cfg.hidden;
         let n_h = cfg.n_heads;
@@ -1438,7 +1437,7 @@ impl Qwen35Model {
 // ---------- Vulkan GPU path ----------
 
 use kore_core::device::{get_backend, DeviceBackend};
-use kore_core::{Device, DType, Storage, Tensor};
+use kore_core::{DType, Device, Storage, Tensor};
 
 struct GpuDelta {
     attn_norm: Tensor,
@@ -1474,8 +1473,17 @@ enum GpuLayer {
 
 /// Mutable per-layer device state.
 pub enum GpuState {
-    Delta { hist: Tensor, state: Tensor },
-    Full { kc: Tensor, vc: Tensor, k_scales: Tensor, v_scales: Tensor, len: usize },
+    Delta {
+        hist: Tensor,
+        state: Tensor,
+    },
+    Full {
+        kc: Tensor,
+        vc: Tensor,
+        k_scales: Tensor,
+        v_scales: Tensor,
+        len: usize,
+    },
 }
 
 /// The recurrent state a batched pass passed through, one slot per column.
@@ -1755,7 +1763,8 @@ impl Qwen35Gpu {
         // demand an `m * cols` table that the model does not have; keying on the
         // row width is identical at `m = 1`.
         let width = *x.shape().dims().last().unwrap_or(&x.numel());
-        self.backend.hadamard_signed(x, self.signs_t(width)?, 512, 0)
+        self.backend
+            .hadamard_signed(x, self.signs_t(width)?, 512, 0)
     }
 
     /// Shared FFN block with the *incoming* residual folded into its post-norm.
@@ -1817,13 +1826,20 @@ impl Qwen35Gpu {
         let uv = self.wgemv(&w.up, &ht)?;
         // Fused SwiGLU [+ Hadamard] (the second half of the FFN's activation pair).
         let signs_ffn = self.signs_or_placeholder(ffn)?;
-        let (_gv, _uv, actt) = b.had_pre(2, self.folded, &gv, &uv, signs_ffn, signs_ffn, self.cfg.eps)?;
+        let (_gv, _uv, actt) =
+            b.had_pre(2, self.folded, &gv, &uv, signs_ffn, signs_ffn, self.cfg.eps)?;
         let down = self.wgemv(&w.down, &actt)?;
         Ok((x_r, down))
     }
 
     /// One decode step; returns the next greedy token.
-    pub fn forward(&self, cpu: &Qwen35Model, token: u32, pos: usize, states: &mut [GpuState]) -> Result<u32> {
+    pub fn forward(
+        &self,
+        cpu: &Qwen35Model,
+        token: u32,
+        pos: usize,
+        states: &mut [GpuState],
+    ) -> Result<u32> {
         let b = &self.backend;
         let cfg = &self.cfg;
         let hidden = cfg.hidden;
@@ -1853,12 +1869,33 @@ impl Qwen35Gpu {
             match (layer, st) {
                 (GpuLayer::Delta(l), GpuState::Delta { hist, state }) => {
                     // Fold the pending residual in, normalize and rotate in one dispatch.
-                    let (x_r, h, ht) = b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, self.signs_or_placeholder(hidden)?, cfg.eps)?;
+                    let (x_r, h, ht) = b.had_pre(
+                        0,
+                        self.folded,
+                        &x,
+                        &pending,
+                        &l.attn_norm,
+                        self.signs_or_placeholder(hidden)?,
+                        cfg.eps,
+                    )?;
                     let qkv = self.wgemv(&l.qkv, &ht)?;
                     let z = self.wgemv(&l.z, &ht)?;
-                    let (beta, gate) = b.gdn_gates(&h, &l.alpha_w, &l.beta_w, &l.dt_bias, &l.a, hidden, n_v)?;
+                    let (beta, gate) =
+                        b.gdn_gates(&h, &l.alpha_w, &l.beta_w, &l.dt_bias, &l.a, hidden, n_v)?;
                     let conv_out = b.gdn_conv(&qkv, &l.conv, hist, conv_dim, cfg.ssm_conv)?;
-                    let o = b.gdn_step(&conv_out, &z, state, &beta, &gate, &l.ssm_norm, n_v, n_k, d_k, d_v, cfg.eps)?;
+                    let o = b.gdn_step(
+                        &conv_out,
+                        &z,
+                        state,
+                        &beta,
+                        &gate,
+                        &l.ssm_norm,
+                        n_v,
+                        n_k,
+                        d_k,
+                        d_v,
+                        cfg.eps,
+                    )?;
                     let ot = self.had_fwd(&o)?;
                     let proj = self.wgemv(&l.out, &ot)?;
                     let (x_next, down) =
@@ -1866,15 +1903,40 @@ impl Qwen35Gpu {
                     x = x_next;
                     pending = down;
                 }
-                (GpuLayer::Full(l), GpuState::Full { kc, vc, k_scales, v_scales, len }) => {
-                    let (x_r, _h, ht) = b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, self.signs_or_placeholder(hidden)?, cfg.eps)?;
+                (
+                    GpuLayer::Full(l),
+                    GpuState::Full {
+                        kc,
+                        vc,
+                        k_scales,
+                        v_scales,
+                        len,
+                    },
+                ) => {
+                    let (x_r, _h, ht) = b.had_pre(
+                        0,
+                        self.folded,
+                        &x,
+                        &pending,
+                        &l.attn_norm,
+                        self.signs_or_placeholder(hidden)?,
+                        cfg.eps,
+                    )?;
                     let qg = self.wgemv(&l.wq, &ht)?;
                     let kk = self.wgemv(&l.wk, &ht)?;
                     let vv = self.wgemv(&l.wv, &ht)?;
                     let (q, k, g) = b.qknorm_rope(
-                        &qg, &kk, &l.q_norm, &l.k_norm,
-                        cfg.n_heads, cfg.n_kv, cfg.head_dim, cfg.rope_dim,
-                        pos, cfg.theta, cfg.eps,
+                        &qg,
+                        &kk,
+                        &l.q_norm,
+                        &l.k_norm,
+                        cfg.n_heads,
+                        cfg.n_kv,
+                        cfg.head_dim,
+                        cfg.rope_dim,
+                        pos,
+                        cfg.theta,
+                        cfg.eps,
                     )?;
 
                     // ---- Q8 (INT8) KV-cache path ----
@@ -1886,8 +1948,15 @@ impl Qwen35Gpu {
                     let (v_q8_t, v_scale_new) = b.quantize_q8_rows(&vv)?;
 
                     let (kv_q8, vv_q8) = b.kv_cache_append_q8(
-                        kc, vc, k_scales, v_scales,
-                        &k_q8_t, &v_q8_t, &k_scale_new, &v_scale_new, *len,
+                        kc,
+                        vc,
+                        k_scales,
+                        v_scales,
+                        &k_q8_t,
+                        &v_q8_t,
+                        &k_scale_new,
+                        &v_scale_new,
+                        *len,
                     )?;
                     *len += 1;
 
@@ -1901,19 +1970,43 @@ impl Qwen35Gpu {
                     let attn = if attn_can_shard(cfg, seq_k) {
                         let n_splits = attn_shard_count(seq_k);
                         b.fused_attention_decode_gqa_q8_split(
-                            &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
-                            cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
-                            n_splits, seq_k,
+                            &q,
+                            &kv_q8,
+                            &vv_q8,
+                            &k_scales,
+                            &v_scales,
+                            cfg.n_heads,
+                            cfg.n_kv,
+                            cfg.head_dim,
+                            scale,
+                            n_splits,
+                            seq_k,
                         )?
                     } else {
                         b.fused_attention_decode_gqa_q8(
-                            &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
-                            cfg.n_heads, cfg.n_kv, cfg.head_dim, scale, seq_k,
+                            &q,
+                            &kv_q8,
+                            &vv_q8,
+                            &k_scales,
+                            &v_scales,
+                            cfg.n_heads,
+                            cfg.n_kv,
+                            cfg.head_dim,
+                            scale,
+                            seq_k,
                         )?
                     };
                     // ---- end Q8 path ----------------------------------------------
 
-                    let (_a, _bv, ot) = b.had_pre(3, self.folded, &attn, &g, self.signs_or_placeholder(hidden)?, self.signs_or_placeholder(hidden)?, cfg.eps)?;
+                    let (_a, _bv, ot) = b.had_pre(
+                        3,
+                        self.folded,
+                        &attn,
+                        &g,
+                        self.signs_or_placeholder(hidden)?,
+                        self.signs_or_placeholder(hidden)?,
+                        cfg.eps,
+                    )?;
                     let proj = self.wgemv(&l.wo, &ot)?;
                     let (x_next, down) =
                         self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn, ffn, hidden)?;
@@ -1924,7 +2017,15 @@ impl Qwen35Gpu {
             }
         }
 
-        let (_r, _h, ht) = b.had_pre(0, self.folded, &x, &pending, &self.out_norm, self.signs_or_placeholder(hidden)?, cfg.eps)?;
+        let (_r, _h, ht) = b.had_pre(
+            0,
+            self.folded,
+            &x,
+            &pending,
+            &self.out_norm,
+            self.signs_or_placeholder(hidden)?,
+            cfg.eps,
+        )?;
         let logits = self.wgemv(&self.head, &ht)?;
         let toks = b.argmax_last_dim(&logits)?;
         Ok(toks[0])
@@ -1983,7 +2084,11 @@ impl Qwen35Gpu {
         let n_chunks = prompt.len().div_ceil(PREFILL_CHUNK);
         let mut out = Vec::new();
         for (i, chunk) in prompt.chunks(PREFILL_CHUNK).enumerate() {
-            let head = if i + 1 == n_chunks { Head::Last } else { Head::Skip };
+            let head = if i + 1 == n_chunks {
+                Head::Last
+            } else {
+                Head::Skip
+            };
             out = self.forward_pass(cpu, chunk, pos0 + i * PREFILL_CHUNK, states, head, None)?;
         }
         out.pop().ok_or_else(|| err("prefill produced no token"))
@@ -2014,7 +2119,11 @@ impl Qwen35Gpu {
             }
             rows.push(per_row);
         }
-        Ok(Rewind { rows, pos0: 0, cols: 0 })
+        Ok(Rewind {
+            rows,
+            pos0: 0,
+            cols: 0,
+        })
     }
 
     /// A verify pass: exactly [`Self::forward_batch`], but with each column's
@@ -2047,7 +2156,10 @@ impl Qwen35Gpu {
     /// [`Self::forward_verify`] took.
     pub fn rewind(&self, states: &mut [GpuState], arena: &Rewind, keep: usize) -> Result<()> {
         if arena.cols == 0 || keep == 0 || keep > arena.cols {
-            return Err(err(&format!("rewind: keep {keep} out of 1..={}", arena.cols)));
+            return Err(err(&format!(
+                "rewind: keep {keep} out of 1..={}",
+                arena.cols
+            )));
         }
         if keep == arena.cols {
             return Ok(());
@@ -2135,7 +2247,8 @@ impl Qwen35Gpu {
         for (li, (layer, st)) in self.layers.iter().zip(states.iter_mut()).enumerate() {
             match (layer, st) {
                 (GpuLayer::Delta(l), GpuState::Delta { hist, state }) => {
-                    let (x_r, h, ht) = b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
+                    let (x_r, h, ht) =
+                        b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
                     let qkv = self.wgemv(&l.qkv, &ht)?;
                     let z = self.wgemv(&l.z, &ht)?;
 
@@ -2151,8 +2264,13 @@ impl Qwen35Gpu {
                             hidden,
                             n_v,
                         )?;
-                        let conv_out =
-                            b.gdn_conv(&qkv.slice_rows(r, 1)?, &l.conv, hist, conv_dim, cfg.ssm_conv)?;
+                        let conv_out = b.gdn_conv(
+                            &qkv.slice_rows(r, 1)?,
+                            &l.conv,
+                            hist,
+                            conv_dim,
+                            cfg.ssm_conv,
+                        )?;
                         let o_r = b.gdn_step(
                             &conv_out,
                             &z.slice_rows(r, 1)?,
@@ -2183,8 +2301,18 @@ impl Qwen35Gpu {
                     x = x_next;
                     pending = down;
                 }
-                (GpuLayer::Full(l), GpuState::Full { kc, vc, k_scales, v_scales, len }) => {
-                    let (x_r, _h, ht) = b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
+                (
+                    GpuLayer::Full(l),
+                    GpuState::Full {
+                        kc,
+                        vc,
+                        k_scales,
+                        v_scales,
+                        len,
+                    },
+                ) => {
+                    let (x_r, _h, ht) =
+                        b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
                     let qg = self.wgemv(&l.wq, &ht)?;
                     let kk = self.wgemv(&l.wk, &ht)?;
                     let vv = self.wgemv(&l.wv, &ht)?;
@@ -2233,14 +2361,30 @@ impl Qwen35Gpu {
                         let sk = *len;
                         if attn_can_shard(cfg, sk) {
                             b.fused_attention_decode_gqa_q8_split(
-                                &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
-                                cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
-                                attn_shard_count(sk), sk,
+                                &q,
+                                &kv_q8,
+                                &vv_q8,
+                                &k_scales,
+                                &v_scales,
+                                cfg.n_heads,
+                                cfg.n_kv,
+                                cfg.head_dim,
+                                scale,
+                                attn_shard_count(sk),
+                                sk,
                             )?
                         } else {
                             b.fused_attention_decode_gqa_q8(
-                                &q, &kv_q8, &vv_q8, &k_scales, &v_scales,
-                                cfg.n_heads, cfg.n_kv, cfg.head_dim, scale, sk,
+                                &q,
+                                &kv_q8,
+                                &vv_q8,
+                                &k_scales,
+                                &v_scales,
+                                cfg.n_heads,
+                                cfg.n_kv,
+                                cfg.head_dim,
+                                scale,
+                                sk,
                             )?
                         }
                     } else {
@@ -2249,14 +2393,30 @@ impl Qwen35Gpu {
                             let qr = q.slice_rows(r, 1)?;
                             let row = if attn_can_shard(cfg, sk) {
                                 b.fused_attention_decode_gqa_q8_split(
-                                    &qr, &kv_q8, &vv_q8, &k_scales, &v_scales,
-                                    cfg.n_heads, cfg.n_kv, cfg.head_dim, scale,
-                                    attn_shard_count(sk), sk,
+                                    &qr,
+                                    &kv_q8,
+                                    &vv_q8,
+                                    &k_scales,
+                                    &v_scales,
+                                    cfg.n_heads,
+                                    cfg.n_kv,
+                                    cfg.head_dim,
+                                    scale,
+                                    attn_shard_count(sk),
+                                    sk,
                                 )?
                             } else {
                                 b.fused_attention_decode_gqa_q8(
-                                    &qr, &kv_q8, &vv_q8, &k_scales, &v_scales,
-                                    cfg.n_heads, cfg.n_kv, cfg.head_dim, scale, sk,
+                                    &qr,
+                                    &kv_q8,
+                                    &vv_q8,
+                                    &k_scales,
+                                    &v_scales,
+                                    cfg.n_heads,
+                                    cfg.n_kv,
+                                    cfg.head_dim,
+                                    scale,
+                                    sk,
                                 )?
                             };
                             b.scatter_row(&attn_staging, r, &row)?;
@@ -2264,7 +2424,8 @@ impl Qwen35Gpu {
                         attn_staging.clone()
                     };
 
-                    let (_a, _bv, ot) = b.had_pre(3, self.folded, &attn, &g, signs_h, signs_h, cfg.eps)?;
+                    let (_a, _bv, ot) =
+                        b.had_pre(3, self.folded, &attn, &g, signs_h, signs_h, cfg.eps)?;
                     let proj = self.wgemv(&l.wo, &ot)?;
                     let (x_next, down) =
                         self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn, ffn, hidden)?;
@@ -2280,7 +2441,15 @@ impl Qwen35Gpu {
             // Running the head here would compute `m` predictions nobody reads.
             return Ok(Vec::new());
         }
-        let (_r, _h, ht) = b.had_pre(0, self.folded, &x, &pending, &self.out_norm, signs_h, cfg.eps)?;
+        let (_r, _h, ht) = b.had_pre(
+            0,
+            self.folded,
+            &x,
+            &pending,
+            &self.out_norm,
+            signs_h,
+            cfg.eps,
+        )?;
         // A prefill chunk needs the prediction at its last position only. The
         // head is row-independent, so projecting that row on its own is the same
         // arithmetic as reading it out of the full `[m, vocab]` result.

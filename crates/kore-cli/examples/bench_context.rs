@@ -50,8 +50,14 @@ fn main() {
     let tok_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "models/bonsai2-2b/tokenizer.json".into());
-    let prefill_ctx: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(5);
-    let n_decode: usize = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(16);
+    let prefill_ctx: usize = std::env::args()
+        .nth(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let n_decode: usize = std::env::args()
+        .nth(4)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let prompt = std::env::args()
         .nth(5)
         .unwrap_or_else(|| "The capital of France is".into());
@@ -94,7 +100,9 @@ fn main() {
         if id == model.cfg.eos {
             break;
         }
-        next = gpu.forward(&model, id, prefill_ctx + k, &mut states).expect("decode fwd");
+        next = gpu
+            .forward(&model, id, prefill_ctx + k, &mut states)
+            .expect("decode fwd");
     }
     let dec_s = t_dec.elapsed().as_secs_f64();
 
@@ -106,7 +114,10 @@ fn main() {
 
     println!("cfg: {:?}", model.cfg);
     println!("prefill_ctx={prefill_ctx} n_decode={n_decode} max_ctx={max_ctx}");
-    println!("prefill: {} tok in {:.3}s = {:.2} tok/s", prefill_ctx, pre_s, pre_tps);
+    println!(
+        "prefill: {} tok in {:.3}s = {:.2} tok/s",
+        prefill_ctx, pre_s, pre_tps
+    );
     println!(
         "decode : {} tok in {:.3}s = {:.2} tok/s (at ctx {})",
         out.len(),
@@ -115,6 +126,9 @@ fn main() {
         prefill_ctx
     );
     println!("tokens : {out:?}");
-    println!("vram   : {} -> {} MiB (total {} MiB)", vram0, vram1, vram_total);
+    println!(
+        "vram   : {} -> {} MiB (total {} MiB)",
+        vram0, vram1, vram_total
+    );
     println!("ram    : free {} -> {} MiB", ram0, ram1);
 }

@@ -76,10 +76,30 @@ fn main() {
         let zero = p.t(&f32s(0.0, h), &[1, h]);
         let signs = p.t(&f32s(1.0, h), &[h]);
 
-        p.time(&format!("add            h={h}"), h, |c| p.b.add(c, &x).unwrap(), &x);
-        p.time(&format!("add_scalar     h={h}"), h, |c| p.b.add_scalar(c, 1e-3).unwrap(), &x);
-        p.time(&format!("silu           h={h}"), h, |c| p.b.silu(c).unwrap(), &x);
-        p.time(&format!("rms_norm       h={h}"), h, |c| p.b.rms_norm(c, &w, eps).unwrap(), &x);
+        p.time(
+            &format!("add            h={h}"),
+            h,
+            |c| p.b.add(c, &x).unwrap(),
+            &x,
+        );
+        p.time(
+            &format!("add_scalar     h={h}"),
+            h,
+            |c| p.b.add_scalar(c, 1e-3).unwrap(),
+            &x,
+        );
+        p.time(
+            &format!("silu           h={h}"),
+            h,
+            |c| p.b.silu(c).unwrap(),
+            &x,
+        );
+        p.time(
+            &format!("rms_norm       h={h}"),
+            h,
+            |c| p.b.rms_norm(c, &w, eps).unwrap(),
+            &x,
+        );
         if h % 512 == 0 {
             p.time(
                 &format!("hadamard       h={h}"),
