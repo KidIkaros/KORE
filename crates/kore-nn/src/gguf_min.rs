@@ -148,15 +148,45 @@ fn err(msg: &str) -> KoreError {
     KoreError::StorageError(format!("gguf_min: {msg}"))
 }
 
-/// Payload byte size for known type ids; returns None for unknown ids.
+/// Payload geometry `(elements per block, bytes per block)` for known type ids;
+/// returns None for unknown ids.
+///
+/// This table is what lets the reader *size* a tensor table, so a model cannot
+/// be loaded until its quant geometry is here -- even if the compute kernels
+/// already exist. It covers the standard ggml types so that real HuggingFace
+/// GGUFs (which ship K-quants and IQ-quants, not Q2_0) can at least be parsed.
+/// Reading the *bytes* is a separate concern (`tensor_f32` / the kernels).
+///
+/// Block sizes: `QK_K = 256` for the K-quants. The 32-wide legacy quants carry a
+/// single f16 scale; the K-quants carry super-block scales plus 6-bit sub-scales.
 fn type_block(type_id: u32) -> Option<(usize, usize)> {
     // (elements per block, bytes per block)
     Some(match type_id {
-        0 => (1, 4),   // F32
-        1 => (1, 2),   // F16
-        30 => (1, 2),  // BF16
-        8 => (32, 34), // Q8_0
-        42 => (64, 18),// Q2_0 (PrismML)
+        0 => (1, 4),      // F32
+        1 => (1, 2),      // F16
+        30 => (1, 2),     // BF16
+        2 => (32, 18),    // Q4_0     : f16 d + 16 B of 4-bit
+        3 => (32, 20),    // Q4_1     : f16 d + f16 m + 16 B
+        6 => (32, 22),    // Q5_0     : f16 d + 4 B qh + 16 B
+        7 => (32, 24),    // Q5_1     : f16 d + f16 m + 4 B qh + 16 B
+        8 => (32, 34),    // Q8_0     : f16 d + 32 B
+        9 => (32, 36),    // Q8_1     : f16 d + f16 s + 32 B
+        10 => (256, 84),  // Q2_K
+        11 => (256, 110), // Q3_K
+        12 => (256, 144), // Q4_K
+        13 => (256, 176), // Q5_K
+        14 => (256, 210), // Q6_K
+        15 => (256, 292), // Q8_K
+        16 => (256, 66),  // IQ2_XXS
+        17 => (256, 74),  // IQ2_XS
+        18 => (256, 98),  // IQ3_XXS
+        19 => (256, 50),  // IQ1_S
+        20 => (32, 18),   // IQ4_NL   : like Q4_0 but a non-linear codebook
+        21 => (256, 110), // IQ3_S
+        22 => (256, 82),  // IQ2_S
+        23 => (256, 136), // IQ4_XS
+        24 => (256, 56),  // IQ1_M
+        42 => (64, 18),   // Q2_0 (PrismML): f16 d + 16 B of 2-bit
         _ => return None,
     })
 }
@@ -424,5 +454,58 @@ impl MiniGguf {
         } else {
             Err(err(&format!("cannot f32-decode type {}", t.type_id)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_geometry_of_common_quants() {
+        // Legacy 32-wide quants.
+        assert_eq!(type_block(8), Some((32, 34))); // Q8_0
+        assert_eq!(type_block(2), Some((32, 18))); // Q4_0
+        assert_eq!(type_block(3), Some((32, 20))); // Q4_1
+
+        // K-quants are 256-wide.
+        assert_eq!(type_block(12), Some((256, 144))); // Q4_K
+        assert_eq!(type_block(14), Some((256, 210))); // Q6_K
+        assert_eq!(type_block(10), Some((256, 84))); // Q2_K
+
+        // The PrismML type this reader was originally written for.
+        assert_eq!(type_block(42), Some((64, 18))); // Q2_0
+
+        // Unquantized.
+        assert_eq!(type_block(0), Some((1, 4)));
+        assert_eq!(type_block(1), Some((1, 2)));
+        assert_eq!(type_block(30), Some((1, 2)));
+    }
+
+    #[test]
+    fn nbytes_rolls_partial_blocks_up() {
+        // 33 elements of a 32-wide quant still occupies two full blocks.
+        assert_eq!(tensor_nbytes(8, &[33]).unwrap(), 2 * 34);
+        // Exactly one block.
+        assert_eq!(tensor_nbytes(8, &[32]).unwrap(), 34);
+    }
+
+    #[test]
+    fn nbytes_of_a_k_quant_matrix() {
+        // A 4096x2048 Q4_K weight: 8_388_608 elements = 32_768 blocks of 256.
+        assert_eq!(tensor_nbytes(12, &[4096, 2048]).unwrap(), 32_768 * 144);
+        // 4.5 bits/weight effective, which is the whole point of Q4_K.
+        let bits = (32_768 * 144 * 8) as f64 / 8_388_608 as f64;
+        assert!(
+            (bits - 4.5).abs() < 1e-9,
+            "Q4_K is 4.5 bits/weight, got {bits}"
+        );
+    }
+
+    #[test]
+    fn unknown_type_is_an_error_not_a_guess() {
+        // Better to refuse than to size a tensor wrongly and read the wrong bytes.
+        assert_eq!(type_block(9999), None);
+        assert!(tensor_nbytes(9999, &[256]).is_err());
     }
 }
