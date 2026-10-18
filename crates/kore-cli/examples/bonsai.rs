@@ -118,6 +118,11 @@ fn main() {
             out.len() as f64 / dt.as_secs_f64()
         );
         eprintln!("token ids: {out:?}");
+        let (hits, misses, bytes) = gpu.expert_stats();
+        eprintln!(
+            "expert bank: {hits} hits, {misses} misses, {:.1} MB uploaded",
+            bytes as f64 / 1e6
+        );
         println!("{}", tok.decode(&out, true).expect("decode"));
         return;
     }

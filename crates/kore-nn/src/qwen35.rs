@@ -706,6 +706,29 @@ pub struct Qwen35Model {
     folded: bool,
 }
 
+/// Router probabilities: one score per expert, softmax over *all* of them.
+///
+/// llama.cpp takes the top-k after a full softmax and renormalises afterwards,
+/// which is not the same as taking a softmax over the top-k -- so this is shared
+/// by both lanes rather than written twice.
+fn router_probs(router: &QW, h: &[f32], n_experts: usize) -> Result<Vec<f32>> {
+    let mut probs = vec![0.0f32; n_experts];
+    router.gemv(h, &mut probs)?;
+    softmax_inplace(&mut probs);
+    Ok(probs)
+}
+
+/// The top `k` experts, renormalised, in descending probability order.
+fn top_k_experts(probs: &[f32], k: usize) -> Vec<(usize, f32)> {
+    // `total_cmp` so a NaN neither panics nor silently wins the sort.
+    let mut order: Vec<usize> = (0..probs.len()).collect();
+    order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+    let k = k.min(order.len());
+    let sum: f32 = order[..k].iter().map(|&e| probs[e]).sum();
+    let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+    order[..k].iter().map(|&e| (e, probs[e] * inv)).collect()
+}
+
 impl Qwen35Model {
     pub fn from_gguf(path: &Path) -> Result<Self> {
         let gg = MiniGguf::load(path)?;
@@ -1148,25 +1171,15 @@ impl Qwen35Model {
             return Err(err("qwen35moe: expert_used_count is zero"));
         }
 
-        let mut probs = vec![0.0f32; ne];
-        m.router.gemv(h, &mut probs)?;
-        softmax_inplace(&mut probs);
-
-        // Descending by probability. `total_cmp` so a NaN neither panics nor
-        // silently wins the sort.
-        let mut order: Vec<usize> = (0..ne).collect();
-        order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
-
-        let sum: f32 = order[..k].iter().map(|&e| probs[e]).sum();
-        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+        let probs = router_probs(&m.router, h, ne)?;
+        let picks = top_k_experts(&probs, k);
 
         let mut out = vec![0.0f32; cfg.hidden];
         let mut g = vec![0.0f32; cfg.moe_ffn];
         let mut u = vec![0.0f32; cfg.moe_ffn];
         let mut act = vec![0.0f32; cfg.moe_ffn];
         let mut d = vec![0.0f32; cfg.hidden];
-        for &e in &order[..k] {
-            let w = probs[e] * inv;
+        for (e, w) in picks {
             m.gate.expert(e, m.stride_gate).gemv(h, &mut g)?;
             m.up.expert(e, m.stride_up).gemv(h, &mut u)?;
             for i in 0..cfg.moe_ffn {
@@ -1525,6 +1538,7 @@ impl Qwen35Model {
 
 use kore_core::device::{get_backend, DeviceBackend};
 use kore_core::{DType, Device, Storage, Tensor};
+use std::sync::Mutex;
 
 struct GpuDelta {
     attn_norm: Tensor,
@@ -1648,14 +1662,49 @@ struct GpuW {
     n: usize,
 }
 
-/// The dense feed-forward weights, resident on the device.
+/// The feed-forward block on the device: a resident dense SwiGLU, or a routed
+/// `qwen35moe` FFN whose experts stream through a slot pool.
+// One per layer; a box would add a pointer chase to every FFN for 900 bytes.
+#[allow(clippy::large_enum_variant)]
+enum GpuFfn {
+    Dense { gate: GpuW, up: GpuW, down: GpuW },
+    Moe(GpuMoe),
+}
+
+/// The routed FFN on the device.
 ///
-/// The routed `qwen35moe` FFN has no resident form yet: its experts are meant to
-/// stream, which is P6.3/P6.4, so this type only ever holds a dense SwiGLU.
-struct GpuFfn {
-    gate: GpuW,
-    up: GpuW,
-    down: GpuW,
+/// The router stays on the host. Its output is needed there anyway -- the expert
+/// windows have to be named before anything can be uploaded -- so a device-side
+/// router would only add a readback on top of the one that is already
+/// unavoidable. Everything after the routing decision runs on the device.
+///
+/// The banks are behind a `Mutex` because `forward` takes `&self`: the slot pool
+/// is mutable state that lives with the weights, not with the sequence, and a
+/// lock is one uncontended acquire per expert against a ~1 MB upload.
+struct GpuMoe {
+    router: QW,
+    shexp_router: QW,
+    gate: Mutex<DeviceBank>,
+    up: Mutex<DeviceBank>,
+    down: Mutex<DeviceBank>,
+    shexp_gate: GpuW,
+    shexp_up: GpuW,
+    shexp_down: GpuW,
+    n_experts: usize,
+    n_used: usize,
+}
+
+/// One expert's device copy, uploaded first on a miss.
+fn bank_expert(
+    bank: &Mutex<DeviceBank>,
+    e: usize,
+    b: &dyn DeviceBackend,
+    device: Device,
+) -> Result<GpuW> {
+    let mut bank = bank
+        .lock()
+        .map_err(|_| err("qwen35moe: an expert bank was poisoned by an earlier panic"))?;
+    Ok(bank.acquire(e, b, device)?.clone())
 }
 
 /// A stacked expert matrix whose device copies stream through a small slot pool.
@@ -1673,10 +1722,8 @@ struct GpuFfn {
 /// which slot, which expert -- and `streamed_experts_match_resident_by_bit`
 /// below pins exactly that, evictions included.
 ///
-/// Not yet consumed by the device FFN; the routed expert loop lands on top of
-/// this (see the P6.3/P6.4 notes in the revamp plan) and will drop this
-/// `allow`.
-#[allow(dead_code)]
+/// The routed FFN's expert loop is the one consumer: [`GpuMoe`] asks each bank
+/// for the experts a token selected, in the order the router ranked them.
 struct DeviceBank {
     /// The whole stacked tensor; one expert every `host.byte_len()` bytes.
     host: QW,
@@ -1908,15 +1955,44 @@ impl Qwen35Gpu {
         // would run and produce wrong tokens.
         let gpu_ffn = |w: &FfnW| -> Result<GpuFfn> {
             match w {
-                FfnW::Dense { gate, up, down } => Ok(GpuFfn {
+                FfnW::Dense { gate, up, down } => Ok(GpuFfn::Dense {
                     gate: up_w(gate)?,
                     up: up_w(up)?,
                     down: up_w(down)?,
                 }),
-                FfnW::Moe(_) => Err(err(
-                    "qwen35moe: the device lane does not build the routed FFN yet \
-                     (it needs the streaming expert engine); use the CPU lane",
-                )),
+                FfnW::Moe(m) => {
+                    // One token needs its whole top-k at once, and slots are
+                    // filled lazily, so the cap costs nothing until experts are
+                    // actually touched. Measured on POCKET (13 GB, 8 GB card):
+                    // 32 vs 96 slots is inside the run-to-run noise, so this
+                    // stays at the floor that keeps VRAM small -- what actually
+                    // decides the rate is whether the file is in page cache.
+                    // `KORE_MOE_SLOTS` overrides it for measurements.
+                    let n_slots = std::env::var("KORE_MOE_SLOTS")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(cfg.n_experts_used.max(1) * 4);
+                    let bank = |host: &QW| -> Result<Mutex<DeviceBank>> {
+                        Ok(Mutex::new(DeviceBank::new(
+                            host.clone(),
+                            m.n_experts,
+                            n_slots,
+                            cfg.n_experts_used,
+                        )?))
+                    };
+                    Ok(GpuFfn::Moe(GpuMoe {
+                        router: m.router.clone(),
+                        shexp_router: m.shexp_router.clone(),
+                        gate: bank(&m.gate)?,
+                        up: bank(&m.up)?,
+                        down: bank(&m.down)?,
+                        shexp_gate: up_w(&m.shexp_gate)?,
+                        shexp_up: up_w(&m.shexp_up)?,
+                        shexp_down: up_w(&m.shexp_down)?,
+                        n_experts: m.n_experts,
+                        n_used: cfg.n_experts_used.min(m.n_experts),
+                    }))
+                }
             }
         };
 
@@ -2041,6 +2117,26 @@ impl Qwen35Gpu {
     /// the FFN output. The caller carries `down` forward as the pending residual,
     /// so the trailing `x += down` add is absorbed into the next layer's norm
     /// `out = W x` for whichever quant the file used.
+    /// `(hits, misses, bytes uploaded)` summed over every expert bank.
+    pub fn expert_stats(&self) -> (u64, u64, u64) {
+        let (mut hits, mut misses, mut bytes) = (0, 0, 0);
+        for layer in &self.layers {
+            let ffn = match layer {
+                GpuLayer::Delta(l) => &l.ffn,
+                GpuLayer::Full(l) => &l.ffn,
+            };
+            if let GpuFfn::Moe(m) = ffn {
+                for bank in [&m.gate, &m.up, &m.down] {
+                    let bank = bank.lock().expect("expert bank");
+                    hits += bank.hits();
+                    misses += bank.misses();
+                    bytes += bank.uploaded();
+                }
+            }
+        }
+        (hits, misses, bytes)
+    }
+
     fn wgemv(&self, w: &GpuW, x: &Tensor) -> Result<Tensor> {
         let b = &self.backend;
         match w.kind {
@@ -2095,14 +2191,85 @@ impl Qwen35Gpu {
             self.signs_or_placeholder(hidden)?,
             self.cfg.eps,
         )?;
-        let gv = self.wgemv(&w.gate, &ht)?;
-        let uv = self.wgemv(&w.up, &ht)?;
-        // Fused SwiGLU [+ Hadamard] (the second half of the FFN's activation pair).
-        let signs_ffn = self.signs_or_placeholder(ffn)?;
-        let (_gv, _uv, actt) =
-            b.had_pre(2, self.folded, &gv, &uv, signs_ffn, signs_ffn, self.cfg.eps)?;
-        let down = self.wgemv(&w.down, &actt)?;
+        let down = match w {
+            GpuFfn::Dense { gate, up, down } => {
+                let gv = self.wgemv(gate, &ht)?;
+                let uv = self.wgemv(up, &ht)?;
+                // Fused SwiGLU [+ Hadamard] (the second half of the FFN's
+                // activation pair).
+                let signs_ffn = self.signs_or_placeholder(ffn)?;
+                let (_gv, _uv, actt) =
+                    b.had_pre(2, self.folded, &gv, &uv, signs_ffn, signs_ffn, self.cfg.eps)?;
+                self.wgemv(down, &actt)?
+            }
+            GpuFfn::Moe(m) => self.moe_ffn_gpu(&ht, m)?,
+        };
         Ok((x_r, down))
+    }
+
+    /// The routed FFN: routing on the host, matvecs on the device.
+    ///
+    /// A step costs one 8 KB readback per layer and no per-expert round trip.
+    /// The router weight is never uploaded -- it is a 2 MB F32 matrix per layer,
+    /// and its result is wanted on the host anyway.
+    ///
+    /// One column at a time. Four columns route to up to four *different* expert
+    /// sets, so a wider pass would not amortise the expert read the way it
+    /// amortises a resident weight: it would run this loop four times and pay
+    /// four times the expert traffic.
+    fn moe_ffn_gpu(&self, ht: &Tensor, m: &GpuMoe) -> Result<Tensor> {
+        let b = &self.backend;
+        let cfg = &self.cfg;
+        let dims = ht.shape().dims();
+        let rows = if dims.len() == 2 { dims[0] } else { 1 };
+        if rows != 1 {
+            return Err(err(
+                "qwen35moe: the routed FFN runs one column at a time (each column \
+                 picks its own experts); prefill chunks on this arch are one token wide",
+            ));
+        }
+
+        let h_cpu = ht
+            .to(Device::Cpu)
+            .map_err(|e| err(&format!("expert routing download: {e}")))?;
+        let h = h_cpu
+            .as_f32_slice()
+            .ok_or_else(|| err("expert routing download did not come back as f32"))?;
+        let picks = top_k_experts(&router_probs(&m.router, h, m.n_experts)?, m.n_used);
+
+        let signs = self.signs_or_placeholder(cfg.moe_ffn)?;
+        let mut acc: Option<Tensor> = None;
+        for (e, weight) in picks {
+            let gate = bank_expert(&m.gate, e, &**b, self.device)?;
+            let up = bank_expert(&m.up, e, &**b, self.device)?;
+            let down = bank_expert(&m.down, e, &**b, self.device)?;
+            let gv = self.wgemv(&gate, ht)?;
+            let uv = self.wgemv(&up, ht)?;
+            let (_g, _u, act) = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?;
+            // `down` is linear, so scaling the activation is the same arithmetic
+            // as scaling its 2048-wide output, for a quarter of the dispatch.
+            let act = b.mul_scalar(&act, weight)?;
+            let dv = self.wgemv(&down, &act)?;
+            acc = Some(match acc {
+                Some(a) => b.add(&a, &dv)?,
+                None => dv,
+            });
+        }
+
+        // Shared expert: always evaluated, gated by `sigmoid` of its own row.
+        let mut sg = vec![0.0f32; m.shexp_router.n];
+        m.shexp_router.gemv(h, &mut sg)?;
+        let gs = 1.0 / (1.0 + (-sg[0]).exp());
+        let sgate = self.wgemv(&m.shexp_gate, ht)?;
+        let sup = self.wgemv(&m.shexp_up, ht)?;
+        let signs = self.signs_or_placeholder(cfg.shexp_ffn)?;
+        let (_g, _u, sact) = b.had_pre(2, self.folded, &sgate, &sup, signs, signs, cfg.eps)?;
+        let sact = b.mul_scalar(&sact, gs)?;
+        let sd = self.wgemv(&m.shexp_down, &sact)?;
+        match acc {
+            Some(a) => Ok(b.add(&a, &sd)?),
+            None => Ok(sd),
+        }
     }
 
     /// One decode step; returns the next greedy token.
@@ -2354,15 +2521,23 @@ impl Qwen35Gpu {
         if prompt.is_empty() {
             return Err(err("prefill needs at least one token"));
         }
-        let n_chunks = prompt.len().div_ceil(PREFILL_CHUNK);
+        // Each column of a routed FFN picks its own experts, so a four-column
+        // chunk would not amortise the expert read the way it amortises a
+        // resident weight -- it would multiply the traffic instead.
+        let width = if self.cfg.n_experts > 0 {
+            1
+        } else {
+            PREFILL_CHUNK
+        };
+        let n_chunks = prompt.len().div_ceil(width);
         let mut out = Vec::new();
-        for (i, chunk) in prompt.chunks(PREFILL_CHUNK).enumerate() {
+        for (i, chunk) in prompt.chunks(width).enumerate() {
             let head = if i + 1 == n_chunks {
                 Head::Last
             } else {
                 Head::Skip
             };
-            out = self.forward_pass(cpu, chunk, pos0 + i * PREFILL_CHUNK, states, head, None)?;
+            out = self.forward_pass(cpu, chunk, pos0 + i * width, states, head, None)?;
         }
         out.pop().ok_or_else(|| err("prefill produced no token"))
     }
