@@ -617,6 +617,108 @@ fn test_vulkan_gemv_q5_k_correctness() {
     );
 }
 
+/// Q8_0 GEMV: a 32-weight block under one f16 scale, `value = q * d`.
+///
+/// The kernel reads a *repacked* payload (36-byte blocks, quants first), so the
+/// fixture is built through `kore_kernels::q8_0::repack_q8_0` — that is the same
+/// path `up_w` takes for a resident Q8_0 tensor, and it is what makes the test
+/// cover the repack as well as the arithmetic.
+///
+/// Matrix W: 2 rows x 256 cols (8 blocks per row) = 544 file bytes.
+///
+/// Row 0: `d = 1.0`, every quant `2` -> each weight `2.0`, dot with all-ones
+///        x = 256 * 2 = 512.
+/// Row 1: `d = 0.5`, every quant `-3` -> each weight `-1.5`, dot = 256 * -1.5
+///        = -384. The negative quant is the point: it exercises the signed-byte
+///        bias-back in the shader, which an all-positive fixture would miss.
+#[test]
+fn test_vulkan_gemv_q8_0_correctness() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    const BLOCK: usize = 34;
+    let mut raw = vec![0u8; 2 * 8 * BLOCK];
+
+    // Row 0: every block d = 1.0 (0x3C00 little-endian), quants 2.
+    for b in 0..8 {
+        raw[b * BLOCK] = 0x00;
+        raw[b * BLOCK + 1] = 0x3C;
+        for i in 0..32 {
+            raw[b * BLOCK + 2 + i] = 2;
+        }
+    }
+    // Row 1 at offset 8 * BLOCK: d = 0.5 (0x3800), quants -3.
+    let r1 = 8 * BLOCK;
+    for b in 0..8 {
+        raw[r1 + b * BLOCK] = 0x00;
+        raw[r1 + b * BLOCK + 1] = 0x38;
+        for i in 0..32 {
+            raw[r1 + b * BLOCK + 2 + i] = (-3i8) as u8;
+        }
+    }
+
+    let packed = kore_kernels::q8_0::repack_q8_0(&raw).expect("repack");
+    assert_eq!(packed.len(), 2 * 8 * 36);
+    let w_tensor = Tensor::from_storage(
+        kore_core::Storage::from_packed_bytes(kore_core::DType::U8, packed.len(), packed),
+        &[2 * 8 * 36],
+    );
+
+    // m = 1
+    let x = Tensor::from_f32(&vec![1.0f32; 256], &[1, 256]);
+    let y = backend
+        .gemv_q8_0(&x, &w_tensor, 2, 256)
+        .expect("gemv_q8_0 failed");
+    assert_eq!(y.shape().dims(), &[1, 2]);
+    let y_cpu = y.to(kore_core::Device::Cpu).expect("to CPU");
+    let y_slice = y_cpu.as_f32_slice().expect("f32 slice");
+    assert!(
+        (y_slice[0] - 512.0).abs() < 1e-3,
+        "positive row: got {}",
+        y_slice[0]
+    );
+    assert!(
+        (y_slice[1] + 384.0).abs() < 1e-3,
+        "negative row: got {}",
+        y_slice[1]
+    );
+
+    // m = 4, columns scaled 1..4: exercises the four-column accumulate path and
+    // checks each column independently (a lane that leaked one column into
+    // another would show up here and nowhere else).
+    let mut x4_data = Vec::with_capacity(4 * 256);
+    for c in 1..=4 {
+        x4_data.extend(std::iter::repeat_n(c as f32, 256));
+    }
+    let x4 = Tensor::from_f32(&x4_data, &[4, 256]);
+    let y4 = backend
+        .gemv_q8_0(&x4, &w_tensor, 2, 256)
+        .expect("gemv_q8_0 m=4 failed");
+    assert_eq!(y4.shape().dims(), &[4, 2]);
+    let y4_cpu = y4.to(kore_core::Device::Cpu).expect("to CPU");
+    let y4_slice = y4_cpu.as_f32_slice().expect("f32 slice");
+    for c in 0..4 {
+        let scale = (c + 1) as f32;
+        assert!(
+            (y4_slice[c * 2] - 512.0 * scale).abs() < 1e-3,
+            "m4 row0 col {c}: got {}",
+            y4_slice[c * 2]
+        );
+        assert!(
+            (y4_slice[c * 2 + 1] + 384.0 * scale).abs() < 1e-3,
+            "m4 row1 col {c}: got {}",
+            y4_slice[c * 2 + 1]
+        );
+    }
+
+    println!(
+        "Q8_0 GPU GEMV passed: positive row = {}, negative row = {}",
+        y_slice[0], y_slice[1]
+    );
+}
+
 /// Quantize one F32 row to offset-binary INT8 + per-row scale (mirrors the CPU Q8 KV path).
 fn q8_quant_row(row: &[f32]) -> (Vec<u8>, f32) {
     let absmax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));

@@ -21,6 +21,7 @@ pub mod cpu_ternary_matmul;
 pub mod hadamard;
 pub mod k_quant;
 pub mod q2_0;
+pub mod q8_0;
 pub mod simd;
 
 #[cfg(feature = "cuda")]

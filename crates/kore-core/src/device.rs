@@ -592,6 +592,27 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Quantized Q8_0 matrix-vector multiplication on device:
+    /// y = x @ W^T
+    /// x: [M, K] in F32 (where M is 1 during decode)
+    /// w_raw: [N * (K / 32) * 36] raw Q8_0 bytes, already adapted by
+    /// `kore_kernels::q8_0::repack_q8_0` (36-byte blocks, quants first)
+    /// n: output dimension (number of rows in W)
+    /// k: input dimension (number of columns in W)
+    /// Output: [M, N] in F32
+    fn gemv_q8_0(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q8_0 not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Fused Q|K|V projection: one dispatch over a concatenated Q4_K weight
     /// buffer (`w` rows = nq | nk | nv) producing three `[M, n*]` outputs.
     fn gemv_q4_k_split3(

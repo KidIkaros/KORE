@@ -252,6 +252,15 @@ struct Q6KUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Q80Uniforms {
+    m: u32,
+    n: u32,
+    k: u32,
+    blocks_per_row: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GemvSplit3Uniforms {
     m: u32,
     n: u32,
@@ -565,6 +574,7 @@ pub struct VulkanBackend {
     gemv_q4_k_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q5_k_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q6_k_pipeline: Arc<wgpu::ComputePipeline>,
+    gemv_q8_0_pipeline: Arc<wgpu::ComputePipeline>,
     repack_q6_k_pipeline: Arc<wgpu::ComputePipeline>,
     elementwise_pipeline: Arc<wgpu::ComputePipeline>,
     quantized_pipeline: Arc<wgpu::ComputePipeline>,
@@ -957,6 +967,21 @@ impl VulkanBackend {
             },
         ));
 
+        let gemv_q8_0_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_gemv_q8_0_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gemv_q8_0.wgsl").into()),
+        });
+        let gemv_q8_0_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_gemv_q8_0_pipeline"),
+                layout: None,
+                module: &gemv_q8_0_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
         let repack_q6_k_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kore_repack_q6_k_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/repack_q6_k.wgsl").into()),
@@ -1203,6 +1228,7 @@ impl VulkanBackend {
             gemv_q4_k_pipeline,
             gemv_q5_k_pipeline,
             gemv_q6_k_pipeline,
+            gemv_q8_0_pipeline,
             repack_q6_k_pipeline,
             elementwise_pipeline,
             quantized_pipeline,
@@ -3271,6 +3297,66 @@ impl VulkanBackend {
         Ok(self.make_tensor(y_kore_buf, &[m, n]))
     }
 
+    /// Q8_0 GEMV: y = x @ W^T, over a payload already adapted by
+    /// [`kore_kernels::q8_0::repack_q8_0`].
+    ///
+    /// Unlike [`Self::gemv_q6_k`] there is no device-side repack pass: Q8_0 is a
+    /// resident-only format here (shared experts, `ssm_out`, `attn_k`/`attn_v`),
+    /// so the caller uploads the packed payload and the adaptation happens once
+    /// at load. `w_raw` is therefore `[n, k/32]` blocks of 36 bytes, not the
+    /// file's 34-byte blocks.
+    ///
+    /// `x`: `[m, k]` F32 (or `[k]`, read as `m = 1`); `w_raw`'s element count is
+    /// `n * k / 32 * 36` bytes.
+    pub fn gemv_q8_0(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+        let x_shape = x.shape().dims();
+        // A 1-D input is a single row: `m` is 1, not its length. (`gemv_q2_0`
+        // has always done it this way.)
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        let k_in = x.numel() / m;
+        if k_in != k || !k.is_multiple_of(kore_kernels::q8_0::Q8_0_BLOCK_SIZE) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q8_0".into(),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+
+        let blocks_per_row = (k / kore_kernels::q8_0::Q8_0_BLOCK_SIZE) as u32;
+        let uniforms = Q80Uniforms {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            blocks_per_row,
+        };
+
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+
+        let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q8_0_out");
+
+        let workgroups_x = (n as u32).div_ceil(4).max(1);
+        let workgroups_y = (m as u32).div_ceil(4).max(1);
+        self.record_dispatch(
+            &self.gemv_q8_0_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            (workgroups_x, workgroups_y, 1),
+            "gemv_q8_0_compute_pass",
+        );
+
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![m, n]);
+        Ok(self.make_tensor(y_kore_buf, &[m, n]))
+    }
+
     /// Get or create the 224B-block padded version of a packed Q6_K weight buffer.
     /// Repack is recorded once per source buffer into the pending submission;
     /// the source `Arc` is pinned in the cache so its pointer can't be recycled.
@@ -4641,6 +4727,17 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         k: usize,
     ) -> kore_core::Result<Tensor> {
         self.gemv_q5_k(x, w_raw, n, k)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gemv_q8_0(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q8_0(x, w_raw, n, k)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
