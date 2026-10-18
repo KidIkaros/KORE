@@ -23,6 +23,7 @@
 //! Usage: `draft_headroom <gguf> <tokenizer> <n_new> <prompt> [rounds]`
 
 use kore_nn::qwen35::{GpuState, Qwen35Gpu, Qwen35Model};
+use kore_nn::spec::longest_match;
 use std::path::Path;
 use std::time::Instant;
 
@@ -39,35 +40,11 @@ fn median(mut v: Vec<f64>) -> f64 {
     }
 }
 
-/// Longest suffix of `hist ++ [t_next]`, of length at most `max_len`, that also
-/// occurs earlier in `hist`. Returns `(length, continuation)`: the continuation
-/// is what followed that earlier occurrence, capped at `k` tokens, and is empty
-/// when the earlier occurrence had nothing after it (nothing to draft).
-///
-/// Matching *including* `t_next` is what aligns the drafts with the batch: the
-/// model's own next token is already known to be right, so the useful guesses
-/// start one position later, and a context that ends with `t_next` is a context
-/// whose continuation is a guess for exactly that position.
-fn longest_match(hist: &[u32], t_next: u32, k: usize, max_len: usize) -> (usize, Vec<u32>) {
-    let p = hist.len();
-    let cap = max_len.min(p + 1);
-    for l in (1..=cap).rev() {
-        if l > p {
-            continue;
-        }
-        let head = &hist[p - (l - 1)..p];
-        // Largest `s` (the most recent earlier occurrence) wins.
-        for s in (0..=p - l).rev() {
-            if hist[s..s + l - 1] == *head && hist[s + l - 1] == t_next {
-                let end = (s + l + k).min(p);
-                if end > s + l {
-                    return (l, hist[s + l..end].to_vec());
-                }
-                return (l, Vec::new());
-            }
-        }
-    }
-    (0, Vec::new())
+/// The shipped matcher, over the whole recorded history (no `search_back`
+/// window): this replay scores the drafter that actually ships, so the
+/// acceptance numbers transfer to `bench_draft`.
+fn matched(hist: &[u32], t_next: u32, k: usize, max_len: usize) -> (usize, Vec<u32>) {
+    longest_match(hist, t_next, k, max_len, usize::MAX)
 }
 
 struct Trigger {
@@ -103,7 +80,7 @@ fn walk(all: &[u32], start: usize, k: usize, max_len: usize, t: &Trigger, step_m
     while p + 1 + k < all.len() {
         w.steps += 1;
         let t_next = all[p];
-        let (l, drafts) = longest_match(&all[..p], t_next, k, max_len);
+        let (l, drafts) = matched(&all[..p], t_next, k, max_len);
         if l >= t.min_match && drafts.len() >= t.min_drafts {
             let m = 1 + drafts.len();
             let j = drafts

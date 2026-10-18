@@ -16,6 +16,8 @@ pub mod moe;
 pub mod gguf_min;
 pub mod llama;
 pub mod qwen35;
+pub mod spec;
+pub use spec::{DraftPolicy, SpecStats};
 pub mod loss;
 pub mod module;
 pub mod pool;
