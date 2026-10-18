@@ -142,7 +142,7 @@ fn main() {
         if t.download_us + t.route_us + t.upload_us + t.compute_us > 0 {
             let total = (t.download_us + t.route_us + t.upload_us + t.compute_us) as f64;
             eprintln!(
-                "moe host: download {:.1} ms ({:.0}%) | router {:.1} ms ({:.0}%) | upload {:.1} ms ({:.0}%) | submit {:.1} ms ({:.0}%) | {:.1} ms/token",
+                "moe host/decode step: download {:.1} ms ({:.0}%) | router {:.1} ms ({:.0}%) | upload {:.1} ms ({:.0}%) | submit {:.1} ms ({:.0}%) | {:.1} ms/forward",
                 t.download_us as f64 / 1e3,
                 100.0 * t.download_us as f64 / total,
                 t.route_us as f64 / 1e3,
@@ -152,6 +152,12 @@ fn main() {
                 t.compute_us as f64 / 1e3,
                 100.0 * t.compute_us as f64 / total,
                 total / 1e3 / out.len().max(1) as f64
+            );
+            let (hits, misses) = kore_vulkan::buffer_alloc_stats();
+            eprintln!(
+                "moe alloc: {hits} pool hits, {misses} created ({:.1} created/token) | {} expert bytes/token",
+                misses as f64 / out.len().max(1) as f64,
+                t.upload_bytes / out.len().max(1) as u64,
             );
         }
         match &tok {

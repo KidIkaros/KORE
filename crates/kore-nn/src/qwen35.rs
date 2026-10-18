@@ -1767,6 +1767,17 @@ pub struct MoeTimes {
     /// Submission of everything else: the three matvecs, the fused SwiGLU, the
     /// combine. Host encoding only.
     pub compute_us: u64,
+    /// Expert bytes actually moved host -> device, misses only.
+    ///
+    /// `upload_us / upload_bytes` is the number that matters: allocation and
+    /// per-call overhead show up as a rate far below the raw memcpy ceiling.
+    pub upload_bytes: u64,
+}
+
+/// Expert bytes moved into the three banks since construction.
+fn expert_bytes_moved(m: &GpuMoe) -> u64 {
+    let sum = |b: &Mutex<DeviceBank>| b.lock().map(|b| b.uploaded()).unwrap_or(0);
+    sum(&m.gate) + sum(&m.up) + sum(&m.down)
 }
 
 /// One expert's device copy, uploaded first on a miss.
@@ -2268,6 +2279,7 @@ impl Qwen35Gpu {
                 total.route_us += t.route_us;
                 total.upload_us += t.upload_us;
                 total.compute_us += t.compute_us;
+                total.upload_bytes += t.upload_bytes;
             }
         }
         total
@@ -2414,6 +2426,7 @@ impl Qwen35Gpu {
         let signs = self.signs_or_placeholder(cfg.moe_ffn)?;
         let mut acc: Option<Tensor> = None;
         let (mut upload_us, mut compute_us) = (0u64, 0u64);
+        let bytes_before = expert_bytes_moved(m);
 
         // Ablation switch: `KORE_MOE_BATCH=0` forces the one-expert-at-a-time
         // path so the two can be timed against the same input.
@@ -2522,6 +2535,7 @@ impl Qwen35Gpu {
             t.route_us += route_us;
             t.upload_us += upload_us;
             t.compute_us += compute_us;
+            t.upload_bytes += expert_bytes_moved(m) - bytes_before;
         }
         Ok(out)
     }
@@ -3178,6 +3192,11 @@ impl Qwen35Gpu {
         if !tokens.is_empty() {
             next = self.prefill(cpu, tokens, 0, &mut states)?;
         }
+        // The profile describes *decode* steps. Without this the prompt's
+        // forwards are divided by the generated tokens, which on a 12-token
+        // prompt against 8 new tokens inflates every region by 2.5x -- and
+        // misattributes the whole prefill to the first step.
+        self.reset_moe_times();
         for k in 0..n_new {
             let tok = next;
             if tok == cpu.cfg.eos {
