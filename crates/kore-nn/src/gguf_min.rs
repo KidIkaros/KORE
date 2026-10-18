@@ -449,6 +449,13 @@ impl MiniGguf {
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                 .collect())
+        } else if t.type_id == 1 {
+            // An f16 export -- and every 1-D auxiliary tensor in a file written
+            // with `--outtype f16` -- lands here.
+            Ok(bytes
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect())
         } else if t.type_id == 42 {
             kore_kernels::q2_0::dequantize_q2_0(bytes, t.n_elements())
         } else {

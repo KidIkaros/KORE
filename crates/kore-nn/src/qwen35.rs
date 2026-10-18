@@ -1,8 +1,21 @@
-//! Qwen3.5 hybrid model (PrismML Ternary Bonsai): gated DeltaNet linear
-//! attention layers interleaved with full-attention layers, Q2_0 quantized
-//! weights, runtime Hadamard activation transforms.
+//! Qwen3.5 hybrid model: gated DeltaNet linear attention layers interleaved
+//! with full-attention layers, packed or unpacked weights, runtime Hadamard
+//! activation transforms.
 //!
-//! Reference contract (from GGUF metadata + llama.cpp qwen35 model):
+//! Two GGUF arch keys are served, and the arch key is also the metadata prefix
+//! (`qwen3_5` in a HuggingFace filename is *not* what the file says):
+//!
+//! - `qwen35`   -- one dense SwiGLU per layer.
+//! - `qwen35moe` -- a router over `expert_count` stacked experts, top
+//!   `expert_used_count` of them evaluated, plus a sigmoid-gated shared expert.
+//!   Files of this arch may also carry an MTP/`nextn` block; it is a draft head,
+//!   not part of the stack, and is skipped.
+//!
+//! Weight formats: F32, F16, Q2_0, Q4_K, Q5_K, Q6_K. A single file may mix
+//! them -- `qwen35moe` files keep the router in F32 and quantize only the
+//! experts.
+//!
+//! Reference contract (from GGUF metadata + llama.cpp `qwen35`/`qwen35moe`):
 //! - Layers: `(i+1) % full_attention_interval == 0` => full attention,
 //!   else gated DeltaNet.
 //! - All folded weights store W' = H D W on the input axis (D = explicit
@@ -10,9 +23,28 @@
 //!   weight first transforms its activation x' = H D x (signs, then WHT
 //!   per block) -- this includes the tied lm head (v2 `tied_output`).
 //!   `inverse_weight_names` (token_embd) rows are stored folded; the
-//!   embedding lookup restores e = D H e' (WHT, then signs).
+//!   embedding lookup restores e = D H e' (WHT, then signs). A file without
+//!   `prism.hadamard.*` metadata has no transform at all, and folding is
+//!   decided per file, never assumed.
 //! - DeltaNet step per head: S *= exp(g); d = beta*(v - S^T k);
 //!   S += k x d^T; out = S^T q / sqrt(d_state).
+//! - DeltaNet q/k are broadcast to the value heads by **tiling** (`hk = hv %
+//!   n_k`), not by interleaving: that is what every GGUF of this family is
+//!   built for, even where the HF reference does the opposite.
+//! - MoE routing is llama.cpp's `build_moe_ffn` with `LLM_FFN_SILU`, softmax
+//!   gating and `norm_w = true`: softmax over *all* experts, top-k, then
+//!   renormalise. The shared expert sits outside the top-k and is scaled by
+//!   `sigmoid(gate_inp_shexp . h)`.
+//!
+//! End-to-end parity for `qwen35moe` is checked against llama.cpp on a 9 MB
+//! conversion of `tiny-random/qwen3.5-moe` (128 experts, top-10, n_k != n_v):
+//!
+//! ```text
+//! python convert_hf_to_gguf.py <hf dir> --outtype f16 --outfile tiny.gguf
+//! ref_ids tiny.gguf "The capital of France is" 8      # gen_ids: 132029 192124 633 ...
+//! bonsai  tiny.gguf <tokenizer.json> "The capital of France is" 8 cpu
+//! ```
+
 
 use std::path::Path;
 use std::sync::Arc;
@@ -101,6 +133,9 @@ const PREFILL_CHUNK: usize = MAX_BATCH_COLS;
 
 #[derive(Debug, Clone)]
 pub struct Qwen35Config {
+    /// The GGUF arch key, which is also the metadata prefix: `qwen35` or
+    /// `qwen35moe`.
+    pub prefix: String,
     pub n_layers: usize,
     pub hidden: usize,
     pub ffn: usize,
@@ -116,6 +151,11 @@ pub struct Qwen35Config {
     pub ssm_groups: usize,
     pub ssm_dt_rank: usize,
     pub ssm_inner: usize,
+    /// Routed-expert geometry. All zero for a dense `qwen35` file.
+    pub n_experts: usize,
+    pub n_experts_used: usize,
+    pub moe_ffn: usize,
+    pub shexp_ffn: usize,
     pub vocab: usize,
     pub context: usize,
     pub hadamard_block: usize,
@@ -196,6 +236,23 @@ fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 
+/// In-place softmax over a slice, max-subtracted so a large router logit cannot
+/// overflow `exp`.
+fn softmax_inplace(x: &mut [f32]) {
+    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for v in x.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    if sum > 0.0 {
+        let inv = 1.0 / sum;
+        for v in x.iter_mut() {
+            *v *= inv;
+        }
+    }
+}
+
 fn softplus(x: f32) -> f32 {
     if x > 20.0 {
         x
@@ -221,6 +278,12 @@ fn gemv_f32(w: &[f32], m: usize, x: &[f32], out: &mut [f32]) {
 /// does: Q5_K holds its 24 `ssm_out.weight` matrices).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum QKind {
+    /// GGML type 0: plain f32. Routers keep this format even inside an
+    /// otherwise K-quant file, so it is not a corner case.
+    F32,
+    /// GGML type 1: plain f16. An unquantised export is a perfectly ordinary
+    /// file, and it is the only way to get an exact f32 parity harness.
+    F16,
     /// GGML type 42, 64 weights per 18-byte block.
     Q2_0,
     /// K-quants, 256 weights per super-block.
@@ -232,6 +295,8 @@ enum QKind {
 impl QKind {
     fn from_type_id(id: u32) -> Option<Self> {
         match id {
+            0 => Some(Self::F32),
+            1 => Some(Self::F16),
             kore_kernels::q2_0::Q2_0_TYPE_ID => Some(Self::Q2_0),
             k_quant::Q4_K_TYPE_ID => Some(Self::Q4K),
             k_quant::Q5_K_TYPE_ID => Some(Self::Q5K),
@@ -242,6 +307,8 @@ impl QKind {
 
     fn type_id(self) -> u32 {
         match self {
+            Self::F32 => 0,
+            Self::F16 => 1,
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_TYPE_ID,
             Self::Q4K => k_quant::Q4_K_TYPE_ID,
             Self::Q5K => k_quant::Q5_K_TYPE_ID,
@@ -252,6 +319,7 @@ impl QKind {
     /// Weights per packed block.
     const fn block(self) -> usize {
         match self {
+            Self::F32 | Self::F16 => 1,
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_BLOCK,
             _ => k_quant::QK_K,
         }
@@ -260,6 +328,8 @@ impl QKind {
     /// Bytes per packed block.
     const fn block_bytes(self) -> usize {
         match self {
+            Self::F32 => 4,
+            Self::F16 => 2,
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_BLOCK_BYTES,
             Self::Q4K => k_quant::Q4_K_BLOCK_BYTES,
             Self::Q5K => k_quant::Q5_K_BLOCK_BYTES,
@@ -268,14 +338,16 @@ impl QKind {
     }
 
     /// The `oxillama` type tag, which is how the CPU lane names a K-quant kernel.
+    ///
+    /// Only the K-quant path goes through `oxillama`; Q2_0 and the unpacked
+    /// formats have their own loops and never ask for a tag, so their value
+    /// here is a placeholder.
     fn gguf(self) -> GgufTensorType {
         match self {
             Self::Q4K => GgufTensorType::Q4K,
             Self::Q5K => GgufTensorType::Q5K,
             Self::Q6K => GgufTensorType::Q6K,
-            // Only the K-quant CPU path goes through `oxillama`; Q2_0 has its
-            // own SIMD kernel and never asks for a tag.
-            Self::Q2_0 => GgufTensorType::Q8_0,
+            Self::F32 | Self::F16 | Self::Q2_0 => GgufTensorType::Q8_0,
         }
     }
 }
@@ -314,15 +386,48 @@ struct QW {
     /// Row count (GGUF `ne[1]`): the matvec's output width.
     n: usize,
     kind: QKind,
+    /// Byte offset of this matrix inside the tensor's payload. Zero for a plain
+    /// 2-D weight; `e * stride` for one expert of a stacked `[.., .., n_experts]`
+    /// tensor, which is how a `qwen35moe` FFN addresses its experts without
+    /// copying (or even touching) the ones it is not using.
+    off: usize,
     /// Zero-copy view over the packed bytes, resolved once at load. Keeps the
     /// file's mapping alive for as long as the model is.
     shared: SharedBytes,
+    /// The whole-tensor owner, kept so an expert window can be re-sliced
+    /// without copying.
+    owner: Arc<dyn ByteOwner>,
 }
 
 impl QW {
     /// The packed payload, `n * (m / block) * block_bytes` bytes.
     fn bytes(&self) -> &[u8] {
-        &self.shared
+        let all = self.shared.as_slice();
+        let end = self.off.saturating_add(self.byte_len()).min(all.len());
+        &all[self.off.min(all.len())..end]
+    }
+
+    /// Payload size of one matrix: `n * (m / block) * block_bytes`.
+    fn byte_len(&self) -> usize {
+        self.n * self.row_bytes()
+    }
+
+    /// The view the K-quant kernels need. Whole-tensor weights reuse the view
+    /// built at load; an expert gets a cheap re-slice of the same mapping.
+    fn view(&self) -> Result<SharedBytes> {
+        if self.off == 0 && self.shared.as_slice().len() == self.byte_len() {
+            return Ok(self.shared.clone());
+        }
+        SharedBytes::from_owner(self.owner.clone(), self.off, self.byte_len())
+            .ok_or_else(|| err(&format!("'{}': expert window is out of range", self.name)))
+    }
+
+    /// Expert `e` of a stacked tensor whose slices are `stride` bytes apart.
+    fn expert(&self, e: usize, stride: usize) -> Self {
+        Self {
+            off: self.off + e * stride,
+            ..self.clone()
+        }
     }
 
     /// Bytes per matrix row.
@@ -347,6 +452,8 @@ impl QW {
             )));
         }
         match self.kind {
+            QKind::F32 => gemv_bytes_f32(self.bytes(), self.m, self.n, x, out),
+            QKind::F16 => gemv_bytes_f16(self.bytes(), self.m, self.n, x, out),
             QKind::Q2_0 => gemv_q2_0(self.bytes(), self.m, self.n, x, out),
             kind => {
                 // The K-quants go through `oxillama`'s dispatcher. It already
@@ -355,7 +462,7 @@ impl QW {
                 // honest: the same code that KORE's `k_quant` reference was
                 // cross-checked against is the code that runs here.
                 let qt = QuantTensor::from_shared(
-                    self.shared.clone(),
+                    self.view()?,
                     vec![self.n, self.m],
                     kind.gguf(),
                 );
@@ -380,10 +487,58 @@ impl QW {
             .get(start..start + rb)
             .ok_or_else(|| err(&format!("'{}': row {index} is out of range", self.name)))?;
         match self.kind {
+            QKind::F32 => Ok(row
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()),
+            QKind::F16 => Ok(row
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect()),
             QKind::Q2_0 => kore_kernels::q2_0::dequantize_q2_0(row, self.m),
             kind => k_quant::dequantize(kind.type_id(), row, self.m),
         }
     }
+}
+
+/// `out[j] = dot(W row j, x)` for an unpacked f32 matrix.
+///
+/// Only the unpacked formats use this; they are what a router ships as even
+/// inside a K-quant file, and what an unquantised export is made of. The loop
+/// is written so the vectoriser can see the reduction.
+fn gemv_bytes_f32(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
+    let need = n * m * 4;
+    if w.len() < need {
+        return Err(err(&format!("f32 gemv: {} bytes < {need}", w.len())));
+    }
+    for (j, o) in out.iter_mut().enumerate().take(n) {
+        let row = &w[j * m * 4..(j + 1) * m * 4];
+        let mut acc = 0.0f32;
+        for i in 0..m {
+            let b = i * 4;
+            acc += f32::from_le_bytes([row[b], row[b + 1], row[b + 2], row[b + 3]]) * x[i];
+        }
+        *o = acc;
+    }
+    Ok(())
+}
+
+/// `out[j] = dot(W row j, x)` for an unpacked f16 matrix.
+fn gemv_bytes_f16(w: &[u8], m: usize, n: usize, x: &[f32], out: &mut [f32]) -> Result<()> {
+    let need = n * m * 2;
+    if w.len() < need {
+        return Err(err(&format!("f16 gemv: {} bytes < {need}", w.len())));
+    }
+    for (j, o) in out.iter_mut().enumerate().take(n) {
+        let row = &w[j * m * 2..(j + 1) * m * 2];
+        let mut acc = 0.0f32;
+        for i in 0..m {
+            let b = i * 2;
+            acc += half::f16::from_le_bytes([row[b], row[b + 1]]).to_f32() * x[i];
+        }
+        *o = acc;
+    }
+    Ok(())
 }
 
 struct DeltaLayer {
@@ -398,9 +553,7 @@ struct DeltaLayer {
     dt_bias: Vec<f32>, // [dt_rank]
     ssm_norm: Vec<f32>, // [head_v_dim]
     out: QW,     // [hidden, hidden]
-    ffn_gate: QW,
-    ffn_up: QW,
-    ffn_down: QW,
+    ffn: FfnW,
 }
 
 struct FullLayer {
@@ -412,14 +565,52 @@ struct FullLayer {
     q_norm: Vec<f32>, // [head_dim]
     k_norm: Vec<f32>,
     wo: QW,
-    ffn_gate: QW,
-    ffn_up: QW,
-    ffn_down: QW,
+    ffn: FfnW,
 }
 
 enum Layer {
     Delta(DeltaLayer),
     Full(FullLayer),
+}
+
+/// The feed-forward block.
+///
+/// `qwen35` has one dense SwiGLU. `qwen35moe` replaces it with a router over
+/// `n_experts` stacked experts, of which the top `n_experts_used` are evaluated,
+/// plus one always-on shared expert behind a sigmoid gate.
+enum FfnW {
+    Dense {
+        gate: QW,
+        up: QW,
+        down: QW,
+    },
+    Moe(MoeW),
+}
+
+/// A `qwen35moe` FFN.
+///
+/// The routed experts are each one 3-D tensor -- `[hidden, moe_ffn, n_experts]`
+/// for gate/up, `[moe_ffn, hidden, n_experts]` for down -- so expert `e` is a
+/// byte window into that same mapping. Nothing is copied, and an expert outside
+/// the top-k is never touched at all, which is what lets the same struct work
+/// for an all-resident file and for one whose experts stream off a disk.
+struct MoeW {
+    /// `ffn_gate_inp.weight`, `[hidden, n_experts]`.
+    router: QW,
+    gate: QW,
+    up: QW,
+    down: QW,
+    /// Bytes between consecutive experts of each stacked tensor.
+    stride_gate: usize,
+    stride_up: usize,
+    stride_down: usize,
+    n_experts: usize,
+    /// `ffn_{gate,up,down}_shexp.weight`: one dense expert, for every token.
+    shexp_gate: QW,
+    shexp_up: QW,
+    shexp_down: QW,
+    /// `ffn_gate_inp_shexp.weight`, `[hidden, 1]`: a sigmoid gate on the above.
+    shexp_router: QW,
 }
 
 // ---------- state ----------
@@ -469,33 +660,79 @@ impl Qwen35Model {
                 .map(|v| v as usize)
                 .ok_or_else(|| err(&format!("missing meta '{k}'")))
         };
-        let get_f = |k: &str, d: f64| -> f64 {
-            meta.get(k).and_then(|v| v.as_f64()).unwrap_or(d)
+        // The metadata prefix *is* the arch key, and it is not the HuggingFace
+        // tag: the family ships as `qwen35` (dense FFN) and `qwen35moe` (routed
+        // FFN), while HF calls both `qwen3_5*`. Every `qwen35.*` key below is
+        // therefore spelled under whichever prefix the file declares.
+        let arch = gg.get_str("general.architecture").unwrap_or("");
+        let moe = match arch {
+            "qwen35" => false,
+            "qwen35moe" => true,
+            other => {
+                return Err(err(&format!(
+                    "arch '{other}' is neither qwen35 nor qwen35moe"
+                )))
+            }
         };
 
-        let arch = gg.get_str("general.architecture").unwrap_or("");
-        if arch != "qwen35" {
-            return Err(err(&format!("arch '{arch}' != qwen35")));
-        }
+        let get_uk = |s: &str| -> Result<usize> {
+            meta.get(&format!("{arch}.{s}"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .ok_or_else(|| err(&format!("missing meta '{arch}.{s}'")))
+        };
+        let get_fk = |s: &str, d: f64| -> f64 {
+            meta.get(&format!("{arch}.{s}"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(d)
+        };
+
+        // A file with an MTP/nextn head declares it as extra blocks. That head
+        // is a speculative drafter, not part of the main stack, and KORE's
+        // drafter is the prompt-lookup one, so those blocks are not loaded.
+        let nextn = get_uk("nextn_predict_layers").unwrap_or(0);
+        let blocks = get_uk("block_count")?;
+        let n_layers = blocks
+            .checked_sub(nextn)
+            .ok_or_else(|| err(&format!("block_count {blocks} < nextn_predict_layers {nextn}")))?;
 
         let cfg = Qwen35Config {
-            n_layers: get_u("qwen35.block_count")?,
-            hidden: get_u("qwen35.embedding_length")?,
-            ffn: get_u("qwen35.feed_forward_length")?,
-            n_heads: get_u("qwen35.attention.head_count")?,
-            n_kv: get_u("qwen35.attention.head_count_kv")?,
-            head_dim: get_u("qwen35.attention.key_length")?,
-            rope_dim: get_u("qwen35.rope.dimension_count").unwrap_or(0),
-            theta: get_f("qwen35.rope.freq_base", 1e7) as f32,
-            eps: get_f("qwen35.attention.layer_norm_rms_eps", 1e-6) as f32,
-            full_attn_interval: get_u("qwen35.full_attention_interval")?,
-            ssm_conv: get_u("qwen35.ssm.conv_kernel")?,
-            ssm_state: get_u("qwen35.ssm.state_size")?,
-            ssm_groups: get_u("qwen35.ssm.group_count")?,
-            ssm_dt_rank: get_u("qwen35.ssm.time_step_rank")?,
-            ssm_inner: get_u("qwen35.ssm.inner_size")?,
+            prefix: arch.to_string(),
+            n_layers,
+            hidden: get_uk("embedding_length")?,
+            ffn: get_uk("feed_forward_length")?,
+            n_heads: get_uk("attention.head_count")?,
+            n_kv: get_uk("attention.head_count_kv")?,
+            head_dim: get_uk("attention.key_length")?,
+            rope_dim: get_uk("rope.dimension_count").unwrap_or(0),
+            theta: get_fk("rope.freq_base", 1e7) as f32,
+            // llama.cpp spells this `layer_norm_rms_epsilon`; `_eps` is accepted
+            // too because Bonsai's file was written with the short spelling.
+            eps: meta
+                .get(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+                .or_else(|| meta.get(&format!("{arch}.attention.layer_norm_rms_eps")))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1e-6) as f32,
+            full_attn_interval: get_uk("full_attention_interval")?,
+            ssm_conv: get_uk("ssm.conv_kernel")?,
+            ssm_state: get_uk("ssm.state_size")?,
+            ssm_groups: get_uk("ssm.group_count")?,
+            ssm_dt_rank: get_uk("ssm.time_step_rank")?,
+            ssm_inner: get_uk("ssm.inner_size")?,
+            n_experts: if moe { get_uk("expert_count")? } else { 0 },
+            n_experts_used: if moe { get_uk("expert_used_count")? } else { 0 },
+            moe_ffn: if moe {
+                get_uk("expert_feed_forward_length")?
+            } else {
+                0
+            },
+            shexp_ffn: if moe {
+                get_uk("expert_shared_feed_forward_length")?
+            } else {
+                0
+            },
             vocab: gg.tensor("token_embd.weight")?.dims[1],
-            context: get_u("qwen35.context_length").unwrap_or(8192),
+            context: get_uk("context_length").unwrap_or(8192),
             hadamard_block: get_u("prism.hadamard.block_size").unwrap_or(512),
             eos: meta
                 .get("tokenizer.ggml.eos_token_id")
@@ -558,7 +795,8 @@ impl Qwen35Model {
             let kind = QKind::from_type_id(t.type_id).ok_or_else(|| {
                 err(&format!(
                     "tensor '{name}' has GGML type {}, which this loader has no \
-                     packed kernel for (supported: Q2_0=42, Q4_K=12, Q5_K=13, Q6_K=14)",
+                     kernel for (supported: F32=0, F16=1, Q4_K=12, Q5_K=13, \
+                     Q6_K=14, Q2_0=42)",
                     t.type_id
                 ))
             })?;
@@ -575,25 +813,36 @@ impl Qwen35Model {
             }
             // Rows are packed back to back, each a whole number of blocks --
             // the layout every packed kernel assumes.
-            let want = n * (m / kind.block()) * kind.block_bytes();
-            if t.nbytes < want {
+            let row = (m / kind.block()) * kind.block_bytes();
+            let want = n * row;
+            // A stacked `[.., .., n_experts]` tensor is `n_experts` copies of
+            // that layout, one after another; the view has to span all of them
+            // even though only one expert is ever a matrix.
+            let n_experts = t.dims.get(2).copied().unwrap_or(1).max(1);
+            let total = want
+                .checked_mul(n_experts)
+                .ok_or_else(|| err(&format!("tensor '{name}': payload size overflows")))?;
+            if t.nbytes < total {
                 return Err(err(&format!(
-                    "tensor '{name}' carries {} bytes but {want} are required",
-                    t.nbytes
+                    "tensor '{name}' carries {} bytes but {total} are required \
+                     ({n} rows of {m} in {} expert slices)",
+                    t.nbytes, n_experts
                 )));
             }
             let owner: Arc<dyn ByteOwner> = Arc::new(TensorBytes {
                 gg: gg.clone(),
                 name: name.clone(),
             });
-            let shared = SharedBytes::from_owner(owner, 0, want)
-                .ok_or_else(|| err(&format!("tensor '{name}': {want} bytes out of range")))?;
+            let shared = SharedBytes::from_owner(owner.clone(), 0, total)
+                .ok_or_else(|| err(&format!("tensor '{name}': {total} bytes out of range")))?;
             Ok(QW {
                 name,
                 m,
                 n,
                 kind,
+                off: 0,
                 shared,
+                owner,
             })
         };
         let f32w = |name: &str| -> Result<Vec<f32>> { gg.tensor_f32(name) };
@@ -603,9 +852,71 @@ impl Qwen35Model {
             let p = |s: &str| format!("blk.{i}.{s}");
             let attn_norm = f32w(&p("attn_norm.weight"))?;
             let post_norm = f32w(&p("post_attention_norm.weight"))?;
-            let fg = qw(p("ffn_gate.weight"), &gg)?;
-            let fu = qw(p("ffn_up.weight"), &gg)?;
-            let fd = qw(p("ffn_down.weight"), &gg)?;
+
+            let ffn = if moe {
+                let name = p("ffn_gate_exps.weight");
+                let t = gg.tensor(&name)?;
+                if t.dims.len() != 3 {
+                    return Err(err(&format!(
+                        "'{name}' is not a stacked expert tensor \
+                         ({} dims, expected 3)",
+                        t.dims.len()
+                    )));
+                }
+                let n_experts = t.dims[2];
+                if n_experts != cfg.n_experts {
+                    return Err(err(&format!(
+                        "'{name}' stacks {n_experts} experts but the header \
+                         says {}",
+                        cfg.n_experts
+                    )));
+                }
+                let router = qw(p("ffn_gate_inp.weight"), &gg)?;
+                if router.m != cfg.hidden || router.n != cfg.n_experts {
+                    return Err(err(&format!(
+                        "router is {}x{} but the model is hidden {} with {} \
+                         experts",
+                        router.n, router.m, cfg.hidden, cfg.n_experts
+                    )));
+                }
+                let gate = qw(name.clone(), &gg)?;
+                let up = qw(p("ffn_up_exps.weight"), &gg)?;
+                let down = qw(p("ffn_down_exps.weight"), &gg)?;
+                // One expert's payload, which is also the distance to the next
+                // one; the three tensors differ because gate/up are
+                // `[hidden, moe_ffn]` per expert and down is `[moe_ffn, hidden]`.
+                let (sg, su, sd) = (gate.byte_len(), up.byte_len(), down.byte_len());
+                let span = sg
+                    .checked_mul(n_experts)
+                    .ok_or_else(|| err("expert tensor size overflows"))?;
+                if t.nbytes < span {
+                    return Err(err(&format!(
+                        "'{name}' carries {} bytes for {n_experts} experts of \
+                         {sg}",
+                        t.nbytes
+                    )));
+                }
+                FfnW::Moe(MoeW {
+                    router,
+                    gate,
+                    up,
+                    down,
+                    stride_gate: sg,
+                    stride_up: su,
+                    stride_down: sd,
+                    n_experts,
+                    shexp_gate: qw(p("ffn_gate_shexp.weight"), &gg)?,
+                    shexp_up: qw(p("ffn_up_shexp.weight"), &gg)?,
+                    shexp_down: qw(p("ffn_down_shexp.weight"), &gg)?,
+                    shexp_router: qw(p("ffn_gate_inp_shexp.weight"), &gg)?,
+                })
+            } else {
+                FfnW::Dense {
+                    gate: qw(p("ffn_gate.weight"), &gg)?,
+                    up: qw(p("ffn_up.weight"), &gg)?,
+                    down: qw(p("ffn_down.weight"), &gg)?,
+                }
+            };
 
             if (i + 1) % cfg.full_attn_interval == 0 {
                 layers.push(Layer::Full(FullLayer {
@@ -617,9 +928,7 @@ impl Qwen35Model {
                     q_norm: f32w(&p("attn_q_norm.weight"))?,
                     k_norm: f32w(&p("attn_k_norm.weight"))?,
                     wo: qw(p("attn_output.weight"), &gg)?,
-                    ffn_gate: fg,
-                    ffn_up: fu,
-                    ffn_down: fd,
+                    ffn,
                 }));
             } else {
                 layers.push(Layer::Delta(DeltaLayer {
@@ -634,9 +943,7 @@ impl Qwen35Model {
                     dt_bias: f32w(&p("ssm_dt.bias"))?,
                     ssm_norm: f32w(&p("ssm_norm.weight"))?,
                     out: qw(p("ssm_out.weight"), &gg)?,
-                    ffn_gate: fg,
-                    ffn_up: fu,
-                    ffn_down: fd,
+                    ffn,
                 }));
             }
         }
@@ -726,22 +1033,94 @@ impl Qwen35Model {
         }
     }
 
-    fn ffn(&self, x: &mut [f32], post_norm: &[f32], gate: &QW, up: &QW, down: &QW) -> Result<()> {
+    fn ffn(&self, x: &mut [f32], post_norm: &[f32], w: &FfnW) -> Result<()> {
         let mut h = vec![0.0f32; self.cfg.hidden];
         rms_norm_into(x, post_norm, self.cfg.eps, &mut h);
         self.apply_t_inv(&mut h)?;
-        let mut g = vec![0.0f32; self.cfg.ffn];
-        let mut u = vec![0.0f32; self.cfg.ffn];
-        gate.gemv(&h, &mut g)?;
-        up.gemv(&h, &mut u)?;
-        let mut act: Vec<f32> = g.iter().zip(&u).map(|(a, b)| silu(*a) * b).collect();
-        self.apply_t_inv(&mut act)?;
-        let mut o = vec![0.0f32; self.cfg.hidden];
-        down.gemv(&act, &mut o)?;
+        let o = match w {
+            FfnW::Dense { gate, up, down } => self.dense_ffn(&h, gate, up, down)?,
+            FfnW::Moe(m) => self.moe_ffn(&h, m)?,
+        };
         for (xv, ov) in x.iter_mut().zip(&o) {
             *xv += ov;
         }
         Ok(())
+    }
+
+    /// SwiGLU: `down( silu(gate h) * (up h) )`.
+    fn dense_ffn(&self, h: &[f32], gate: &QW, up: &QW, down: &QW) -> Result<Vec<f32>> {
+        let mut g = vec![0.0f32; self.cfg.ffn];
+        let mut u = vec![0.0f32; self.cfg.ffn];
+        gate.gemv(h, &mut g)?;
+        up.gemv(h, &mut u)?;
+        let mut act: Vec<f32> = g.iter().zip(&u).map(|(a, b)| silu(*a) * b).collect();
+        self.apply_t_inv(&mut act)?;
+        let mut o = vec![0.0f32; self.cfg.hidden];
+        down.gemv(&act, &mut o)?;
+        Ok(o)
+    }
+
+    /// `qwen35moe` FFN.
+    ///
+    /// Routing follows llama.cpp's `build_moe_ffn` with `LLM_FFN_SILU`, softmax
+    /// gating and `norm_w = true`: softmax over *all* experts, take the top
+    /// `n_experts_used` by probability, then renormalise those to sum to 1. The
+    /// shared expert is added afterwards, scaled by
+    /// `sigmoid(gate_inp_shexp . h)`; it is not a candidate in the top-k.
+    fn moe_ffn(&self, h: &[f32], m: &MoeW) -> Result<Vec<f32>> {
+        let cfg = &self.cfg;
+        let ne = m.n_experts;
+        let k = cfg.n_experts_used.min(ne);
+        if k == 0 {
+            return Err(err("qwen35moe: expert_used_count is zero"));
+        }
+
+        let mut probs = vec![0.0f32; ne];
+        m.router.gemv(h, &mut probs)?;
+        softmax_inplace(&mut probs);
+
+        // Descending by probability. `total_cmp` so a NaN neither panics nor
+        // silently wins the sort.
+        let mut order: Vec<usize> = (0..ne).collect();
+        order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+
+        let sum: f32 = order[..k].iter().map(|&e| probs[e]).sum();
+        let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+
+        let mut out = vec![0.0f32; cfg.hidden];
+        let mut g = vec![0.0f32; cfg.moe_ffn];
+        let mut u = vec![0.0f32; cfg.moe_ffn];
+        let mut act = vec![0.0f32; cfg.moe_ffn];
+        let mut d = vec![0.0f32; cfg.hidden];
+        for &e in &order[..k] {
+            let w = probs[e] * inv;
+            m.gate.expert(e, m.stride_gate).gemv(h, &mut g)?;
+            m.up.expert(e, m.stride_up).gemv(h, &mut u)?;
+            for i in 0..cfg.moe_ffn {
+                act[i] = silu(g[i]) * u[i];
+            }
+            self.apply_t_inv(&mut act)?;
+            m.down.expert(e, m.stride_down).gemv(&act, &mut d)?;
+            for i in 0..cfg.hidden {
+                out[i] += w * d[i];
+            }
+        }
+
+        // Shared expert: always evaluated, sigmoid-gated by its own router row.
+        let mut sg = vec![0.0f32; m.shexp_router.n];
+        m.shexp_router.gemv(h, &mut sg)?;
+        let gs = 1.0 / (1.0 + (-sg[0]).exp());
+        let mut sgate = vec![0.0f32; cfg.shexp_ffn];
+        let mut sup = vec![0.0f32; cfg.shexp_ffn];
+        m.shexp_gate.gemv(h, &mut sgate)?;
+        m.shexp_up.gemv(h, &mut sup)?;
+        let mut sact: Vec<f32> = sgate.iter().zip(&sup).map(|(a, b)| silu(*a) * b).collect();
+        self.apply_t_inv(&mut sact)?;
+        m.shexp_down.gemv(&sact, &mut d)?;
+        for i in 0..cfg.hidden {
+            out[i] += gs * d[i];
+        }
+        Ok(out)
     }
 
     fn delta_step(&self, l: &DeltaLayer, st: &mut DeltaState, x: &mut [f32]) -> Result<()> {
@@ -762,7 +1141,11 @@ impl Qwen35Model {
 
         let mut qkv = vec![0.0f32; qkv_dim];
         l.qkv.gemv(&ht, &mut qkv)?;
-        let mut z = vec![0.0f32; hidden];
+        // The output gate is one scalar per value channel, not one per hidden
+        // unit: `attn_gate` is `[hidden, n_v * d_v]`. For Bonsai and Ornith
+        // those two widths are equal, which is exactly why a `hidden`-sized
+        // buffer looked right there and is wrong here.
+        let mut z = vec![0.0f32; n_v * d_v];
         l.z.gemv(&ht, &mut z)?;
 
         let mut beta = vec![0.0f32; n_v];
@@ -988,12 +1371,12 @@ impl Qwen35Model {
                 Layer::Delta(l) => {
                     self.delta_step(l, &mut dstate[di], &mut x)?;
                     di += 1;
-                    self.ffn(&mut x, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down)?;
+                    self.ffn(&mut x, &l.post_norm, &l.ffn)?;
                 }
                 Layer::Full(l) => {
                     self.full_attn_step(l, &mut astate[ai], &mut x, pos)?;
                     ai += 1;
-                    self.ffn(&mut x, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down)?;
+                    self.ffn(&mut x, &l.post_norm, &l.ffn)?;
                 }
             }
         }
@@ -1069,9 +1452,7 @@ struct GpuDelta {
     qkv: GpuW,
     z: GpuW,
     out: GpuW,
-    ffn_gate: GpuW,
-    ffn_up: GpuW,
-    ffn_down: GpuW,
+    ffn: GpuFfn,
 }
 
 struct GpuFull {
@@ -1083,9 +1464,7 @@ struct GpuFull {
     wk: GpuW,
     wv: GpuW,
     wo: GpuW,
-    ffn_gate: GpuW,
-    ffn_up: GpuW,
-    ffn_down: GpuW,
+    ffn: GpuFfn,
 }
 
 enum GpuLayer {
@@ -1169,6 +1548,16 @@ struct GpuW {
     n: usize,
 }
 
+/// The dense feed-forward weights, resident on the device.
+///
+/// The routed `qwen35moe` FFN has no resident form yet: its experts are meant to
+/// stream, which is P6.3/P6.4, so this type only ever holds a dense SwiGLU.
+struct GpuFfn {
+    gate: GpuW,
+    up: GpuW,
+    down: GpuW,
+}
+
 /// Qwen3.5 with all weights device-resident; single-token decode via the
 /// fused Vulkan kernels. Requires `n_k == n_v` and `d_k == d_v` (true for
 /// Bonsai-2B) plus head_dim == 256.
@@ -1237,6 +1626,24 @@ impl Qwen35Gpu {
             })
         };
 
+        // A routed FFN has no resident device form: its experts are the whole
+        // reason for the streaming engine, which is not wired to the device yet.
+        // Failing here is the honest outcome -- silently building a dense FFN
+        // would run and produce wrong tokens.
+        let gpu_ffn = |w: &FfnW| -> Result<GpuFfn> {
+            match w {
+                FfnW::Dense { gate, up, down } => Ok(GpuFfn {
+                    gate: up_w(gate)?,
+                    up: up_w(up)?,
+                    down: up_w(down)?,
+                }),
+                FfnW::Moe(_) => Err(err(
+                    "qwen35moe: the device lane does not build the routed FFN yet \
+                     (it needs the streaming expert engine); use the CPU lane",
+                )),
+            }
+        };
+
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for layer in &cpu.layers {
             match layer {
@@ -1252,9 +1659,7 @@ impl Qwen35Gpu {
                     qkv: up_w(&l.qkv)?,
                     z: up_w(&l.z)?,
                     out: up_w(&l.out)?,
-                    ffn_gate: up_w(&l.ffn_gate)?,
-                    ffn_up: up_w(&l.ffn_up)?,
-                    ffn_down: up_w(&l.ffn_down)?,
+                    ffn: gpu_ffn(&l.ffn)?,
                 })),
                 Layer::Full(l) => layers.push(GpuLayer::Full(GpuFull {
                     attn_norm: up_f32(&l.attn_norm)?,
@@ -1265,9 +1670,7 @@ impl Qwen35Gpu {
                     wk: up_w(&l.wk)?,
                     wv: up_w(&l.wv)?,
                     wo: up_w(&l.wo)?,
-                    ffn_gate: up_w(&l.ffn_gate)?,
-                    ffn_up: up_w(&l.ffn_up)?,
-                    ffn_down: up_w(&l.ffn_down)?,
+                    ffn: gpu_ffn(&l.ffn)?,
                 })),
             }
         }
@@ -1368,6 +1771,9 @@ impl Qwen35Gpu {
             QKind::Q4K => b.gemv_q4_k(x, &w.t, w.n, w.m),
             QKind::Q5K => b.gemv_q5_k(x, &w.t, w.n, w.m),
             QKind::Q6K => b.gemv_q6_k(x, &w.t, w.n, w.m),
+            QKind::F32 | QKind::F16 => Err(err(
+                "unpacked F32/F16 weights have no device kernel; run the CPU lane",
+            )),
         }
     }
 
@@ -1391,9 +1797,7 @@ impl Qwen35Gpu {
         x: &Tensor,
         res: &Tensor,
         post_norm: &Tensor,
-        g: &GpuW,
-        u: &GpuW,
-        d: &GpuW,
+        w: &GpuFfn,
         ffn: usize,
         hidden: usize,
     ) -> Result<(Tensor, Tensor)> {
@@ -1409,12 +1813,12 @@ impl Qwen35Gpu {
             self.signs_or_placeholder(hidden)?,
             self.cfg.eps,
         )?;
-        let gv = self.wgemv(g, &ht)?;
-        let uv = self.wgemv(u, &ht)?;
+        let gv = self.wgemv(&w.gate, &ht)?;
+        let uv = self.wgemv(&w.up, &ht)?;
         // Fused SwiGLU [+ Hadamard] (the second half of the FFN's activation pair).
         let signs_ffn = self.signs_or_placeholder(ffn)?;
         let (_gv, _uv, actt) = b.had_pre(2, self.folded, &gv, &uv, signs_ffn, signs_ffn, self.cfg.eps)?;
-        let down = self.wgemv(d, &actt)?;
+        let down = self.wgemv(&w.down, &actt)?;
         Ok((x_r, down))
     }
 
@@ -1457,7 +1861,8 @@ impl Qwen35Gpu {
                     let o = b.gdn_step(&conv_out, &z, state, &beta, &gate, &l.ssm_norm, n_v, n_k, d_k, d_v, cfg.eps)?;
                     let ot = self.had_fwd(&o)?;
                     let proj = self.wgemv(&l.out, &ot)?;
-                    let (x_next, down) = self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
+                    let (x_next, down) =
+                        self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn, ffn, hidden)?;
                     x = x_next;
                     pending = down;
                 }
@@ -1510,7 +1915,8 @@ impl Qwen35Gpu {
 
                     let (_a, _bv, ot) = b.had_pre(3, self.folded, &attn, &g, self.signs_or_placeholder(hidden)?, self.signs_or_placeholder(hidden)?, cfg.eps)?;
                     let proj = self.wgemv(&l.wo, &ot)?;
-                    let (x_next, down) = self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
+                    let (x_next, down) =
+                        self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn, ffn, hidden)?;
                     x = x_next;
                     pending = down;
                 }
@@ -1772,16 +2178,8 @@ impl Qwen35Gpu {
                     // weight once for all columns.
                     let ot = self.had_fwd(&o)?;
                     let proj = self.wgemv(&l.out, &ot)?;
-                    let (x_next, down) = self.ffn_gpu(
-                        &x_r,
-                        &proj,
-                        &l.post_norm,
-                        &l.ffn_gate,
-                        &l.ffn_up,
-                        &l.ffn_down,
-                        ffn,
-                        hidden,
-                    )?;
+                    let (x_next, down) =
+                        self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn, ffn, hidden)?;
                     x = x_next;
                     pending = down;
                 }
@@ -1868,16 +2266,8 @@ impl Qwen35Gpu {
 
                     let (_a, _bv, ot) = b.had_pre(3, self.folded, &attn, &g, signs_h, signs_h, cfg.eps)?;
                     let proj = self.wgemv(&l.wo, &ot)?;
-                    let (x_next, down) = self.ffn_gpu(
-                        &x_r,
-                        &proj,
-                        &l.post_norm,
-                        &l.ffn_gate,
-                        &l.ffn_up,
-                        &l.ffn_down,
-                        ffn,
-                        hidden,
-                    )?;
+                    let (x_next, down) =
+                        self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn, ffn, hidden)?;
                     x = x_next;
                     pending = down;
                 }
