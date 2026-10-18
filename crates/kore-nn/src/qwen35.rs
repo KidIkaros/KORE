@@ -1715,6 +1715,34 @@ struct GpuMoe {
     shexp_down: GpuW,
     n_experts: usize,
     n_used: usize,
+    /// Gather target for the token's `n_used` expert `gate` matrices.
+    ///
+    /// Expert columns live in independent LRU slots, so they are not adjacent in
+    /// memory and cannot feed one matvec. Collecting them here -- one
+    /// device-to-device copy per expert, inside the same batch -- makes them a
+    /// single `[n_used * n, blocks]` matrix, and the matvec that follows is one
+    /// dispatch at `n_used` times the row count instead of `n_used` dispatches.
+    /// The win is dispatch count, which is the host's binding cost: measured on
+    /// POCKET the step's `submit` region drops 297 ms -> 88 ms per 8 tokens,
+    /// while the queue drain (device time) is unchanged. The number of bytes
+    /// moved is identical either way -- this is not a bandwidth optimisation.
+    gate_stage: Tensor,
+    up_stage: Tensor,
+    /// One activation row per expert, split out of the batched SwiGLU output so
+    /// each `down` matvec sees exactly its own 512-wide input.
+    ///
+    /// `down` is deliberately *not* batched: one expert's `down` is already 2048
+    /// rows, which is past the point where the kernel reaches its bandwidth
+    /// ceiling, so stacking them buys dispatch count and nothing else.
+    act_rows: Vec<Tensor>,
+    /// Row count / row width of an `moe_ffn` expert matrix.
+    ffn_rows: usize,
+    ffn_cols: usize,
+    /// Bytes of one expert matrix, as uploaded.
+    ffn_bytes: usize,
+    /// Whether the batched expert path may run (every expert uses a K-quant the
+    /// concatenation trick is valid for).
+    can_batch: bool,
     /// Host-side wall clock accumulated by the routed FFN, split by region.
     ///
     /// Only the *host* half of each region shows up here: a `gemv` costs one
@@ -2027,6 +2055,36 @@ impl Qwen35Gpu {
                             cfg.n_experts_used,
                         )?))
                     };
+                    let n_used = cfg.n_experts_used.min(m.n_experts);
+                    // A zeroed device buffer of `n_used` expert matrices. Wasteful
+                    // to write 220 MB of zeros at load, but it is the only way to
+                    // get one buffer the batched matvec can read without adding an
+                    // allocation call to the backend.
+                    let stage = |host: &QW| -> Result<Tensor> {
+                        let bytes = host.byte_len().checked_mul(n_used).ok_or_else(|| {
+                            err(&format!("'{}': expert stage overflows usize", host.name))
+                        })?;
+                        let s = Storage::from_bytes(DType::U8, bytes, vec![0u8; bytes])?;
+                        Tensor::from_storage(s, &[bytes])
+                            .to(device)
+                            .map_err(|e| err(&format!("expert stage upload: {e}")))
+                    };
+                    // The concatenation is only a valid `[n_used * n, blocks]`
+                    // matrix when every expert's payload is a whole number of
+                    // rows laid end to end -- true for the K-quant families,
+                    // whose blocks are uniform. Q2_0's repack pads each expert to
+                    // a multiple of four rows, which would only line up by luck.
+                    let can_batch = matches!(
+                        m.gate.kind,
+                        QKind::Q2K | QKind::Q3K | QKind::Q4K | QKind::Q5K | QKind::Q6K
+                    ) && n_used > 1;
+                    let act_rows = (0..n_used)
+                        .map(|_| {
+                            Tensor::from_f32(&vec![0.0f32; m.gate.n], &[m.gate.n])
+                                .to(device)
+                                .map_err(|e| err(&format!("expert act row upload: {e}")))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
                     Ok(GpuFfn::Moe(GpuMoe {
                         router: m.router.clone(),
                         shexp_router: m.shexp_router.clone(),
@@ -2037,7 +2095,14 @@ impl Qwen35Gpu {
                         shexp_up: up_w(&m.shexp_up)?,
                         shexp_down: up_w(&m.shexp_down)?,
                         n_experts: m.n_experts,
-                        n_used: cfg.n_experts_used.min(m.n_experts),
+                        n_used,
+                        gate_stage: stage(&m.gate)?,
+                        up_stage: stage(&m.up)?,
+                        act_rows,
+                        ffn_rows: m.gate.n,
+                        ffn_cols: m.gate.m,
+                        ffn_bytes: m.gate.byte_len(),
+                        can_batch,
                         times: Mutex::new(MoeTimes::default()),
                     }))
                 }
@@ -2222,14 +2287,23 @@ impl Qwen35Gpu {
     }
 
     fn wgemv(&self, w: &GpuW, x: &Tensor) -> Result<Tensor> {
+        self.wgemv_at(w.kind, &w.t, w.n, w.m, x)
+    }
+
+    /// Matvec against an explicitly-sized weight buffer.
+    ///
+    /// The routed FFN gathers several experts' matrices into one contiguous
+    /// buffer, which is a `[k * rows, cols]` weight the `GpuW` it came from does
+    /// not describe. Everything else about the dispatch is unchanged.
+    fn wgemv_at(&self, kind: QKind, t: &Tensor, n: usize, k: usize, x: &Tensor) -> Result<Tensor> {
         let b = &self.backend;
-        match w.kind {
-            QKind::Q2_0 => b.gemv_q2_0(x, &w.t, w.n, w.m),
-            QKind::Q2K => b.gemv_q2_k(x, &w.t, w.n, w.m),
-            QKind::Q3K => b.gemv_q3_k(x, &w.t, w.n, w.m),
-            QKind::Q4K => b.gemv_q4_k(x, &w.t, w.n, w.m),
-            QKind::Q5K => b.gemv_q5_k(x, &w.t, w.n, w.m),
-            QKind::Q6K => b.gemv_q6_k(x, &w.t, w.n, w.m),
+        match kind {
+            QKind::Q2_0 => b.gemv_q2_0(x, t, n, k),
+            QKind::Q2K => b.gemv_q2_k(x, t, n, k),
+            QKind::Q3K => b.gemv_q3_k(x, t, n, k),
+            QKind::Q4K => b.gemv_q4_k(x, t, n, k),
+            QKind::Q5K => b.gemv_q5_k(x, t, n, k),
+            QKind::Q6K => b.gemv_q6_k(x, t, n, k),
             QKind::F32 | QKind::F16 => Err(err(
                 "unpacked F32/F16 weights have no device kernel; run the CPU lane",
             )),
@@ -2340,26 +2414,89 @@ impl Qwen35Gpu {
         let signs = self.signs_or_placeholder(cfg.moe_ffn)?;
         let mut acc: Option<Tensor> = None;
         let (mut upload_us, mut compute_us) = (0u64, 0u64);
-        for (e, weight) in picks {
+
+        // Ablation switch: `KORE_MOE_BATCH=0` forces the one-expert-at-a-time
+        // path so the two can be timed against the same input.
+        let batch = m.can_batch
+            && std::env::var("KORE_MOE_BATCH")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        if batch {
             let t_up = Instant::now();
-            let gate = bank_expert(&m.gate, e, &**b, self.device)?;
-            let up = bank_expert(&m.up, e, &**b, self.device)?;
-            let down = bank_expert(&m.down, e, &**b, self.device)?;
+            let mut gs = Vec::with_capacity(picks.len());
+            let mut us = Vec::with_capacity(picks.len());
+            let mut ds = Vec::with_capacity(picks.len());
+            for (e, _) in &picks {
+                gs.push(bank_expert(&m.gate, *e, &**b, self.device)?);
+                us.push(bank_expert(&m.up, *e, &**b, self.device)?);
+                ds.push(bank_expert(&m.down, *e, &**b, self.device)?);
+            }
             upload_us += t_up.elapsed().as_micros() as u64;
 
             let t_c = Instant::now();
-            let gv = self.wgemv(&gate, ht)?;
-            let uv = self.wgemv(&up, ht)?;
+            // Gather: one copy per expert, in the same batch as the dispatch
+            // that reads the result.
+            for (i, (g, u)) in gs.iter().zip(us.iter()).enumerate() {
+                b.copy_buffer_range(&m.gate_stage, i * m.ffn_bytes, &g.t, 0, m.ffn_bytes)?;
+                b.copy_buffer_range(&m.up_stage, i * m.ffn_bytes, &u.t, 0, m.ffn_bytes)?;
+            }
+            let rows = picks.len() * m.ffn_rows;
+            let gv = self.wgemv_at(gs[0].kind, &m.gate_stage, rows, m.ffn_cols, ht)?;
+            let uv = self.wgemv_at(us[0].kind, &m.up_stage, rows, m.ffn_cols, ht)?;
+            // Same elementwise SwiGLU, one row per expert: the result is
+            // bit-identical to running it per expert, since nothing crosses a
+            // row boundary.
+            let gv = gv.reshape(&[picks.len() as isize, m.ffn_rows as isize])?;
+            let uv = uv.reshape(&[picks.len() as isize, m.ffn_rows as isize])?;
             let (_g, _u, act) = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?;
-            // `down` is linear, so scaling the activation is the same arithmetic
-            // as scaling its 2048-wide output, for a quarter of the dispatch.
-            let act = b.mul_scalar(&act, weight)?;
-            let dv = self.wgemv(&down, &act)?;
-            acc = Some(match acc {
-                Some(a) => b.add(&a, &dv)?,
-                None => dv,
-            });
+            // The router weight is a per-expert scalar. Scale the whole block in
+            // one dispatch instead of one per expert; `down` is linear, so this
+            // is the same arithmetic as scaling its 2048-wide output.
+            let scales = Tensor::from_f32(
+                &picks.iter().map(|(_, w)| *w).collect::<Vec<f32>>(),
+                &[picks.len()],
+            )
+            .to(self.device)
+            .map_err(|e| err(&format!("expert weight upload: {e}")))?;
+            let act = b.mul_rows(&act, &scales, picks.len(), m.ffn_rows)?;
+            // `down` per expert: its input is that expert's 512-wide row.
+            for (i, a) in m.act_rows.iter().enumerate().take(picks.len()) {
+                b.copy_buffer_range(a, 0, &act, i * m.ffn_rows * 4, m.ffn_rows * 4)?;
+            }
+            // `down` stays one dispatch per expert, and so does the fold: staging
+            // the `down` outputs and summing them in one kernel was measured
+            // against this add chain and lost (the extra copies cost more than
+            // the seven adds they replace).
+            for (i, d) in ds.iter().enumerate().take(picks.len()) {
+                let dv = self.wgemv(d, &m.act_rows[i])?;
+                acc = Some(match acc {
+                    Some(a) => b.add(&a, &dv)?,
+                    None => dv,
+                });
+            }
             compute_us += t_c.elapsed().as_micros() as u64;
+        } else {
+            for (e, weight) in picks {
+                let t_up = Instant::now();
+                let gate = bank_expert(&m.gate, e, &**b, self.device)?;
+                let up = bank_expert(&m.up, e, &**b, self.device)?;
+                let down = bank_expert(&m.down, e, &**b, self.device)?;
+                upload_us += t_up.elapsed().as_micros() as u64;
+
+                let t_c = Instant::now();
+                let gv = self.wgemv(&gate, ht)?;
+                let uv = self.wgemv(&up, ht)?;
+                let (_g, _u, act) = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?;
+                // `down` is linear, so scaling the activation is the same arithmetic
+                // as scaling its 2048-wide output, for a quarter of the dispatch.
+                let act = b.mul_scalar(&act, weight)?;
+                let dv = self.wgemv(&down, &act)?;
+                acc = Some(match acc {
+                    Some(a) => b.add(&a, &dv)?,
+                    None => dv,
+                });
+                compute_us += t_c.elapsed().as_micros() as u64;
+            }
         }
 
         let t_c = Instant::now();
@@ -3308,5 +3445,134 @@ mod weight_path_tests {
         assert_eq!(bank.misses(), 5, "five uploads for six acquisitions");
         assert_eq!(bank.hits(), 1, "the repeat must hit the pool, not the file");
         assert_eq!(bank.uploaded(), (per * 5) as u64);
+    }
+
+    /// The P6.7 gate: gathering k experts into one contiguous stage and running
+    /// a single `k * n`-row matvec must reproduce k separate `n`-row matvecs bit
+    /// for bit.
+    ///
+    /// This is the assumption the batched routed FFN rests on -- that k stacked
+    /// expert matrices *are* one `[k * n, blocks]` matrix, so the row a kernel
+    /// reads is the same row it would have read from the expert's own buffer.
+    /// The reduction inside a row is untouched by `n`, so a difference here can
+    /// only be addressing.
+    #[test]
+    fn batched_expert_gather_matches_one_at_a_time() {
+        let device = Device::Vulkan(0);
+        let Ok(vk) = kore_vulkan::VulkanBackend::new() else {
+            println!("no Vulkan backend available; skipping");
+            return;
+        };
+        let backend: Arc<dyn DeviceBackend> = Arc::new(vk);
+        assert!(get_backend(device).is_some(), "backend did not register");
+
+        let (n_experts, m, n) = (4usize, 256usize, 8usize);
+        let host = stacked_q4k(n_experts, m, n);
+        let per = host.byte_len();
+
+        let mut resident = Vec::with_capacity(n_experts);
+        for e in 0..n_experts {
+            let bytes = host.expert(e, per).bytes().to_vec();
+            let len = bytes.len();
+            let t = Tensor::from_storage(
+                Storage::from_bytes(DType::U8, len, bytes).expect("host storage"),
+                &[len],
+            )
+            .to(device)
+            .expect("resident upload");
+            resident.push(GpuW {
+                t,
+                kind: QKind::Q4K,
+                m,
+                n,
+            });
+        }
+
+        let x: Vec<f32> = (0..m).map(|i| ((i % 17) as f32 - 8.0) * 0.03125).collect();
+        let xt = Tensor::from_f32(&x, &[1, m]).to(device).expect("upload x");
+        let read = |t: Tensor| -> Vec<f32> {
+            t.to(Device::Cpu)
+                .expect("readback")
+                .as_f32_slice()
+                .expect("f32 output")
+                .to_vec()
+        };
+
+        let want: Vec<Vec<f32>> = resident
+            .iter()
+            .map(|w| read(backend.gemv_q4_k(&xt, &w.t, n, m).expect("gemv")))
+            .collect();
+        assert!(want[0].iter().any(|v| *v != 0.0), "fixture is all zero");
+
+        let stage = Tensor::from_storage(
+            Storage::from_bytes(DType::U8, per * n_experts, vec![0u8; per * n_experts])
+                .expect("stage storage"),
+            &[per * n_experts],
+        )
+        .to(device)
+        .expect("stage upload");
+        for (e, w) in resident.iter().enumerate() {
+            backend
+                .copy_buffer_range(&stage, e * per, &w.t, 0, per)
+                .expect("gather");
+        }
+
+        let got = read(
+            backend
+                .gemv_q4_k(&xt, &stage, n_experts * n, m)
+                .expect("batched gemv"),
+        );
+        assert_eq!(got.len(), n_experts * n);
+        for e in 0..n_experts {
+            for i in 0..n {
+                assert_eq!(
+                    got[e * n + i].to_bits(),
+                    want[e][i].to_bits(),
+                    "expert {e} lane {i}: batched {} != single {}",
+                    got[e * n + i],
+                    want[e][i]
+                );
+            }
+        }
+    }
+
+    /// Per-row scaling replaces one `mul_scalar` dispatch per expert with one
+    /// per layer, so it has to be the same arithmetic, bit for bit.
+    #[test]
+    fn mul_rows_matches_per_row_scalar_multiply() {
+        let device = Device::Vulkan(0);
+        let Ok(vk) = kore_vulkan::VulkanBackend::new() else {
+            println!("no Vulkan backend available; skipping");
+            return;
+        };
+        let backend: Arc<dyn DeviceBackend> = Arc::new(vk);
+        assert!(get_backend(device).is_some(), "backend did not register");
+
+        let (k, cols) = (4usize, 8usize);
+        let act: Vec<f32> = (0..k * cols).map(|i| (i as f32 - 7.0) * 0.1875).collect();
+        let scales: Vec<f32> = vec![0.5, -1.25, 0.03125, 2.0];
+
+        let at = Tensor::from_f32(&act, &[k, cols])
+            .to(device)
+            .expect("upload");
+        let st = Tensor::from_f32(&scales, &[k]).to(device).expect("upload");
+        let scaled = backend
+            .mul_rows(&at, &st, k, cols)
+            .expect("mul_rows")
+            .to(Device::Cpu)
+            .expect("readback")
+            .as_f32_slice()
+            .expect("f32")
+            .to_vec();
+        for e in 0..k {
+            for j in 0..cols {
+                let want = act[e * cols + j] * scales[e];
+                assert_eq!(
+                    scaled[e * cols + j].to_bits(),
+                    want.to_bits(),
+                    "row {e} col {j}"
+                );
+            }
+        }
     }
 }

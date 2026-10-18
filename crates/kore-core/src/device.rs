@@ -269,6 +269,40 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Copy `len` bytes from `src[src_offset..]` into `dst[dst_offset..]` on device.
+    ///
+    /// The whole-tensor [`copy_buffer`](Self::copy_buffer) cannot express the
+    /// gather the routed FFN needs: expert columns live in independent slot
+    /// buffers and have to be collected into one contiguous stage before a
+    /// single batched matvec can read them.
+    fn copy_buffer_range(
+        &self,
+        _dst: &crate::Tensor,
+        _dst_offset: usize,
+        _src: &crate::Tensor,
+        _src_offset: usize,
+        _len: usize,
+    ) -> crate::Result<()> {
+        Err(crate::KoreError::StorageError(format!(
+            "copy_buffer_range not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Scale row `r` of `x` (`[rows, cols]`) by `scales[r]`.
+    fn mul_rows(
+        &self,
+        _x: &crate::Tensor,
+        _scales: &crate::Tensor,
+        _rows: usize,
+        _cols: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "mul_rows not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Append `new_rows` (`[num_new, cols]`) into preallocated `cache_buf` (`[max_rows, cols]`)
     /// at `row_offset`, returning a tensor view of shape `[row_offset + num_new, cols]`.
     fn kv_cache_append(

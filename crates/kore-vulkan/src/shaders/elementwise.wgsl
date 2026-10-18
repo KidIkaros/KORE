@@ -32,6 +32,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             C[idx] = (g_val / (1.0 + exp(-g_val))) * u_val;
             return;
         }
+        if (params.op_type == 11u) {
+            // Per-row scale: `a_numel` is the row width, so every element of row
+            // r is multiplied by `B[r]`. One dispatch scales an [rows, cols]
+            // activation block that the routed FFN would otherwise scale once
+            // per expert.
+            C[idx] = A[idx] * B[idx / params.a_numel];
+            return;
+        }
         var a_idx = idx;
         if (params.a_numel != params.numel) {
             a_idx = idx % params.a_numel;

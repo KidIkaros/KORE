@@ -441,15 +441,52 @@ struct QkNormRopeUniforms {
     rows: u32,
 }
 
+/// How many commands may queue before the batch is flushed.
+///
+/// This is a *pipelining* knob, not a memory one. Every flush is a
+/// `queue.submit`, and enough submissions in flight make the next one wait for
+/// an earlier fence -- so a small limit serialises the host against the GPU.
+/// At 48 the routed FFN flushed roughly once per layer, which is exactly the
+/// host/device turn-taking the step already exhibits. The uniform ring holds
+/// 2048 slots, so anything below that cannot overwrite a uniform a queued
+/// dispatch still reads.
+///
+/// Raising it was measured and does not help: at 512 the `submit` region drops
+/// 280 ms -> 69 ms per 8 tokens but the queue drain (`download`) rises by the
+/// same 210 ms, because that time is the GPU's work surfacing earlier, not time
+/// the host was wasting. The sum is flat to within the run-to-run spread.
+const BATCH_OPS: usize = 48;
+
 struct QueuedDispatch {
     pipeline: Arc<wgpu::ComputePipeline>,
     bind_group: wgpu::BindGroup,
     workgroups: (u32, u32, u32),
 }
 
+/// One queued command. Copies share the queue with dispatches so a
+/// device-to-device move is ordered against the compute around it without a
+/// separate submit -- which is what lets the routed FFN gather expert columns
+/// into a contiguous stage inside the same batch.
+enum BatchOp {
+    Dispatch(QueuedDispatch),
+    Copy {
+        src: Arc<wgpu::Buffer>,
+        src_offset: u64,
+        dst: Arc<wgpu::Buffer>,
+        dst_offset: u64,
+        size: u64,
+    },
+}
+
+impl BatchOp {
+    fn is_dispatch(&self) -> bool {
+        matches!(self, BatchOp::Dispatch(_))
+    }
+}
+
 /// Batched compute dispatches, uniform ring buffer, and pipeline layout cache state.
 struct PendingBatch {
-    dispatches: Vec<QueuedDispatch>,
+    ops: Vec<BatchOp>,
     uniform_cursor: usize,
     uniform_buffers: Vec<Arc<wgpu::Buffer>>,
     uniform_data: Vec<Vec<u8>>,
@@ -457,23 +494,48 @@ struct PendingBatch {
 }
 
 impl PendingBatch {
-    /// Encode all queued compute dispatches into a SINGLE `wgpu::ComputePass` on a `CommandEncoder`.
+    /// Encode the queued commands into one `CommandEncoder`.
+    ///
+    /// Dispatches run in a single merged compute pass; a copy forces a pass
+    /// boundary, so the ops are walked in order and split into runs. Copies are
+    /// rare (one gather per expert matrix per layer), and a pass boundary is
+    /// cheap next to the submit it replaces.
     fn take_encoder(&mut self, device: &wgpu::Device) -> Option<wgpu::CommandEncoder> {
-        if self.dispatches.is_empty() {
+        if self.ops.is_empty() {
             return None;
         }
+        let ops = std::mem::take(&mut self.ops);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("kore_batched_encoder"),
         });
-        {
+        let mut i = 0;
+        while i < ops.len() {
+            if let BatchOp::Copy {
+                src,
+                src_offset,
+                dst,
+                dst_offset,
+                size,
+            } = &ops[i]
+            {
+                encoder.copy_buffer_to_buffer(src, *src_offset, dst, *dst_offset, *size);
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < ops.len() && ops[i].is_dispatch() {
+                i += 1;
+            }
             let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("kore_merged_compute_pass"),
                 timestamp_writes: None,
             });
-            for cmd in self.dispatches.drain(..) {
-                cpass.set_pipeline(&cmd.pipeline);
-                cpass.set_bind_group(0, &cmd.bind_group, &[]);
-                cpass.dispatch_workgroups(cmd.workgroups.0, cmd.workgroups.1, cmd.workgroups.2);
+            for op in &ops[start..i] {
+                if let BatchOp::Dispatch(cmd) = op {
+                    cpass.set_pipeline(&cmd.pipeline);
+                    cpass.set_bind_group(0, &cmd.bind_group, &[]);
+                    cpass.dispatch_workgroups(cmd.workgroups.0, cmd.workgroups.1, cmd.workgroups.2);
+                }
             }
         }
         Some(encoder)
@@ -1123,7 +1185,7 @@ impl VulkanBackend {
         ));
 
         let batch = Arc::new(parking_lot::Mutex::new(PendingBatch {
-            dispatches: Vec::with_capacity(1024),
+            ops: Vec::with_capacity(1024),
             uniform_cursor: 0,
             uniform_buffers: Vec::with_capacity(2048),
             uniform_data: Vec::with_capacity(2048),
@@ -1196,7 +1258,7 @@ impl VulkanBackend {
             return;
         }
         let mut batch = self.batch.lock();
-        if batch.dispatches.len() >= 48 {
+        if batch.ops.len() >= BATCH_OPS {
             if let Some(enc) = batch.take_encoder(&self.device) {
                 crate::buffer::submit_with_reclaim(&self.queue, enc);
             }
@@ -1259,11 +1321,91 @@ impl VulkanBackend {
             entries: &entries,
         });
 
-        batch.dispatches.push(QueuedDispatch {
+        batch.ops.push(BatchOp::Dispatch(QueuedDispatch {
             pipeline: Arc::clone(pipeline),
             bind_group,
             workgroups,
+        }));
+    }
+
+    /// Queue a device-to-device copy into the same batch as the dispatches.
+    ///
+    /// `wgpu::Queue::copy_buffer_to_buffer` would order against the *next*
+    /// submit, which is too late for a gather that the very next dispatch
+    /// reads. Recording it into the batch keeps it ordered against the compute
+    /// around it and costs no extra submit.
+    pub fn record_copy(
+        &self,
+        src: &Arc<wgpu::Buffer>,
+        src_offset: u64,
+        dst: &Arc<wgpu::Buffer>,
+        dst_offset: u64,
+        size: u64,
+    ) {
+        let mut batch = self.batch.lock();
+        if batch.ops.len() >= BATCH_OPS {
+            if let Some(enc) = batch.take_encoder(&self.device) {
+                crate::buffer::submit_with_reclaim(&self.queue, enc);
+            }
+        }
+        batch.ops.push(BatchOp::Copy {
+            src: Arc::clone(src),
+            src_offset,
+            dst: Arc::clone(dst),
+            dst_offset,
+            size,
         });
+    }
+
+    /// Copy `len` bytes between two device tensors at the given byte offsets.
+    pub fn copy_buffer_range(
+        &self,
+        dst: &Tensor,
+        dst_offset: usize,
+        src: &Tensor,
+        src_offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        let (dst_len, src_len) = (dst.storage_ref().nbytes(), src.storage_ref().nbytes());
+        if dst_offset + len > dst_len || src_offset + len > src_len {
+            return Err(VulkanError::ShapeMismatch {
+                op: "copy_buffer_range".into(),
+                lhs: vec![dst_offset + len, dst_len],
+                rhs: vec![src_offset + len, src_len],
+            });
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        const ALIGN: usize = 4;
+        if !len.is_multiple_of(ALIGN)
+            || !src_offset.is_multiple_of(ALIGN)
+            || !dst_offset.is_multiple_of(ALIGN)
+        {
+            return Err(VulkanError::UnsupportedOperation(
+                "copy_buffer_range: offsets and length must be 4-byte aligned".into(),
+            ));
+        }
+        let src_buf = KoreVulkanBuffer::from_storage(
+            src.storage_ref(),
+            src.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let dst_buf = KoreVulkanBuffer::from_storage(
+            dst.storage_ref(),
+            dst.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        self.record_copy(
+            src_buf.arc_buffer(),
+            src_offset as u64,
+            dst_buf.arc_buffer(),
+            dst_offset as u64,
+            len as u64,
+        );
+        Ok(())
     }
 
     /// Flush any pending batched GPU commands to the queue.
@@ -1487,6 +1629,68 @@ impl VulkanBackend {
     /// Element-wise scalar multiplication: C = A * scalar
     pub fn mul_scalar(&self, a: &Tensor, scalar: f32) -> Result<Tensor> {
         self.elementwise_scalar(a, scalar, 5)
+    }
+
+    /// Scale each row of `a` by the matching entry of `scales`.
+    ///
+    /// `a` is `[rows, cols]` (flattened), `scales` is `[rows]`. This is the
+    /// routed FFN's per-expert gate weight applied to a block of activations
+    /// that were computed in one batched matvec.
+    pub fn mul_rows(
+        &self,
+        a: &Tensor,
+        scales: &Tensor,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Tensor> {
+        if rows * cols != a.numel() {
+            return Err(VulkanError::ShapeMismatch {
+                op: "mul_rows".into(),
+                lhs: vec![rows, cols],
+                rhs: a.shape().dims().to_vec(),
+            });
+        }
+        if scales.numel() != rows {
+            return Err(VulkanError::ShapeMismatch {
+                op: "mul_rows".into(),
+                lhs: vec![scales.numel()],
+                rhs: vec![rows],
+            });
+        }
+        let a_shape = a.shape().dims();
+        let a_buf =
+            KoreVulkanBuffer::from_storage(a.storage_ref(), a_shape, &self.device, &self.queue)?;
+        let s_buf = KoreVulkanBuffer::from_storage(
+            scales.storage_ref(),
+            scales.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+
+        let numel = rows * cols;
+        let out_bytes = (numel * std::mem::size_of::<f32>()).max(4);
+        let c_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_mul_rows_out");
+        let uniforms = ElementwiseUniforms {
+            numel: numel as u32,
+            op_type: 11,
+            scalar: 0.0,
+            a_numel: cols as u32,
+            b_numel: rows as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+        let workgroups = (numel as u32).div_ceil(256).max(1);
+        self.record_dispatch(
+            &self.elementwise_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[a_buf.arc_buffer(), s_buf.arc_buffer(), &c_buffer],
+            (workgroups, 1, 1),
+            "elem_mul_rows_pass",
+        );
+        let c_kore_buf = KoreVulkanBuffer::new(c_buffer, DType::F32, a_shape.to_vec());
+        Ok(self.make_tensor(c_kore_buf, a_shape))
     }
 
     /// Element-wise SiLU activation: C = silu(A) = A / (1 + exp(-A))
@@ -4272,6 +4476,29 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
 
     fn copy_buffer(&self, dst: &Tensor, src: &Tensor) -> kore_core::Result<()> {
         self.copy_buffer(dst, src)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn copy_buffer_range(
+        &self,
+        dst: &Tensor,
+        dst_offset: usize,
+        src: &Tensor,
+        src_offset: usize,
+        len: usize,
+    ) -> kore_core::Result<()> {
+        self.copy_buffer_range(dst, dst_offset, src, src_offset, len)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn mul_rows(
+        &self,
+        x: &Tensor,
+        scales: &Tensor,
+        rows: usize,
+        cols: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.mul_rows(x, scales, rows, cols)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
