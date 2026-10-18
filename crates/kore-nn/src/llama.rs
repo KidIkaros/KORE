@@ -1136,19 +1136,36 @@ impl LlamaModel {
         })?;
         let meta = &gguf.file.metadata;
 
+        // Every hyperparameter key is namespaced by `general.architecture`, not
+        // by the family this module happens to have been written for. Qwen2 and
+        // Qwen3 use the same tensor naming and block structure as llama --
+        // qwen2 only adds q/k/v biases (handled below), qwen3 only adds per-head
+        // q/k norms (still refused by name) -- so the prefix was the blocker.
+        let arch = meta
+            .get("general.architecture")
+            .and_then(|v| v.as_str())
+            .unwrap_or("llama")
+            .to_string();
+        let key = |suffix: &str| format!("{arch}.{suffix}");
+
         let total_layers = meta
-            .get("llama.block_count")
+            .get(&key("block_count"))
             .and_then(|v| v.as_u32())
-            .ok_or_else(|| KoreError::StorageError("missing llama.block_count in GGUF".into()))?
-            as usize;
+            .ok_or_else(|| {
+                KoreError::StorageError(
+                    "missing GGUF metadata: general.architecture block_count".into(),
+                )
+            })? as usize;
 
         let num_layers = max_layers.unwrap_or(total_layers).min(total_layers);
 
         let hidden_size = meta
-            .get("llama.embedding_length")
+            .get(&key("embedding_length"))
             .and_then(|v| v.as_u32())
             .ok_or_else(|| {
-                KoreError::StorageError("missing llama.embedding_length in GGUF".into())
+                KoreError::StorageError(
+                    "the file has neither {arch}.embedding_length nor an embedding tensor".into(),
+                )
             })? as usize;
 
         let vocab_size = meta
@@ -1162,35 +1179,43 @@ impl LlamaModel {
             .unwrap_or(32000);
 
         let num_attention_heads = meta
-            .get("llama.attention.head_count")
+            .get(&key("attention.head_count"))
             .and_then(|v| v.as_u32())
             .ok_or_else(|| {
-                KoreError::StorageError("missing llama.attention.head_count in GGUF".into())
+                KoreError::StorageError(
+                    "the file has neither {arch}.attention.head_count nor a head count".into(),
+                )
             })? as usize;
 
         let num_key_value_heads = meta
-            .get("llama.attention.head_count_kv")
+            .get(&key("attention.head_count_kv"))
             .and_then(|v| v.as_u32())
             .map(|v| v as usize)
             .unwrap_or(num_attention_heads);
 
         let intermediate_size = meta
-            .get("llama.feed_forward_length")
+            .get(&key("feed_forward_length"))
             .and_then(|v| v.as_u32())
             .map(|v| v as usize)
             .unwrap_or(hidden_size * 4);
 
         let rms_norm_eps = meta
-            .get("llama.attention.layer_norm_rms_epsilon")
+            .get(&key("attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
             .unwrap_or(1e-5);
 
         let rope_theta = meta
-            .get("llama.rope.freq_base")
+            .get(&key("rope.freq_base"))
             .and_then(|v| v.as_f32())
             .unwrap_or(10000.0);
 
-        let head_dim = hidden_size / num_attention_heads;
+        // `key_length` is optional and equals `hidden / heads` on every arch
+        // that omits it, so reading it only matters where it doesn't.
+        let head_dim = meta
+            .get(&key("attention.key_length"))
+            .and_then(|v| v.as_u32())
+            .map(|v| v as usize)
+            .unwrap_or(hidden_size / num_attention_heads);
 
         let config = LlamaConfig {
             vocab_size,
@@ -1218,7 +1243,19 @@ impl LlamaModel {
             Ok(Tensor::from_f32(&f32_data, shape))
         };
 
-        let load_linear = |name: &str, in_features: usize, out_features: usize| -> Result<Linear> {
+        let load_linear = |name: &str,
+                           in_features: usize,
+                           out_features: usize,
+                           bias: Option<&str>|
+         -> Result<Linear> {
+            // Qwen2 carries q/k/v biases; llama and Qwen3 do not. A quantized
+            // `Linear` keeps its bias in f32 beside the packed weight, and
+            // `concat_packed3` refuses to fuse a biased layer, so a biased model
+            // just loses the fused q|k|v dispatch and stays correct.
+            let bias_t = match bias {
+                Some(bname) => Some(dequant_to_tensor(bname, &[out_features])?),
+                None => None,
+            };
             let info =
                 gguf.file.tensors.get(name).map_err(|e| {
                     KoreError::StorageError(format!("missing tensor '{name}': {e}"))
@@ -1231,14 +1268,14 @@ impl LlamaModel {
                     raw.to_vec(),
                     in_features,
                     out_features,
-                    None,
+                    bias_t,
                 ))
             } else if info.tensor_type == oxillama_gguf::GgufTensorType::Q6K {
                 Ok(Linear::from_q6_k(
                     raw.to_vec(),
                     in_features,
                     out_features,
-                    None,
+                    bias_t,
                 ))
             } else {
                 let numel = in_features * out_features;
@@ -1248,7 +1285,7 @@ impl LlamaModel {
                     })?;
                 let w = Tensor::from_f32(&f32_data, &[out_features, in_features]);
                 let w_t = w.transpose()?.contiguous();
-                Ok(Linear::from_weight_transposed(w_t, None))
+                Ok(Linear::from_weight_transposed(w_t, bias_t))
             }
         };
 
@@ -1277,25 +1314,36 @@ impl LlamaModel {
                     dequant_to_tensor(&format!("blk.{i}.attn_norm.weight"), &[hidden_size])?;
                 let input_layernorm = RMSNorm::from_weight(in_norm_w, rms_norm_eps);
 
+                // `attention_bias` is per-arch metadata and not every writer
+                // emits it, so the presence of the tensor is the reliable
+                // signal.
+                let bias_of = |suffix: &str| -> Option<String> {
+                    let name = format!("blk.{i}.{suffix}.bias");
+                    gguf.file.tensors.get(&name).ok().map(|_| name)
+                };
                 let q_proj = load_linear(
                     &format!("blk.{i}.attn_q.weight"),
                     hidden_size,
                     num_attention_heads * head_dim,
+                    bias_of("attn_q").as_deref(),
                 )?;
                 let k_proj = load_linear(
                     &format!("blk.{i}.attn_k.weight"),
                     hidden_size,
                     num_key_value_heads * head_dim,
+                    bias_of("attn_k").as_deref(),
                 )?;
                 let v_proj = load_linear(
                     &format!("blk.{i}.attn_v.weight"),
                     hidden_size,
                     num_key_value_heads * head_dim,
+                    bias_of("attn_v").as_deref(),
                 )?;
                 let o_proj = load_linear(
                     &format!("blk.{i}.attn_output.weight"),
                     num_attention_heads * head_dim,
                     hidden_size,
+                    bias_of("attn_output").as_deref(),
                 )?;
 
                 let self_attn = LlamaAttention::new(
@@ -1318,16 +1366,19 @@ impl LlamaModel {
                     &format!("blk.{i}.ffn_gate.weight"),
                     hidden_size,
                     intermediate_size,
+                    bias_of("ffn_gate").as_deref(),
                 )?;
                 let up_proj = load_linear(
                     &format!("blk.{i}.ffn_up.weight"),
                     hidden_size,
                     intermediate_size,
+                    bias_of("ffn_up").as_deref(),
                 )?;
                 let down_proj = load_linear(
                     &format!("blk.{i}.ffn_down.weight"),
                     intermediate_size,
                     hidden_size,
+                    bias_of("ffn_down").as_deref(),
                 )?;
                 let mlp = LlamaMlp::new(gate_proj, up_proj, down_proj);
 
@@ -1348,7 +1399,7 @@ impl LlamaModel {
         } else {
             "token_embd.weight"
         };
-        let lm_head = load_linear(lm_head_name, hidden_size, vocab_size)?;
+        let lm_head = load_linear(lm_head_name, hidden_size, vocab_size, None)?;
 
         Ok(Self {
             config,
