@@ -2201,10 +2201,15 @@ impl Qwen35Gpu {
                 FfnW::Moe(m) => {
                     // One token needs its whole top-k at once, and slots are
                     // filled lazily, so the cap costs nothing until experts are
-                    // actually touched. Measured on POCKET (13 GB, 8 GB card):
-                    // 32 vs 96 slots is inside the run-to-run noise, so this
-                    // stays at the floor that keeps VRAM small -- what actually
-                    // decides the rate is whether the file is in page cache.
+                    // actually touched. Measured on the real 14 GB bartowski
+                    // file: 32 -> 64 slots cuts uploaded bytes 1.46x for
+                    // +6-8% tok/s, and 64 -> 96 changes *six* fetches over a
+                    // whole run, so the pool saturates almost immediately and
+                    // the misses left are cold experts, not evictions. It is
+                    // therefore not what decides the rate: a 2.1x byte cut buys
+                    // ~6%, because expert upload is under half the routed step
+                    // and the per-layer routing readback is the other half. This
+                    // stays at the floor and the VRAM goes to context instead.
                     // `KORE_MOE_SLOTS` overrides it for measurements.
                     let n_slots = std::env::var("KORE_MOE_SLOTS")
                         .ok()
@@ -2572,10 +2577,17 @@ impl Qwen35Gpu {
     /// The router weight is never uploaded -- it is a 2 MB F32 matrix per layer,
     /// and its result is wanted on the host anyway.
     ///
-    /// One column at a time. Four columns route to up to four *different* expert
-    /// sets, so a wider pass would not amortise the expert read the way it
-    /// amortises a resident weight: it would run this loop four times and pay
-    /// four times the expert traffic.
+    /// One column at a time. Widening the pass is not the traffic multiplication
+    /// this comment used to claim: a chunk deduplicates the *union* of its
+    /// columns' picks, so per-token traffic falls and never rises. But it falls
+    /// only once the chunk is wider than the slot pool -- with the pool at its
+    /// floor, a chunk of 16 uploads no fewer experts than the pool already holds,
+    /// so it evicts what it just fetched. Past that it is worth ~1.9x of bytes at
+    /// m=64, and 2.1x of bytes on this arch is worth ~6% tok/s, because expert
+    /// upload is under half the routed step and the per-layer routing readback is
+    /// the other half (`kore-tools/moe-route-locality.py` measures the union).
+    /// A grouped GEMM and m-wide recurrent state is not a trade for single
+    /// digits.
     fn moe_ffn_gpu(&self, ht: &Tensor, m: &GpuMoe) -> Result<Tensor> {
         let b = &self.backend;
         let cfg = &self.cfg;
