@@ -17,11 +17,11 @@ var<workgroup> sdata: array<vec4<f32>, 128>;
 // A Q8_0 block is 32 int8 quants under one f16 scale -- an eighth of a K-quant
 // block -- so the lane map is per-quad rather than per-block: lane `tid` owns
 // quants [4*(tid%8), 4*(tid%8)+4) of the blocks whose index is `tid/8` mod 4,
-// and accumulates over `blocks_per_row / 4` of them. One warp covers four blocks
-// per iteration with 16-byte-contiguous x reads; `e` in the loop is an element
-// index, so thread `t` also reads `x` at a 16-byte stride. The reduction below
-// is the same 32-lane tree the K-quant kernels use, which is what keeps the
-// result independent of the batch width `m`.
+// and walks them step 4. One warp therefore covers four blocks per iteration,
+// and each of those blocks gets its eight quads read by eight lanes, so the x
+// vec4s a warp loads for one block are 128 contiguous bytes. The reduction
+// below is the same 32-lane tree the K-quant kernels use, which is what keeps
+// the result independent of the batch width `m`.
 //
 // The payload is a repacked copy (`kore_kernels::q8_0::repack_q8_0`): the quants
 // come first, eight words of them, so a lane's quad sits at word `quad`, and the
