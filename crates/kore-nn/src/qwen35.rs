@@ -286,6 +286,14 @@ enum QKind {
     F16,
     /// GGML type 42, 64 weights per 18-byte block.
     Q2_0,
+    /// GGML type 6, 32 weights per 22-byte block. Not a boutique format: a
+    /// K-quant file falls back to it whenever a tensor's row width is not a
+    /// multiple of 256, which is exactly what a routed expert's `down`
+    /// projection looks like (`ne[0] = expert_ffn`, e.g. 192).
+    Q5_0,
+    /// GGML type 8, 32 weights per 34-byte block. The other half of the same
+    /// fallback: `Q4_K_M` picks Q8_0 for the tensors Q5_0 is too lossy for.
+    Q8_0,
     /// K-quants, 256 weights per super-block.
     Q4K,
     Q5K,
@@ -298,6 +306,8 @@ impl QKind {
             0 => Some(Self::F32),
             1 => Some(Self::F16),
             kore_kernels::q2_0::Q2_0_TYPE_ID => Some(Self::Q2_0),
+            6 => Some(Self::Q5_0),
+            8 => Some(Self::Q8_0),
             k_quant::Q4_K_TYPE_ID => Some(Self::Q4K),
             k_quant::Q5_K_TYPE_ID => Some(Self::Q5K),
             k_quant::Q6_K_TYPE_ID => Some(Self::Q6K),
@@ -310,6 +320,8 @@ impl QKind {
             Self::F32 => 0,
             Self::F16 => 1,
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_TYPE_ID,
+            Self::Q5_0 => 6,
+            Self::Q8_0 => 8,
             Self::Q4K => k_quant::Q4_K_TYPE_ID,
             Self::Q5K => k_quant::Q5_K_TYPE_ID,
             Self::Q6K => k_quant::Q6_K_TYPE_ID,
@@ -321,6 +333,7 @@ impl QKind {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_BLOCK,
+            Self::Q5_0 | Self::Q8_0 => 32,
             _ => k_quant::QK_K,
         }
     }
@@ -331,19 +344,26 @@ impl QKind {
             Self::F32 => 4,
             Self::F16 => 2,
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_BLOCK_BYTES,
+            // Legacy 32-weight blocks: f16 scale plus 32 quantized values, and
+            // above them 4 bytes of high bits for Q5_0.
+            Self::Q5_0 => 2 + 4 + 16,
+            Self::Q8_0 => 2 + 32,
             Self::Q4K => k_quant::Q4_K_BLOCK_BYTES,
             Self::Q5K => k_quant::Q5_K_BLOCK_BYTES,
             Self::Q6K => k_quant::Q6_K_BLOCK_BYTES,
         }
     }
 
-    /// The `oxillama` type tag, which is how the CPU lane names a K-quant kernel.
+    /// The `oxillama` type tag, which is how the CPU lane names a quantized
+    /// kernel.
     ///
-    /// Only the K-quant path goes through `oxillama`; Q2_0 and the unpacked
-    /// formats have their own loops and never ask for a tag, so their value
-    /// here is a placeholder.
+    /// The K-quants and the legacy pair both go through `oxillama`; Q2_0 and the
+    /// unpacked formats have their own loops and never ask for a tag, so their
+    /// value here is a placeholder.
     fn gguf(self) -> GgufTensorType {
         match self {
+            Self::Q5_0 => GgufTensorType::Q5_0,
+            Self::Q8_0 => GgufTensorType::Q8_0,
             Self::Q4K => GgufTensorType::Q4K,
             Self::Q5K => GgufTensorType::Q5K,
             Self::Q6K => GgufTensorType::Q6K,
@@ -492,6 +512,10 @@ impl QW {
                 .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect()),
             QKind::Q2_0 => kore_kernels::q2_0::dequantize_q2_0(row, self.m),
+            QKind::Q5_0 | QKind::Q8_0 => {
+                oxillama_quant::dequantize_to_f32(row, self.kind.gguf(), self.m)
+                    .map_err(|e| err(&format!("'{}': dequantize: {e}", self.name)))
+            }
             kind => k_quant::dequantize(kind.type_id(), row, self.m),
         }
     }
@@ -792,15 +816,21 @@ impl Qwen35Model {
             let kind = QKind::from_type_id(t.type_id).ok_or_else(|| {
                 err(&format!(
                     "tensor '{name}' has GGML type {}, which this loader has no \
-                     kernel for (supported: F32=0, F16=1, Q4_K=12, Q5_K=13, \
-                     Q6_K=14, Q2_0=42)",
+                     kernel for (supported: F32=0, F16=1, Q5_0=6, Q8_0=8, Q4_K=12, \
+                     Q5_K=13, Q6_K=14, Q2_0=42)",
                     t.type_id
                 ))
             })?;
-            if t.dims.len() < 2 {
-                return Err(err(&format!("tensor '{name}' is not a 2-D weight")));
-            }
-            let (m, n) = (t.dims[0], t.dims[1]);
+            // A 1-D weight is an `[n, 1]` matrix. The GGUF writer trims trailing
+            // unit dimensions, so a single-output projection -- the shared-expert
+            // router `ffn_gate_inp_shexp` is one -- comes back as `[hidden]`
+            // rather than `[hidden, 1]`. Rejecting it would refuse every file
+            // that has been through llama-quantize, including the real MoE.
+            let (m, n) = match t.dims.as_slice() {
+                [m] => (*m, 1),
+                [m, n, ..] => (*m, *n),
+                _ => return Err(err(&format!("tensor '{name}' has no dimensions"))),
+            };
             if m == 0 || n == 0 || m % kind.block() != 0 {
                 return Err(err(&format!(
                     "tensor '{name}' has row length {m}, not a multiple of the {} \
@@ -1787,6 +1817,15 @@ impl Qwen35Gpu {
                 .map_err(|e| err(&format!("upload: {e}")))
         };
         let up_w = |w: &QW| -> Result<GpuW> {
+            // Refuse at load rather than on the first token. A quant with no
+            // device kernel is a property of the lane, not of the file, and
+            // discovering it mid-generation reads like a corrupt model.
+            if matches!(w.kind, QKind::F32 | QKind::F16 | QKind::Q5_0 | QKind::Q8_0) {
+                return Err(err(&format!(
+                    "the gpu lane has no kernel for {:?} weights (tensor '{}'); run the CPU lane",
+                    w.kind, w.name
+                )));
+            }
             let bytes = match w.kind {
                 // The ternary kernel reads a padded, reordered copy (four rows
                 // per workgroup). The K-quant kernels read the file's own
@@ -1955,6 +1994,9 @@ impl Qwen35Gpu {
             QKind::Q6K => b.gemv_q6_k(x, &w.t, w.n, w.m),
             QKind::F32 | QKind::F16 => Err(err(
                 "unpacked F32/F16 weights have no device kernel; run the CPU lane",
+            )),
+            QKind::Q5_0 | QKind::Q8_0 => Err(err(
+                "Q5_0/Q8_0 weights have no device kernel yet; run the CPU lane",
             )),
         }
     }
@@ -2662,7 +2704,7 @@ impl Qwen35Gpu {
 }
 
 #[cfg(test)]
-mod device_bank_tests {
+mod weight_path_tests {
     use super::*;
 
     /// A [`ByteOwner`] over a buffer the test owns, so a bank can be built over
@@ -2711,6 +2753,49 @@ mod device_bank_tests {
     /// all-resident bank. Both arms run the same kernel over the same payload,
     /// so anything that differs is address arithmetic -- a wrong expert window,
     /// a slot that was not overwritten, or a cache that lied about residency.
+    /// A Q4_K matrix with **one super-block per row** -- the shape a routed
+    /// expert's `down` projection has (`ne[0] = expert_ffn`, e.g. 192 for the
+    /// 27 B MoE, rounded up to a block here) -- must agree with an f64 dot over
+    /// its own bit-exact dequantized rows.
+    ///
+    /// The committed K-quant fixtures pin *dequantization*, not the dot; and the
+    /// large dense model this path was built on has 16 blocks per row, so a
+    /// one-block row was never numerically checked. It matters because this is
+    /// the shape where a different accumulation grouping (llama.cpp's CPU
+    /// `q4_K_8x8` repack, which KORE deliberately does not do) turns into a
+    /// token flip: on `qwen35moe-tiny-q4km` the KORE and llama.cpp step-4
+    /// logits agree to ~8e-4 and rank a near-tie oppositely. Byte-identity is a
+    /// KORE-to-KORE contract; llama.cpp is an oracle for *semantics*.
+    #[test]
+    fn q4k_one_block_per_row_matches_f64() {
+        let (m, n) = (256usize, 8usize);
+        let host = stacked_q4k(1, m, n);
+        assert_eq!(host.byte_len(), n * k_quant::Q4_K_BLOCK_BYTES);
+
+        let x: Vec<f32> = (0..m).map(|i| ((i % 23) as f32 - 11.0) * 0.017).collect();
+        let mut out = vec![0.0f32; n];
+        host.gemv(&x, &mut out).expect("cpu gemv");
+
+        for r in 0..n {
+            let row = host.row_f32(r).expect("dequant row");
+            let want: f64 = row
+                .iter()
+                .zip(&x)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum();
+            assert!(
+                want.abs() > 1e-3,
+                "row {r} reference is ~0 ({want}); the fixture proves nothing"
+            );
+            let rel = (f64::from(out[r]) - want).abs() / want.abs();
+            assert!(
+                rel < 1e-5,
+                "row {r}: gemv {} vs f64 {want} (rel {rel:.3e})",
+                out[r]
+            );
+        }
+    }
+
     #[test]
     fn streamed_experts_match_resident_by_bit() {
         let device = Device::Vulkan(0);
