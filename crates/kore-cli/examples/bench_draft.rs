@@ -111,6 +111,24 @@ fn main() {
     let mut tokens: Vec<Option<Vec<u32>>> = vec![None; n_arms];
     let mut stats: Vec<SpecStats> = vec![SpecStats::default(); n_arms];
 
+    // Warm every arm before timing any of them. Pipelines are compiled lazily on
+    // first use, so without this the arm that runs first in round 0 pays a
+    // one-time cost for the whole run -- and when `rounds < n_arms` the rotation
+    // never gives that arm a turn behind a warm GPU. It showed up as a policy
+    // that never fired (0% fire) timing 1.20x *faster* than plain greedy, which
+    // cannot happen: at 0% fire the spec path does strictly more work per token
+    // than greedy does. Full `n_new` rather than a short pass, so the same
+    // long-context shard counts and the same `Head::Last` width are compiled too.
+    for arm in 0..n_arms {
+        if arm == 0 {
+            gpu.generate_greedy(&model, &ids, n_new, max_ctx)
+                .expect("warm-up greedy");
+        } else {
+            gpu.generate_spec(&model, &ids, n_new, max_ctx, policies[arm - 1])
+                .expect("warm-up spec");
+        }
+    }
+
     for round in 0..rounds {
         // Rotate which arm runs first, so no arm is systematically the one that
         // pays for the clock it warmed up.
