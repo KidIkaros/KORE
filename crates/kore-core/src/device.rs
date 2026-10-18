@@ -586,12 +586,17 @@ pub trait DeviceBackend: Send + Sync {
     }
 
     /// Fused "pre-op + 512-point signed Hadamard" decode kernel.
-    /// `mode`: 0 = add+rms_norm+had, 1 = rms_norm+had, 2 = swiglu+had, 3 = sigmoid_mul+had.
+    /// `mode`: 0 = add+rms_norm, 1 = rms_norm, 2 = swiglu, 3 = sigmoid_mul.
+    /// `had`: when false the sign table and the transform are skipped and
+    /// `out_had` is the pre-op value as-is. That is what a model whose weights
+    /// are *not* folded through the transform needs: the same fused pre-op and
+    /// no rotation. `signs` is only read when `had`.
     /// Returns `(out_res, out_norm, out_had)`; unused outputs are uninitialized.
     /// `weight` is only read for modes 0/1 (pass `signs` for modes 2/3).
     fn had_pre(
         &self,
         _mode: u32,
+        _had: bool,
         _a: &crate::Tensor,
         _b: &crate::Tensor,
         _weight: &crate::Tensor,
@@ -719,6 +724,10 @@ pub trait DeviceBackend: Send + Sync {
 
     /// Fused DeltaNet recurrent step: L2-normed q/k, in-place delta-rule state
     /// update, output readout, gated RMSNorm with z. Returns `[n_v*d_v]`.
+    ///
+    /// `n_v` value heads read `n_k` key heads: value head `hv` borrows key head
+    /// `hv * n_k / n_v`, so a file whose q/k projections carry fewer heads than
+    /// v (GQA over the linear attention) needs no reshuffle of the weights.
     fn gdn_step(
         &self,
         _qkv: &crate::Tensor,
@@ -728,6 +737,7 @@ pub trait DeviceBackend: Send + Sync {
         _gate: &crate::Tensor,
         _norm_w: &crate::Tensor,
         _n_v: usize,
+        _n_k: usize,
         _d_k: usize,
         _d_v: usize,
         _eps: f32,

@@ -993,7 +993,7 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     };
 
     // ---- mode 0: add + rms_norm + hadamard ----
-    let (res, norm, had) = backend.had_pre(0, &a, &b, &w, &signs, eps).expect("had_pre 0");
+    let (res, norm, had) = backend.had_pre(0, true, &a, &b, &w, &signs, eps).expect("had_pre 0");
     let (ref_res, ref_norm) = backend.add_rms_norm(&a, &b, &w, eps).expect("add_rms_norm");
     let ref_had = backend
         .hadamard_signed(&ref_norm, &signs, 512, 0)
@@ -1004,13 +1004,13 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     assert_eq!(to_cpu(&had), to_cpu(&ref_had), "mode 0 hadamard differs");
 
     // ---- mode 2: swiglu + hadamard ----
-    let (_r, _n, had2) = backend.had_pre(2, &a, &b, &signs, &signs, eps).expect("had_pre 2");
+    let (_r, _n, had2) = backend.had_pre(2, true, &a, &b, &signs, &signs, eps).expect("had_pre 2");
     let act = backend.swiglu(&a, &b).expect("swiglu");
     let ref_had2 = backend.hadamard_signed(&act, &signs, 512, 0).expect("had2");
     assert_eq!(to_cpu(&had2), to_cpu(&ref_had2), "mode 2 hadamard differs");
 
     // ---- mode 3: sigmoid_mul + hadamard ----
-    let (_r, _n, had3) = backend.had_pre(3, &a, &b, &signs, &signs, eps).expect("had_pre 3");
+    let (_r, _n, had3) = backend.had_pre(3, true, &a, &b, &signs, &signs, eps).expect("had_pre 3");
     let gated = backend.sigmoid_mul(&a, &b).expect("sigmoid_mul");
     let ref_had3 = backend.hadamard_signed(&gated, &signs, 512, 0).expect("had3");
     assert_eq!(to_cpu(&had3), to_cpu(&ref_had3), "mode 3 hadamard differs");
@@ -1037,7 +1037,7 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     let rw = Tensor::from_f32(&rw, &[rcols]).to(dev).unwrap();
 
     let (mres, mnorm, mhad) = backend
-        .had_pre(0, &ra, &rb, &rw, &rs, eps)
+        .had_pre(0, true, &ra, &rb, &rw, &rs, eps)
         .expect("had_pre multi-row");
 
     // The authoritative check: bit-identical to `rows` independent single-row calls.
@@ -1045,6 +1045,7 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
         let (sres, snorm, shad) = backend
             .had_pre(
                 0,
+                true,
                 &ra.slice_rows(r, 1).expect("slice a"),
                 &rb.slice_rows(r, 1).expect("slice b"),
                 &rw,
@@ -1069,6 +1070,94 @@ fn test_vulkan_had_pre_matches_standalone_kernels() {
     assert_eq!(to_cpu(&mres), to_cpu(&rres), "multi-row residual differs");
     assert_eq!(to_cpu(&mnorm), to_cpu(&rnorm), "multi-row normed differs");
     assert_eq!(to_cpu(&mhad), to_cpu(&rhad), "multi-row hadamard differs");
+}
+
+/// `had = false` must produce exactly the pre-op value: for mode 0, the same
+/// `(residual, normed)` as the `had = true` path and a `out_had` equal to
+/// `out_norm`. A model with unfolded weights reads that third output as its
+/// matvec input, so it has to be the plain normalized activation, not a rotated
+/// one.
+#[test]
+fn test_vulkan_had_pre_without_hadamard() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+    let (rows, cols) = (2usize, 1024usize);
+    let phase = |i: usize| (i as f32 * 0.011).cos();
+    let a: Vec<f32> = (0..rows * cols).map(|i| phase(i) * 1.7).collect();
+    let b: Vec<f32> = (0..rows * cols).map(|i| phase(i + 3) * 0.4).collect();
+    let w: Vec<f32> = (0..cols).map(|i| 0.5 + phase(i + 5) * 0.5).collect();
+    // Deliberately a *non-trivial* sign table: if the kernel applied it when
+    // `had = false` the third output would differ from the second.
+    let signs: Vec<f32> = (0..cols)
+        .map(|i| if (i * 2654435761usize) % 5 < 2 { -1.0 } else { 1.0 })
+        .collect();
+    let eps = 1e-6f32;
+    let a = Tensor::from_f32(&a, &[rows, cols]).to(dev).unwrap();
+    let b = Tensor::from_f32(&b, &[rows, cols]).to(dev).unwrap();
+    let w = Tensor::from_f32(&w, &[cols]).to(dev).unwrap();
+    let signs = Tensor::from_f32(&signs, &[cols]).to(dev).unwrap();
+    let to_cpu = |t: &Tensor| {
+        t.to(kore_core::Device::Cpu)
+            .unwrap()
+            .as_f32_slice()
+            .unwrap()
+            .to_vec()
+    };
+
+    // mode 0, no Hadamard.
+    let (res, norm, had) = backend
+        .had_pre(0, false, &a, &b, &w, &signs, eps)
+        .expect("had_pre had=false");
+    assert_eq!(to_cpu(&had), to_cpu(&norm), "out_had must be out_norm");
+
+    // Same residual/norm as the folded path, so the flag cannot perturb the norm.
+    let (res_t, norm_t, _) = backend
+        .had_pre(0, true, &a, &b, &w, &signs, eps)
+        .expect("had_pre had=true");
+    assert_eq!(to_cpu(&res), to_cpu(&res_t), "residual differs");
+    assert_eq!(to_cpu(&norm), to_cpu(&norm_t), "normed differs");
+
+    // And the unfolded `out_had` equals the standalone residual+norm, so the
+    // unfused fallback path would agree too.
+    let (sres, snorm) = backend.add_rms_norm(&a, &b, &w, eps).expect("add_rms_norm");
+    assert_eq!(to_cpu(&res), to_cpu(&sres), "vs standalone residual");
+    assert_eq!(to_cpu(&had), to_cpu(&snorm), "vs standalone normed");
+
+    // mode 2 (swiglu) must equal the standalone swiglu.
+    let (_, _, act) = backend
+        .had_pre(2, false, &a, &b, &signs, &signs, eps)
+        .expect("had_pre mode 2 had=false");
+    let sw = backend.swiglu(&a, &b).expect("swiglu");
+    assert_eq!(to_cpu(&act), to_cpu(&sw), "mode 2 vs swiglu");
+
+    // mode 3 must equal a * sigmoid(b), computed here. `exp` is the one
+    // transcendental in these kernels, and the GPU's differs from the host's in
+    // the last ulp, so this leg is checked to a relative tolerance rather than
+    // bit-exactly (the kernels' *own* arithmetic is exact elsewhere).
+    let (_, _, gate) = backend
+        .had_pre(3, false, &a, &b, &signs, &signs, eps)
+        .expect("had_pre mode 3 had=false");
+    let got = to_cpu(&gate);
+    let av = to_cpu(&a);
+    let bv = to_cpu(&b);
+    for i in 0..rows * cols {
+        let want = av[i] / (1.0 + (-bv[i]).exp());
+        assert!(
+            (got[i] - want).abs() <= 4.0 * f32::EPSILON * want.abs().max(1.0),
+            "mode 3 element {i}: got {} want {want}",
+            got[i]
+        );
+    }
+
+    // The unfolded path skips the transform, so a sign table of the wrong width
+    // must not be an error -- there is nothing to index it with.
+    let tiny = Tensor::from_f32(&[0.0f32], &[1]).to(dev).unwrap();
+    backend
+        .had_pre(0, false, &a, &b, &w, &tiny, eps)
+        .expect("had=false must not require a full-width sign table");
 }
 
 /// `hadamard_signed` on an `[rows, cols]` input must be *bit-identical* to `rows`
@@ -1517,4 +1606,211 @@ fn test_vulkan_copy_buffer_is_a_real_copy() {
     // A mismatched length is a caller bug, not a silent partial copy.
     let short = Tensor::zeros(&[n - 1], kore_core::DType::F32).to(dev).unwrap();
     assert!(backend.copy_buffer(&dst, &short).is_err());
+}
+
+/// A 1-D activation is one row, not `k` rows.
+///
+/// The DeltaNet readout produces a `[n_v*d_v]` vector, and an *unfolded* model
+/// passes it on unchanged, so every quantized GEMV has to read a 1-D input as
+/// `m = 1`. Reading `x_shape[0]` as `m` silently produced a `[k, k]` output
+/// instead of `[1, n]`, which then re-entered the next fused norm as a
+/// `[k, k]` residual. Only reachable on a file with no folded Hadamard, which
+/// is why the Q2_0 path (which had always done it correctly) never hit it.
+#[test]
+fn test_vulkan_k_quant_gemv_treats_1d_activation_as_one_row() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    // One Q5_K row of 256 columns: d = 1.0, dmin = 0, scales = 1, mins = 0,
+    // qs byte 0x32 -> nibbles 2 and 3, so the dot with an all-ones x is
+    // 128*2 + 128*3 = 640.
+    let mut raw = vec![0u8; 176];
+    raw[1] = 0x3C; // d = 1.0
+    for i in 4..8 {
+        raw[i] = 1;
+    }
+    for i in 12..16 {
+        raw[i] = 1;
+    }
+    for i in 48..176 {
+        raw[i] = 0x32;
+    }
+    let w = Tensor::from_storage(
+        kore_core::Storage::from_packed_bytes(kore_core::DType::U8, 176, raw),
+        &[176],
+    );
+
+    let ones = vec![1.0f32; 256];
+    let x_2d = Tensor::from_f32(&ones, &[1, 256]);
+    let y_2d = backend.gemv_q5_k(&x_2d, &w, 1, 256).expect("q5_k 2-D");
+    assert_eq!(y_2d.shape().dims(), &[1, 1]);
+
+    let x_1d = Tensor::from_f32(&ones, &[256]);
+    let y_1d = backend.gemv_q5_k(&x_1d, &w, 1, 256).expect("q5_k 1-D");
+    assert_eq!(
+        y_1d.shape().dims(),
+        &[1, 1],
+        "a 1-D activation must produce a [1, n] output"
+    );
+
+    let a = y_2d.to(kore_core::Device::Cpu).unwrap();
+    let b = y_1d.to(kore_core::Device::Cpu).unwrap();
+    assert_eq!(
+        a.as_f32_slice().unwrap(),
+        b.as_f32_slice().unwrap(),
+        "1-D and [1, k] activations must agree bit-for-bit"
+    );
+    assert!((a.as_f32_slice().unwrap()[0] - 640.0).abs() < 1e-3);
+
+    // A 1-D input of the wrong length is still a caller bug.
+    let short = Tensor::from_f32(&vec![1.0f32; 128], &[128]);
+    assert!(backend.gemv_q5_k(&short, &w, 1, 256).is_err());
+
+    // The shape rule belongs to all three K-quants, not just Q5_K. The value
+    // paths are covered by the per-quant correctness tests above.
+    let q4k = Tensor::from_storage(
+        kore_core::Storage::from_packed_bytes(kore_core::DType::U8, 144, vec![0u8; 144]),
+        &[144],
+    );
+    let q6k = Tensor::from_storage(
+        kore_core::Storage::from_packed_bytes(kore_core::DType::U8, 210, vec![0u8; 210]),
+        &[210],
+    );
+    let y4 = backend.gemv_q4_k(&x_1d, &q4k, 1, 256).unwrap();
+    assert_eq!(y4.shape().dims(), &[1, 1]);
+    let y6 = backend.gemv_q6_k(&x_1d, &q6k, 1, 256).unwrap();
+    assert_eq!(y6.shape().dims(), &[1, 1]);
+}
+
+/// GQA inside the linear attention: `n_v` value heads read `n_k` key heads.
+///
+/// Value head `hv` borrows key head `hv % n_k` -- the key heads are *tiled* up
+/// to the value head count, which is what llama.cpp's `ggml_gated_delta_net`
+/// does (`iq1 = iv1 % neq1`, and `ggml_repeat` in the unfused path). Grouping
+/// them as `hv / (n_v / n_k)` instead is a silent, whole-model-sized error.
+///
+/// The oracle avoids restating the rule: explicitly tile q/k up to `n_v` heads
+/// and run the kernel with `n_k == n_v`, where the mapping is the identity.
+/// Output *and* recurrent state must then match bit-for-bit.
+#[test]
+fn test_vulkan_gdn_step_groups_key_heads_by_tiling() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+
+    // The kernel stages one head of k/q/v in a 128-wide workgroup, and thread
+    // `j` owns state column `j`, so both head dims are fixed at 128.
+    const DK: usize = 128;
+    const DV: usize = 128;
+    // `n_v / n_k` must be > 1 for the two conventions to disagree: tiling reads
+    // `hv % n_k` = [0, 1, 0, 1] where interleaving reads `hv / 2` = [0, 0, 1, 1].
+    const NK: usize = 2;
+    const NV: usize = 4;
+    const EPS: f32 = 1e-6;
+
+    let mut s: u32 = 0x2545_f491;
+    let mut rnd = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((s >> 8) as f32 / 16_777_216.0) - 0.5
+            })
+            .collect()
+    };
+
+    let q = rnd(NK * DK);
+    let k = rnd(NK * DK);
+    let v = rnd(NV * DV);
+    let z = rnd(NV * DV);
+    let beta = rnd(NV);
+    // Negative gates keep `exp(gate) < 1`, so the state decays rather than
+    // growing without bound.
+    let gate: Vec<f32> = rnd(NV).into_iter().map(|g| -0.5 - g.abs()).collect();
+    let norm_w: Vec<f32> = rnd(DV).into_iter().map(|w| 0.5 + w.abs()).collect();
+    let state0 = rnd(NV * DV * DV);
+
+    // `n_k == n_k`, the layout the file actually stores.
+    let mut qkv_grouped = Vec::with_capacity(2 * NK * DK + NV * DV);
+    qkv_grouped.extend_from_slice(&q);
+    qkv_grouped.extend_from_slice(&k);
+    qkv_grouped.extend_from_slice(&v);
+
+    // q/k tiled up to `n_v` heads: `n_k == n_v`, so the mapping is identity.
+    let mut qkv_tiled = Vec::with_capacity(2 * NV * DK + NV * DV);
+    for _ in 0..(NV / NK) {
+        qkv_tiled.extend_from_slice(&q);
+    }
+    for _ in 0..(NV / NK) {
+        qkv_tiled.extend_from_slice(&k);
+    }
+    qkv_tiled.extend_from_slice(&v);
+
+    let up = |data: &[f32]| -> Tensor { Tensor::from_f32(data, &[data.len()]).to(dev).unwrap() };
+    let z_t = up(&z);
+    let beta_t = up(&beta);
+    let gate_t = up(&gate);
+    let nw_t = up(&norm_w);
+    let state_grouped = up(&state0);
+    let state_tiled = up(&state0);
+
+    let out_grouped = VulkanBackend::gdn_step(
+        &backend,
+        &up(&qkv_grouped),
+        &z_t,
+        &state_grouped,
+        &beta_t,
+        &gate_t,
+        &nw_t,
+        NV,
+        NK,
+        DK,
+        DV,
+        EPS,
+    )
+    .expect("gdn_step grouped");
+    let out_tiled = VulkanBackend::gdn_step(
+        &backend,
+        &up(&qkv_tiled),
+        &z_t,
+        &state_tiled,
+        &beta_t,
+        &gate_t,
+        &nw_t,
+        NV,
+        NV,
+        DK,
+        DV,
+        EPS,
+    )
+    .expect("gdn_step tiled");
+
+    let og = out_grouped.to(kore_core::Device::Cpu).unwrap();
+    let ot = out_tiled.to(kore_core::Device::Cpu).unwrap();
+    assert_eq!(og.shape().dims(), &[NV * DV]);
+    assert_eq!(
+        og.as_f32_slice().unwrap(),
+        ot.as_f32_slice().unwrap(),
+        "value heads must read key heads by tiling"
+    );
+
+    let sg = state_grouped.to(kore_core::Device::Cpu).unwrap();
+    let st = state_tiled.to(kore_core::Device::Cpu).unwrap();
+    assert_eq!(
+        sg.as_f32_slice().unwrap(),
+        st.as_f32_slice().unwrap(),
+        "the recurrent state must diverge too if the head pairing is wrong"
+    );
+    // Guard against the test passing because nothing happened at all.
+    assert!(any_nonzero(og.as_f32_slice().unwrap()));
+    assert!(any_nonzero(sg.as_f32_slice().unwrap()));
+}
+
+/// True when at least one entry is finite and non-zero -- so a comparison of
+/// two "all zeros because the kernel never ran" results cannot pass silently.
+fn any_nonzero(x: &[f32]) -> bool {
+    x.iter().any(|v| v.is_finite() && *v != 0.0)
 }

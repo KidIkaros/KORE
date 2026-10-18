@@ -1,11 +1,18 @@
 struct GdnStepUniforms {
-    n_v: u32,          // value heads (16)
+    n_v: u32,          // value heads (32 on the 9B, 16 on Bonsai)
+    n_k: u32,          // key heads (16 on the 9B, == n_v on Bonsai)
     d_k: u32,          // key dim per head (128)
     d_v: u32,          // value dim per head (128)
     eps: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-// qkv layout: [q: n_v*d_k | k: n_v*d_k | v: n_v*d_v]
+// qkv layout: [q: n_k*d_k | k: n_k*d_k | v: n_v*d_v]
+// Value head `hv` reads key head `hv % n_k` -- the key heads are *tiled* up to
+// the value head count, matching llama.cpp's `ggml_gated_delta_net`
+// (`iq1 = iv1 % neq1`).
 // state layout per head: s[j*d_v + i] = S[i][j]  (row j holds S[:, j])
 @group(0) @binding(0) var<uniform> params: GdnStepUniforms;
 @group(0) @binding(1) var<storage, read> qkv: array<f32>;        // conv+silu output
@@ -31,9 +38,10 @@ fn main(
     let dk = params.d_k;
     let dv = params.d_v;
     let tid = lid.x;
-    let q_off = hv * dk;
-    let k_off = params.n_v * dk + hv * dk;
-    let v_off = 2u * params.n_v * dk + hv * dv;
+    let hk = hv % params.n_k;
+    let q_off = hk * dk;
+    let k_off = params.n_k * dk + hk * dk;
+    let v_off = 2u * params.n_k * dk + hv * dv;
     let s_base = hv * dv * dv;
 
     // load k, q, v into shared

@@ -6,16 +6,24 @@
 // pair into one kernel.
 //
 // Modes:
-//   0 = add + rms_norm + hadamard   (residual add folded into the norm)
-//   1 = rms_norm + hadamard
-//   2 = swiglu + hadamard
-//   3 = sigmoid_mul + hadamard
+//   0 = add + rms_norm   (residual add folded into the norm)
+//   1 = rms_norm
+//   2 = swiglu
+//   3 = sigmoid_mul
 //
 // Outputs:
-//   mode 0 -> out_res  = a + b            out_norm = rms_norm(a+b)*w   out_had = WHT(signs*h)
-//   mode 1 ->                              out_norm = rms_norm(a)*w     out_had = WHT(signs*h)
-//   mode 2 ->                                                           out_had = WHT(signs*swiglu(a,b))
-//   mode 3 ->                                                           out_had = WHT(signs*(a/(1+exp(-b))))
+//   mode 0 -> out_res  = a + b            out_norm = rms_norm(a+b)*w   out_had = h
+//   mode 1 ->                              out_norm = rms_norm(a)*w     out_had = h
+//   mode 2 ->                                                           out_had = swiglu(a,b)
+//   mode 3 ->                                                           out_had = a/(1+exp(-b))
+//
+// `had` selects whether the sign table and the Walsh-Hadamard transform are
+// applied on the way out (`out_had = WHT(signs * v)`) or not (`out_had = v`).
+// A model whose GGUF carries `prism.hadamard.*` stores its weights folded
+// through the transform and needs `had = 1`; a model with plain weights needs
+// `had = 0`, and then `signs` is never read. Keeping both in this kernel means
+// an unfolded model pays the same single dispatch per norm, not one for the
+// norm and another for the activation.
 //
 // Every arithmetic step reproduces the corresponding standalone shader
 // (rms_norm.wgsl / add_rms_norm.wgsl / elementwise.wgsl / hadamard_signed.wgsl)
@@ -33,7 +41,7 @@ struct HadPreUniforms {
     mode: u32,     // 0..3
     eps: f32,
     scale: f32,    // 1/sqrt(512)
-    _pad0: u32,
+    had: u32,      // 1 = apply signs + WHT, 0 = out_had is the pre-op value
     _pad1: u32,
 }
 
@@ -104,7 +112,8 @@ fn main(
         rms = inverseSqrt(shared_sq[0] / f32(cols) + params.eps);
     }
 
-    // ---- pre-op + sign application into buf_a ----
+    // ---- pre-op into vv, then either sign+WHT or straight out ----
+    var vv: array<f32, 4>;
     for (var i = 0u; i < 4u; i = i + 1u) {
         let j = tid * 4u + i;
         var v: f32 = 0.0;
@@ -125,10 +134,25 @@ fn main(
         } else {
             v = a[bb + j] / (1.0 + exp(-b[bb + j]));
         }
+        vv[i] = v;
+    }
+
+    // Unfolded weights: the pre-op result is the whole answer. `had` is uniform
+    // across the workgroup, so this early return is taken by every invocation
+    // together and no barrier is left half-reached.
+    if (params.had == 0u) {
+        for (var i = 0u; i < 4u; i = i + 1u) {
+            out_had[bb + tid * 4u + i] = vv[i];
+        }
+        return;
+    }
+
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let j = tid * 4u + i;
         // The sign pattern covers one row (same width as `weight`), so it is
         // indexed row-locally: `cidx + i` equals `blk * 512 + j`, not `bb + j`.
         // At rows = 1 the two expressions are identical.
-        buf_a[j] = v * signs[cidx + i];
+        buf_a[j] = vv[i] * signs[cidx + i];
     }
     workgroupBarrier();
 

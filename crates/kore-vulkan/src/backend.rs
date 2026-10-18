@@ -369,7 +369,8 @@ struct HadPreUniforms {
     mode: u32,
     eps: f32,
     scale: f32,
-    _pad0: u32,
+    /// 1 = apply signs + Walsh-Hadamard, 0 = `out_had` is the pre-op value.
+    had: u32,
     _pad1: u32,
 }
 
@@ -395,9 +396,17 @@ struct GdnGatesUniforms {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GdnStepUniforms {
     n_v: u32,
+    /// Key/value head counts. They differ whenever the q/k projections carry
+    /// fewer heads than v; each value head then borrows key head
+    /// `hv % n_k`. Padding keeps the buffer a multiple of 16 bytes, as the
+    /// uniform address space requires.
+    n_k: u32,
     d_k: u32,
     d_v: u32,
     eps: f32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 #[repr(C)]
@@ -2558,8 +2567,11 @@ impl VulkanBackend {
         k: usize,
     ) -> Result<Tensor> {
         let x_shape = x.shape().dims();
-        let m = if x_shape.is_empty() { 1 } else { x_shape[0] };
-        let k_in = if x_shape.len() > 1 { x_shape[1] } else { x_shape[0] };
+        // A 1-D input is a single row: `m` is 1, not its length. Reading
+        // `x_shape[0]` as `m` would turn a `[k]` activation vector into a
+        // `[k, k]` output. (`gemv_q2_0` has always done it this way.)
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        let k_in = x.numel() / m;
         if k_in != k {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q4_k".into(),
@@ -2609,8 +2621,11 @@ impl VulkanBackend {
         k: usize,
     ) -> Result<Tensor> {
         let x_shape = x.shape().dims();
-        let m = if x_shape.is_empty() { 1 } else { x_shape[0] };
-        let k_in = if x_shape.len() > 1 { x_shape[1] } else { x_shape[0] };
+        // A 1-D input is a single row: `m` is 1, not its length. Reading
+        // `x_shape[0]` as `m` would turn a `[k]` activation vector into a
+        // `[k, k]` output. (`gemv_q2_0` has always done it this way.)
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        let k_in = x.numel() / m;
         if k_in != k {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q5_k".into(),
@@ -2660,8 +2675,11 @@ impl VulkanBackend {
         k: usize,
     ) -> Result<Tensor> {
         let x_shape = x.shape().dims();
-        let m = if x_shape.is_empty() { 1 } else { x_shape[0] };
-        let k_in = if x_shape.len() > 1 { x_shape[1] } else { x_shape[0] };
+        // A 1-D input is a single row: `m` is 1, not its length. Reading
+        // `x_shape[0]` as `m` would turn a `[k]` activation vector into a
+        // `[k, k]` output. (`gemv_q2_0` has always done it this way.)
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        let k_in = x.numel() / m;
         if k_in != k {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q6_k".into(),
@@ -2773,8 +2791,11 @@ impl VulkanBackend {
         label: &str,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let x_shape = x.shape().dims();
-        let m = if x_shape.is_empty() { 1 } else { x_shape[0] };
-        let k_in = if x_shape.len() > 1 { x_shape[1] } else { x_shape[0] };
+        // A 1-D input is a single row: `m` is 1, not its length. Reading
+        // `x_shape[0]` as `m` would turn a `[k]` activation vector into a
+        // `[k, k]` output. (`gemv_q2_0` has always done it this way.)
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        let k_in = x.numel() / m;
         let n = nq + nk + nv;
         if k_in != k {
             return Err(VulkanError::ShapeMismatch {
@@ -3142,6 +3163,7 @@ impl VulkanBackend {
     pub fn had_pre(
         &self,
         mode: u32,
+        had: bool,
         a: &Tensor,
         b: &Tensor,
         weight: &Tensor,
@@ -3183,7 +3205,9 @@ impl VulkanBackend {
         }
         // `signs` covers one row; the pattern is applied to every row of an
         // `[rows, cols]` input. At `rows = 1` this is `signs.numel() < numel`.
-        if signs.numel() < cols {
+        // Only read when the Hadamard stage runs, so an unfolded model may pass
+        // any tensor here.
+        if had && signs.numel() < cols {
             return Err(VulkanError::ShapeMismatch {
                 op: "had_pre".into(),
                 lhs: vec![cols],
@@ -3209,7 +3233,7 @@ impl VulkanBackend {
             mode,
             eps,
             scale: 512f32.sqrt().recip(),
-            _pad0: 0,
+            had: had as u32,
             _pad1: 0,
         };
         self.record_dispatch(
@@ -3325,6 +3349,7 @@ impl VulkanBackend {
         gate: &Tensor,
         norm_w: &Tensor,
         n_v: usize,
+        n_k: usize,
         d_k: usize,
         d_v: usize,
         eps: f32,
@@ -3339,9 +3364,13 @@ impl VulkanBackend {
 
         let uniforms = GdnStepUniforms {
             n_v: n_v as u32,
+            n_k: n_k as u32,
             d_k: d_k as u32,
             d_v: d_v as u32,
             eps,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
         };
         self.record_dispatch(
             &self.gdn_step_pipeline,
@@ -3700,6 +3729,17 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    fn gemv_q5_k(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q5_k(x, w_raw, n, k)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
     fn gemv_q4_k_split3(
         &self,
         x: &Tensor,
@@ -3793,13 +3833,14 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
     fn had_pre(
         &self,
         mode: u32,
+        had: bool,
         a: &Tensor,
         b: &Tensor,
         weight: &Tensor,
         signs: &Tensor,
         eps: f32,
     ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
-        self.had_pre(mode, a, b, weight, signs, eps)
+        self.had_pre(mode, had, a, b, weight, signs, eps)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
@@ -3838,11 +3879,12 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         gate: &Tensor,
         norm_w: &Tensor,
         n_v: usize,
+        n_k: usize,
         d_k: usize,
         d_v: usize,
         eps: f32,
     ) -> kore_core::Result<Tensor> {
-        self.gdn_step(qkv, z, state, beta, gate, norm_w, n_v, d_k, d_v, eps)
+        self.gdn_step(qkv, z, state, beta, gate, norm_w, n_v, n_k, d_k, d_v, eps)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 

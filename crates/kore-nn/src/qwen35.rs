@@ -20,7 +20,10 @@ use std::sync::Arc;
 use kore_core::{KoreError, Result};
 
 use crate::gguf_min::{MiniGguf, MetaVal};
+use kore_kernels::k_quant;
 use kore_kernels::q2_0::gemv_q2_0;
+use oxillama_gguf::{ByteOwner, GgufTensorType, SharedBytes};
+use oxillama_quant::{global_dispatcher, QuantTensor};
 
 fn had_off() -> bool {
     static M: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -210,54 +213,208 @@ fn gemv_f32(w: &[f32], m: usize, x: &[f32], out: &mut [f32]) {
 
 // ---------- weights ----------
 
-/// Packed Q2_0 weight, mmap-backed; bytes sliced on demand.
-#[derive(Clone)]
-struct Q2W {
-    gg: Arc<MiniGguf>,
-    name: String,
-    m: usize,
-    n: usize,
+/// The packed weight formats the fast path can actually compute.
+///
+/// `Q2_0` is the ternary format this engine started with. The three K-quants
+/// are what real GGUFs ship: a file labelled `Q4_K_M` is a *mix*, and a single
+/// one can carry Q4_K, Q5_K and Q6_K tensors all at once (the 9B staging fixture
+/// does: Q5_K holds its 24 `ssm_out.weight` matrices).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum QKind {
+    /// GGML type 42, 64 weights per 18-byte block.
+    Q2_0,
+    /// K-quants, 256 weights per super-block.
+    Q4K,
+    Q5K,
+    Q6K,
 }
 
-impl Q2W {
-    fn bytes(&self) -> &[u8] {
-        self.gg.tensor_bytes(&self.name).expect("q2w bytes")
+impl QKind {
+    fn from_type_id(id: u32) -> Option<Self> {
+        match id {
+            kore_kernels::q2_0::Q2_0_TYPE_ID => Some(Self::Q2_0),
+            k_quant::Q4_K_TYPE_ID => Some(Self::Q4K),
+            k_quant::Q5_K_TYPE_ID => Some(Self::Q5K),
+            k_quant::Q6_K_TYPE_ID => Some(Self::Q6K),
+            _ => None,
+        }
     }
-    /// out[n] = W' * x (x must already be Hadamard-transformed).
-    fn gemv(&self, x: &[f32], out: &mut [f32]) {
-        gemv_q2_0(self.bytes(), self.m, self.n, x, out).expect("q2 gemv");
+
+    fn type_id(self) -> u32 {
+        match self {
+            Self::Q2_0 => kore_kernels::q2_0::Q2_0_TYPE_ID,
+            Self::Q4K => k_quant::Q4_K_TYPE_ID,
+            Self::Q5K => k_quant::Q5_K_TYPE_ID,
+            Self::Q6K => k_quant::Q6_K_TYPE_ID,
+        }
+    }
+
+    /// Weights per packed block.
+    const fn block(self) -> usize {
+        match self {
+            Self::Q2_0 => kore_kernels::q2_0::Q2_0_BLOCK,
+            _ => k_quant::QK_K,
+        }
+    }
+
+    /// Bytes per packed block.
+    const fn block_bytes(self) -> usize {
+        match self {
+            Self::Q2_0 => kore_kernels::q2_0::Q2_0_BLOCK_BYTES,
+            Self::Q4K => k_quant::Q4_K_BLOCK_BYTES,
+            Self::Q5K => k_quant::Q5_K_BLOCK_BYTES,
+            Self::Q6K => k_quant::Q6_K_BLOCK_BYTES,
+        }
+    }
+
+    /// The `oxillama` type tag, which is how the CPU lane names a K-quant kernel.
+    fn gguf(self) -> GgufTensorType {
+        match self {
+            Self::Q4K => GgufTensorType::Q4K,
+            Self::Q5K => GgufTensorType::Q5K,
+            Self::Q6K => GgufTensorType::Q6K,
+            // Only the K-quant CPU path goes through `oxillama`; Q2_0 has its
+            // own SIMD kernel and never asks for a tag.
+            Self::Q2_0 => GgufTensorType::Q8_0,
+        }
+    }
+}
+
+/// `oxillama`'s zero-copy byte view over one tensor of a [`MiniGguf`]'s map.
+///
+/// The K-quant CPU kernels take a `SharedBytes` rather than a slice, so that a
+/// weight can be used straight out of the file instead of being copied into
+/// RAM first. That is the whole point of the mmap on a box where the model does
+/// not fit: a 5.7 GB file must stay 5.7 GB of page cache, not 5.7 GB of RSS.
+struct TensorBytes {
+    gg: Arc<MiniGguf>,
+    name: String,
+}
+
+// SAFETY: the payload is a slice of the file's `memmap2::Mmap`, owned by `gg`,
+// never written through, and unable to move while `gg` is alive. `tensor_bytes`
+// resolves the same range on every call, so the pointer `SharedBytes` caches is
+// the one it will dereference for the rest of its life. The view is read-only.
+unsafe impl ByteOwner for TensorBytes {
+    fn owned_bytes(&self) -> &[u8] {
+        self.gg.tensor_bytes(&self.name).unwrap_or(&[])
+    }
+}
+
+/// A packed weight matrix, mmap-backed and format-agnostic.
+///
+/// One type covers every quant the engine can run: the byte geometry and the
+/// arithmetic are chosen from `kind` inside [`QW::gemv`], so no layer struct has
+/// to know — or care — which format a particular file happens to use.
+#[derive(Clone)]
+struct QW {
+    name: String,
+    /// Row length (GGUF `ne[0]`): the matvec's input width.
+    m: usize,
+    /// Row count (GGUF `ne[1]`): the matvec's output width.
+    n: usize,
+    kind: QKind,
+    /// Zero-copy view over the packed bytes, resolved once at load. Keeps the
+    /// file's mapping alive for as long as the model is.
+    shared: SharedBytes,
+}
+
+impl QW {
+    /// The packed payload, `n * (m / block) * block_bytes` bytes.
+    fn bytes(&self) -> &[u8] {
+        &self.shared
+    }
+
+    /// Bytes per matrix row.
+    fn row_bytes(&self) -> usize {
+        (self.m / self.kind.block()) * self.kind.block_bytes()
+    }
+
+    /// `out[n] = W x`.
+    ///
+    /// `x` must already be in whatever basis the weights are stored in — i.e.
+    /// Hadamard-transformed exactly when the file is folded. That choice lives
+    /// with the caller, because it is a property of the file, not of the format.
+    fn gemv(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
+        if x.len() != self.m || out.len() != self.n {
+            return Err(err(&format!(
+                "'{}': gemv wants {}x{} but got x={} out={}",
+                self.name,
+                self.n,
+                self.m,
+                x.len(),
+                out.len()
+            )));
+        }
+        match self.kind {
+            QKind::Q2_0 => gemv_q2_0(self.bytes(), self.m, self.n, x, out),
+            kind => {
+                // The K-quants go through `oxillama`'s dispatcher. It already
+                // carries validated AVX2/AVX-512 kernels for all of them, and
+                // driving one implementation is what keeps the packed layouts
+                // honest: the same code that KORE's `k_quant` reference was
+                // cross-checked against is the code that runs here.
+                let qt = QuantTensor::from_shared(
+                    self.shared.clone(),
+                    vec![self.n, self.m],
+                    kind.gguf(),
+                );
+                let kernel = global_dispatcher()
+                    .get_kernel(qt.tensor_type)
+                    .map_err(|e| err(&format!("'{}': no kernel: {e}", self.name)))?;
+                kernel
+                    .gemv(&qt, x, out)
+                    .map_err(|e| err(&format!("'{}': gemv: {e}", self.name)))
+            }
+        }
+    }
+
+    /// One row, dequantized to f32.
+    fn row_f32(&self, index: usize) -> Result<Vec<f32>> {
+        let rb = self.row_bytes();
+        let start = index
+            .checked_mul(rb)
+            .ok_or_else(|| err(&format!("'{}': row {index} overflows", self.name)))?;
+        let row = self
+            .bytes()
+            .get(start..start + rb)
+            .ok_or_else(|| err(&format!("'{}': row {index} is out of range", self.name)))?;
+        match self.kind {
+            QKind::Q2_0 => kore_kernels::q2_0::dequantize_q2_0(row, self.m),
+            kind => k_quant::dequantize(kind.type_id(), row, self.m),
+        }
     }
 }
 
 struct DeltaLayer {
     attn_norm: Vec<f32>,
     post_norm: Vec<f32>,
-    qkv: Q2W,     // [hidden, qkv_dim]
-    z: Q2W,       // [hidden, hidden]
+    qkv: QW,     // [hidden, qkv_dim]
+    z: QW,       // [hidden, hidden]
     conv: Vec<f32>, // [conv_k, conv_ch] ne0=conv_k contiguous per channel
     a: Vec<f32>,  // [dt_rank] stored as -exp(A_log)
     alpha_w: Vec<f32>, // [hidden, dt_rank]
     beta_w: Vec<f32>,  // [hidden, dt_rank]
     dt_bias: Vec<f32>, // [dt_rank]
     ssm_norm: Vec<f32>, // [head_v_dim]
-    out: Q2W,     // [hidden, hidden]
-    ffn_gate: Q2W,
-    ffn_up: Q2W,
-    ffn_down: Q2W,
+    out: QW,     // [hidden, hidden]
+    ffn_gate: QW,
+    ffn_up: QW,
+    ffn_down: QW,
 }
 
 struct FullLayer {
     attn_norm: Vec<f32>,
     post_norm: Vec<f32>,
-    wq: Q2W, // [hidden, 2*n_heads*head_dim] interleaved q|gate per head
-    wk: Q2W, // [hidden, n_kv*head_dim]
-    wv: Q2W,
+    wq: QW, // [hidden, 2*n_heads*head_dim] interleaved q|gate per head
+    wk: QW, // [hidden, n_kv*head_dim]
+    wv: QW,
     q_norm: Vec<f32>, // [head_dim]
     k_norm: Vec<f32>,
-    wo: Q2W,
-    ffn_gate: Q2W,
-    ffn_up: Q2W,
-    ffn_down: Q2W,
+    wo: QW,
+    ffn_gate: QW,
+    ffn_up: QW,
+    ffn_down: QW,
 }
 
 enum Layer {
@@ -282,12 +439,23 @@ pub struct AttnState {
 
 pub struct Qwen35Model {
     pub cfg: Qwen35Config,
-    emb: Q2W,
+    emb: QW,
+    /// The vocabulary projection. Equals `emb` when the file ties the two.
+    head: QW,
     layers: Vec<Layer>,
     out_norm: Vec<f32>,
     /// sign tables: table for width `w` selected by sign_widths order.
     sign_tables: Vec<(usize, Vec<f32>)>,
-    head_inv: bool,
+    /// Whether the weights are stored folded through the Hadamard transform.
+    ///
+    /// `true` for a file that carries `prism.hadamard.*`: every folded weight is
+    /// `W' = H D W`, so every activation has to be rotated into that basis
+    /// before it meets one, and the embedding rows have to be rotated back
+    /// after lookup. `false` for a file with plain weights, where the transform
+    /// does not exist and must not be applied — a 9B K-quant file has no
+    /// `prism.hadamard.*` at all, and rotating it would silently turn every
+    /// matvec into noise.
+    folded: bool,
 }
 
 impl Qwen35Model {
@@ -336,37 +504,96 @@ impl Qwen35Model {
                 .unwrap_or(248046),
         };
 
-        // sign tables
-        let widths: Vec<usize> = match meta.get("prism.hadamard.sign_widths") {
-            Some(MetaVal::I64Arr(v)) => v.iter().map(|&x| x as usize).collect(),
-            _ => return Err(err("missing prism.hadamard.sign_widths")),
-        };
-        let values: Vec<f32> = match meta.get("prism.hadamard.sign_values") {
-            Some(MetaVal::F32Arr(v)) => v.clone(),
-            Some(MetaVal::I64Arr(v)) => v.iter().map(|&x| x as f32).collect(),
-            _ => return Err(err("missing prism.hadamard.sign_values")),
-        };
-        let total: usize = widths.iter().sum();
-        if values.len() < total {
-            return Err(err("sign_values shorter than sign_widths"));
+        // Geometry the recurrence depends on. State is per value head and is
+        // kept as a `[d_k, d_v]` matrix, so a file whose key and value head
+        // widths differ would index the two apart from each other; and the
+        // value heads borrow key heads, which only partitions cleanly when one
+        // count divides the other. Qwen3.5 ships 128/128 heads and n_v a
+        // multiple of n_k, so this is a guard against a foreign file rather
+        // than a limitation to work around.
+        if cfg.ssm_state * cfg.ssm_dt_rank != cfg.ssm_inner {
+            return Err(err(&format!(
+                "delta-net head widths disagree: {} key heads x {} state \
+                 != {} value dim",
+                cfg.ssm_groups, cfg.ssm_state, cfg.ssm_inner
+            )));
         }
-        let mut sign_tables = Vec::new();
-        let mut off = 0usize;
-        for &w in &widths {
-            sign_tables.push((w, values[off..off + w].to_vec()));
-            off += w;
+        if cfg.ssm_dt_rank % cfg.ssm_groups != 0 {
+            return Err(err(&format!(
+                "{} value heads is not a multiple of {} key heads",
+                cfg.ssm_dt_rank, cfg.ssm_groups
+            )));
         }
 
-        let q2w = |name: String, gg: &Arc<MiniGguf>| -> Result<Q2W> {
-            let t = gg.tensor(&name)?;
-            if t.type_id != kore_kernels::q2_0::Q2_0_TYPE_ID {
-                return Err(err(&format!("tensor '{name}' type {} != Q2_0", t.type_id)));
+        // Sign tables. Their presence *is* the fold: a file that carries them
+        // stores `W' = H D W` on the input axis of every listed weight, and one
+        // that does not stores plain weights. Absence is not an error -- it is
+        // the other, equally valid layout.
+        let folded = meta.contains_key("prism.hadamard.sign_widths");
+        let mut sign_tables = Vec::new();
+        if folded {
+            let widths: Vec<usize> = match meta.get("prism.hadamard.sign_widths") {
+                Some(MetaVal::I64Arr(v)) => v.iter().map(|&x| x as usize).collect(),
+                _ => return Err(err("prism.hadamard.sign_widths is not an integer array")),
+            };
+            let values: Vec<f32> = match meta.get("prism.hadamard.sign_values") {
+                Some(MetaVal::F32Arr(v)) => v.clone(),
+                Some(MetaVal::I64Arr(v)) => v.iter().map(|&x| x as f32).collect(),
+                _ => return Err(err("missing prism.hadamard.sign_values")),
+            };
+            let total: usize = widths.iter().sum();
+            if values.len() < total {
+                return Err(err("sign_values shorter than sign_widths"));
             }
-            Ok(Q2W {
+            let mut off = 0usize;
+            for &w in &widths {
+                sign_tables.push((w, values[off..off + w].to_vec()));
+                off += w;
+            }
+        }
+
+        // Any packed matrix the engine can compute, whatever the format.
+        let qw = |name: String, gg: &Arc<MiniGguf>| -> Result<QW> {
+            let t = gg.tensor(&name)?;
+            let kind = QKind::from_type_id(t.type_id).ok_or_else(|| {
+                err(&format!(
+                    "tensor '{name}' has GGML type {}, which this loader has no \
+                     packed kernel for (supported: Q2_0=42, Q4_K=12, Q5_K=13, Q6_K=14)",
+                    t.type_id
+                ))
+            })?;
+            if t.dims.len() < 2 {
+                return Err(err(&format!("tensor '{name}' is not a 2-D weight")));
+            }
+            let (m, n) = (t.dims[0], t.dims[1]);
+            if m == 0 || n == 0 || m % kind.block() != 0 {
+                return Err(err(&format!(
+                    "tensor '{name}' has row length {m}, not a multiple of the {} \
+                     weights per block of its format",
+                    kind.block()
+                )));
+            }
+            // Rows are packed back to back, each a whole number of blocks --
+            // the layout every packed kernel assumes.
+            let want = n * (m / kind.block()) * kind.block_bytes();
+            if t.nbytes < want {
+                return Err(err(&format!(
+                    "tensor '{name}' carries {} bytes but {want} are required",
+                    t.nbytes
+                )));
+            }
+            let owner: Arc<dyn ByteOwner> = Arc::new(TensorBytes {
                 gg: gg.clone(),
+                name: name.clone(),
+            });
+            let shared = SharedBytes::from_owner(owner, 0, want)
+                .ok_or_else(|| err(&format!("tensor '{name}': {want} bytes out of range")))?;
+            Ok(QW {
                 name,
-                m: t.dims[0],
-                n: t.dims[1],
+                m,
+                n,
+                kind,
+                shared,
             })
         };
         let f32w = |name: &str| -> Result<Vec<f32>> { gg.tensor_f32(name) };
@@ -376,20 +603,20 @@ impl Qwen35Model {
             let p = |s: &str| format!("blk.{i}.{s}");
             let attn_norm = f32w(&p("attn_norm.weight"))?;
             let post_norm = f32w(&p("post_attention_norm.weight"))?;
-            let fg = q2w(p("ffn_gate.weight"), &gg)?;
-            let fu = q2w(p("ffn_up.weight"), &gg)?;
-            let fd = q2w(p("ffn_down.weight"), &gg)?;
+            let fg = qw(p("ffn_gate.weight"), &gg)?;
+            let fu = qw(p("ffn_up.weight"), &gg)?;
+            let fd = qw(p("ffn_down.weight"), &gg)?;
 
             if (i + 1) % cfg.full_attn_interval == 0 {
                 layers.push(Layer::Full(FullLayer {
                     attn_norm,
                     post_norm,
-                    wq: q2w(p("attn_q.weight"), &gg)?,
-                    wk: q2w(p("attn_k.weight"), &gg)?,
-                    wv: q2w(p("attn_v.weight"), &gg)?,
+                    wq: qw(p("attn_q.weight"), &gg)?,
+                    wk: qw(p("attn_k.weight"), &gg)?,
+                    wv: qw(p("attn_v.weight"), &gg)?,
                     q_norm: f32w(&p("attn_q_norm.weight"))?,
                     k_norm: f32w(&p("attn_k_norm.weight"))?,
-                    wo: q2w(p("attn_output.weight"), &gg)?,
+                    wo: qw(p("attn_output.weight"), &gg)?,
                     ffn_gate: fg,
                     ffn_up: fu,
                     ffn_down: fd,
@@ -398,15 +625,15 @@ impl Qwen35Model {
                 layers.push(Layer::Delta(DeltaLayer {
                     attn_norm,
                     post_norm,
-                    qkv: q2w(p("attn_qkv.weight"), &gg)?,
-                    z: q2w(p("attn_gate.weight"), &gg)?,
+                    qkv: qw(p("attn_qkv.weight"), &gg)?,
+                    z: qw(p("attn_gate.weight"), &gg)?,
                     conv: f32w(&p("ssm_conv1d.weight"))?,
                     a: f32w(&p("ssm_a"))?,
                     alpha_w: f32w(&p("ssm_alpha.weight"))?,
                     beta_w: f32w(&p("ssm_beta.weight"))?,
                     dt_bias: f32w(&p("ssm_dt.bias"))?,
                     ssm_norm: f32w(&p("ssm_norm.weight"))?,
-                    out: q2w(p("ssm_out.weight"), &gg)?,
+                    out: qw(p("ssm_out.weight"), &gg)?,
                     ffn_gate: fg,
                     ffn_up: fu,
                     ffn_down: fd,
@@ -414,16 +641,33 @@ impl Qwen35Model {
             }
         }
 
-        let emb = q2w("token_embd.weight".to_string(), &gg)?;
+        let emb = qw("token_embd.weight".to_string(), &gg)?;
+        // Untied head: `output.weight` is the vocabulary projection in its own
+        // right, not a copy of the embedding matrix. Ternary Bonsai ties them;
+        // the K-quant files do not, and at `[hidden, vocab]` the head is the
+        // single largest weight read in a decode step, so silently using the
+        // embedding here would produce plausible-looking garbage.
+        let head = if gg.tensor("output.weight").is_ok() {
+            qw("output.weight".to_string(), &gg)?
+        } else {
+            emb.clone()
+        };
+        if head.m != cfg.hidden || head.n != cfg.vocab {
+            return Err(err(&format!(
+                "head is {}x{} but the model is hidden {} vocab {}",
+                head.n, head.m, cfg.hidden, cfg.vocab
+            )));
+        }
         let out_norm = f32w("output_norm.weight")?;
 
         Ok(Self {
             cfg,
             emb,
+            head,
             layers,
             out_norm,
             sign_tables,
-            head_inv: true,
+            folded,
         })
     }
 
@@ -436,8 +680,12 @@ impl Qwen35Model {
     }
 
     /// D H x in place (embedding restore direction).
+    ///
+    /// A no-op for an unfolded file: there is no transform to invert. Note this
+    /// is not the same as `KORE_HAD_OFF`, which is an ablation of a *folded*
+    /// model's transform.
     fn apply_t(&self, x: &mut [f32]) -> Result<()> {
-        if had_off() {
+        if !self.folded || had_off() {
             return Ok(());
         }
         let signs = self.signs_for(x.len())?;
@@ -445,9 +693,9 @@ impl Qwen35Model {
         Ok(())
     }
 
-    /// H D x in place (folded-matmul input direction, incl. tied head).
+    /// H D x in place (folded-matmul input direction, incl. a folded head).
     fn apply_t_inv(&self, x: &mut [f32]) -> Result<()> {
-        if had_off() {
+        if !self.folded || had_off() {
             return Ok(());
         }
         let signs = self.signs_for(x.len())?;
@@ -457,12 +705,8 @@ impl Qwen35Model {
 
     /// Embedding lookup + inverse-rotation restore.
     fn embed(&self, token: u32) -> Result<Vec<f32>> {
-        let m = self.emb.m;
-        let row_bytes = (m / 64) * 18;
-        let bytes = self.emb.bytes();
-        let row = &bytes[token as usize * row_bytes..(token as usize + 1) * row_bytes];
-        let mut x = kore_kernels::q2_0::dequantize_q2_0(row, m)?;
-        // inverse-lookup restore: D H x (WHT then signs)
+        let mut x = self.emb.row_f32(token as usize)?;
+        // inverse-lookup restore: D H x (WHT then signs); identity when unfolded
         self.apply_t(&mut x)?;
         Ok(x)
     }
@@ -482,18 +726,18 @@ impl Qwen35Model {
         }
     }
 
-    fn ffn(&self, x: &mut [f32], post_norm: &[f32], gate: &Q2W, up: &Q2W, down: &Q2W) -> Result<()> {
+    fn ffn(&self, x: &mut [f32], post_norm: &[f32], gate: &QW, up: &QW, down: &QW) -> Result<()> {
         let mut h = vec![0.0f32; self.cfg.hidden];
         rms_norm_into(x, post_norm, self.cfg.eps, &mut h);
         self.apply_t_inv(&mut h)?;
         let mut g = vec![0.0f32; self.cfg.ffn];
         let mut u = vec![0.0f32; self.cfg.ffn];
-        gate.gemv(&h, &mut g);
-        up.gemv(&h, &mut u);
+        gate.gemv(&h, &mut g)?;
+        up.gemv(&h, &mut u)?;
         let mut act: Vec<f32> = g.iter().zip(&u).map(|(a, b)| silu(*a) * b).collect();
         self.apply_t_inv(&mut act)?;
         let mut o = vec![0.0f32; self.cfg.hidden];
-        down.gemv(&act, &mut o);
+        down.gemv(&act, &mut o)?;
         for (xv, ov) in x.iter_mut().zip(&o) {
             *xv += ov;
         }
@@ -517,9 +761,9 @@ impl Qwen35Model {
         self.apply_t_inv(&mut ht)?;
 
         let mut qkv = vec![0.0f32; qkv_dim];
-        l.qkv.gemv(&ht, &mut qkv);
+        l.qkv.gemv(&ht, &mut qkv)?;
         let mut z = vec![0.0f32; hidden];
-        l.z.gemv(&ht, &mut z);
+        l.z.gemv(&ht, &mut z)?;
 
         let mut beta = vec![0.0f32; n_v];
         gemv_f32(&l.beta_w, hidden, &h, &mut beta);
@@ -562,13 +806,22 @@ impl Qwen35Model {
             l2_norm_inplace(&mut k[i * d_k..(i + 1) * d_k], cfg.eps);
         }
 
-        // gated delta rule per v-head (n_v == n_k here)
-        let scale = 1.0 / (d_v as f32).sqrt();
+        // gated delta rule, one state per *value* head.
+        //
+        // The q/k projections carry `n_k` heads and v carries `n_v`; when the
+        // two differ, each value head borrows a key head by *tiling* the key
+        // heads up to the value head count -- value head `hv` reads key head
+        // `hv % n_k`. That is what llama.cpp's `ggml_gated_delta_net` does
+        // (`iq1 = iv1 % neq1`, and the unfused path's `ggml_repeat`), and it is
+        // what the GGUF layout is built for. Bonsai-2B has n_v == n_k, so the
+        // mapping is the identity there and its output cannot move.
+        let scale = 1.0 / (d_k as f32).sqrt();
         let mut out = vec![0.0f32; n_v * d_v];
         for hv in 0..n_v {
             let s = &mut st.state[hv * d_v * d_v..(hv + 1) * d_v * d_v];
-            let ki = &k[hv * d_k..(hv + 1) * d_k];
-            let qi = &q[hv * d_k..(hv + 1) * d_k];
+            let hk = hv % n_k;
+            let ki = &k[hk * d_k..(hk + 1) * d_k];
+            let qi = &q[hk * d_k..(hk + 1) * d_k];
             let vi = &v[hv * d_v..(hv + 1) * d_v];
             let decay = gate[hv].exp();
             for val in s.iter_mut() {
@@ -610,7 +863,7 @@ impl Qwen35Model {
 
         self.apply_t_inv(&mut o)?;
         let mut proj = vec![0.0f32; hidden];
-        l.out.gemv(&o, &mut proj);
+        l.out.gemv(&o, &mut proj)?;
         for (xv, pv) in x.iter_mut().zip(&proj) {
             *xv += pv;
         }
@@ -630,11 +883,11 @@ impl Qwen35Model {
         self.apply_t_inv(&mut h)?;
 
         let mut qg = vec![0.0f32; n_h * hd * 2];
-        l.wq.gemv(&h, &mut qg);
+        l.wq.gemv(&h, &mut qg)?;
         let mut kk = vec![0.0f32; kv_dim];
-        l.wk.gemv(&h, &mut kk);
+        l.wk.gemv(&h, &mut kk)?;
         let mut vv = vec![0.0f32; kv_dim];
-        l.wv.gemv(&h, &mut vv);
+        l.wv.gemv(&h, &mut vv)?;
 
         // per-head q rmsnorm + gate extraction, k rmsnorm
         let mut q = vec![0.0f32; n_h * hd];
@@ -698,22 +951,24 @@ impl Qwen35Model {
 
         self.apply_t_inv(&mut out)?;
         let mut proj = vec![0.0f32; hidden];
-        l.wo.gemv(&out, &mut proj);
+        l.wo.gemv(&out, &mut proj)?;
         for (xv, pv) in x.iter_mut().zip(&proj) {
             *xv += pv;
         }
         Ok(())
     }
 
-    /// Logits for a hidden state (tied embedding head, inverse transform).
+    /// Logits for a hidden state (vocabulary projection, inverse transform).
     pub fn logits(&self, x: &[f32]) -> Result<Vec<f32>> {
         let mut h = vec![0.0f32; self.cfg.hidden];
         rms_norm_into(x, &self.out_norm, self.cfg.eps, &mut h);
-        if self.head_inv {
+        // Folded files store the head rotated like every other folded weight, so
+        // its input needs the same rotation. An unfolded head reads `h` as-is.
+        if self.folded {
             self.apply_t_inv(&mut h)?;
         }
         let mut logits = vec![0.0f32; self.cfg.vocab];
-        gemv_q2_0(self.emb.bytes(), self.emb.m, self.cfg.vocab, &h, &mut logits)?;
+        self.head.gemv(&h, &mut logits)?;
         Ok(logits)
     }
 
@@ -811,12 +1066,12 @@ struct GpuDelta {
     beta_w: Tensor,
     dt_bias: Tensor,
     ssm_norm: Tensor,
-    qkv: Tensor,
-    z: Tensor,
-    out: Tensor,
-    ffn_gate: Tensor,
-    ffn_up: Tensor,
-    ffn_down: Tensor,
+    qkv: GpuW,
+    z: GpuW,
+    out: GpuW,
+    ffn_gate: GpuW,
+    ffn_up: GpuW,
+    ffn_down: GpuW,
 }
 
 struct GpuFull {
@@ -824,13 +1079,13 @@ struct GpuFull {
     post_norm: Tensor,
     q_norm: Tensor,
     k_norm: Tensor,
-    wq: Tensor,
-    wk: Tensor,
-    wv: Tensor,
-    wo: Tensor,
-    ffn_gate: Tensor,
-    ffn_up: Tensor,
-    ffn_down: Tensor,
+    wq: GpuW,
+    wk: GpuW,
+    wv: GpuW,
+    wo: GpuW,
+    ffn_gate: GpuW,
+    ffn_up: GpuW,
+    ffn_down: GpuW,
 }
 
 enum GpuLayer {
@@ -903,6 +1158,17 @@ impl Rewind {
     }
 }
 
+/// A device-resident packed weight plus what it takes to compute with it.
+#[derive(Clone)]
+struct GpuW {
+    t: Tensor,
+    kind: QKind,
+    /// Row length (matvec input width).
+    m: usize,
+    /// Row count (matvec output width).
+    n: usize,
+}
+
 /// Qwen3.5 with all weights device-resident; single-token decode via the
 /// fused Vulkan kernels. Requires `n_k == n_v` and `d_k == d_v` (true for
 /// Bonsai-2B) plus head_dim == 256.
@@ -910,11 +1176,18 @@ pub struct Qwen35Gpu {
     cfg: Qwen35Config,
     device: Device,
     backend: Arc<dyn DeviceBackend>,
-    emb: Tensor, // U8 packed Q2_0 rows
-    emb_m: usize,
+    /// The vocabulary projection (== `emb` for a tied file).
+    head: GpuW,
     layers: Vec<GpuLayer>,
     out_norm: Tensor,
     signs: Vec<(usize, Tensor)>,
+    /// Whether the weights are folded through the Hadamard transform; see
+    /// [`Qwen35Model::folded`]. Drives the `had` flag of every fused pre-op and
+    /// whether `had_fwd` rotates at all.
+    folded: bool,
+    /// Stand-in bound where a sign table would go when `folded` is false. Never
+    /// read: the fused kernels only touch `signs` when the Hadamard stage runs.
+    no_signs: Tensor,
 }
 
 impl Qwen35Gpu {
@@ -922,12 +1195,17 @@ impl Qwen35Gpu {
     pub fn from_cpu(cpu: &Qwen35Model, device: Device) -> Result<Self> {
         let backend = get_backend(device).ok_or_else(|| err("no backend for device"))?;
         let cfg = cpu.cfg.clone();
-        let n_k = cfg.ssm_groups;
         let n_v = cfg.ssm_dt_rank;
         let d_k = cfg.ssm_state;
         let d_v = cfg.ssm_inner / n_v;
-        if n_k != n_v || d_k != d_v {
-            return Err(err("gpu path requires n_k == n_v and d_k == d_v"));
+        // `gdn_step` reads one key head per value head and stages a single head
+        // of k, q and v per workgroup, so the two head dims have to agree with
+        // each other and with the workgroup size. Head *counts* are free to
+        // differ: the kernel groups them itself.
+        if d_k != d_v || d_k != 128 {
+            return Err(err(&format!(
+                "gpu path requires d_k == d_v == 128, got {d_k} and {d_v}"
+            )));
         }
         if cfg.head_dim != 256 {
             return Err(err("gpu path requires head_dim 256"));
@@ -938,13 +1216,25 @@ impl Qwen35Gpu {
                 .to(device)
                 .map_err(|e| err(&format!("upload: {e}")))
         };
-        let up_q2 = |w: &Q2W| -> Result<Tensor> {
-            let bytes = kore_kernels::q2_0::repack_q2_0(w.bytes(), w.m, w.n)?;
-            let n = bytes.len();
-            let s = Storage::from_bytes(DType::U8, n, bytes)?;
-            Tensor::from_storage(s, &[n])
+        let up_w = |w: &QW| -> Result<GpuW> {
+            let bytes = match w.kind {
+                // The ternary kernel reads a padded, reordered copy (four rows
+                // per workgroup). The K-quant kernels read the file's own
+                // packing, so their payload goes up untouched.
+                QKind::Q2_0 => kore_kernels::q2_0::repack_q2_0(w.bytes(), w.m, w.n)?,
+                _ => w.bytes().to_vec(),
+            };
+            let len = bytes.len();
+            let s = Storage::from_bytes(DType::U8, len, bytes)?;
+            let t = Tensor::from_storage(s, &[len])
                 .to(device)
-                .map_err(|e| err(&format!("upload q2: {e}")))
+                .map_err(|e| err(&format!("upload '{}': {e}", w.name)))?;
+            Ok(GpuW {
+                t,
+                kind: w.kind,
+                m: w.m,
+                n: w.n,
+            })
         };
 
         let mut layers = Vec::with_capacity(cfg.n_layers);
@@ -959,37 +1249,30 @@ impl Qwen35Gpu {
                     beta_w: up_f32(&l.beta_w)?,
                     dt_bias: up_f32(&l.dt_bias)?,
                     ssm_norm: up_f32(&l.ssm_norm)?,
-                    qkv: up_q2(&l.qkv)?,
-                    z: up_q2(&l.z)?,
-                    out: up_q2(&l.out)?,
-                    ffn_gate: up_q2(&l.ffn_gate)?,
-                    ffn_up: up_q2(&l.ffn_up)?,
-                    ffn_down: up_q2(&l.ffn_down)?,
+                    qkv: up_w(&l.qkv)?,
+                    z: up_w(&l.z)?,
+                    out: up_w(&l.out)?,
+                    ffn_gate: up_w(&l.ffn_gate)?,
+                    ffn_up: up_w(&l.ffn_up)?,
+                    ffn_down: up_w(&l.ffn_down)?,
                 })),
                 Layer::Full(l) => layers.push(GpuLayer::Full(GpuFull {
                     attn_norm: up_f32(&l.attn_norm)?,
                     post_norm: up_f32(&l.post_norm)?,
                     q_norm: up_f32(&l.q_norm)?,
                     k_norm: up_f32(&l.k_norm)?,
-                    wq: up_q2(&l.wq)?,
-                    wk: up_q2(&l.wk)?,
-                    wv: up_q2(&l.wv)?,
-                    wo: up_q2(&l.wo)?,
-                    ffn_gate: up_q2(&l.ffn_gate)?,
-                    ffn_up: up_q2(&l.ffn_up)?,
-                    ffn_down: up_q2(&l.ffn_down)?,
+                    wq: up_w(&l.wq)?,
+                    wk: up_w(&l.wk)?,
+                    wv: up_w(&l.wv)?,
+                    wo: up_w(&l.wo)?,
+                    ffn_gate: up_w(&l.ffn_gate)?,
+                    ffn_up: up_w(&l.ffn_up)?,
+                    ffn_down: up_w(&l.ffn_down)?,
                 })),
             }
         }
 
-        let emb = {
-            let bytes = kore_kernels::q2_0::repack_q2_0(cpu.emb.bytes(), cpu.emb.m, cpu.emb.n)?;
-            let n = bytes.len();
-            let s = Storage::from_bytes(DType::U8, n, bytes)?;
-            Tensor::from_storage(s, &[n])
-                .to(device)
-                .map_err(|e| err(&format!("upload emb: {e}")))?
-        };
+        let head = up_w(&cpu.head)?;
 
         let mut signs = Vec::new();
         for (w, t) in &cpu.sign_tables {
@@ -997,11 +1280,14 @@ impl Qwen35Gpu {
         }
 
         Ok(Self {
-            emb_m: cpu.emb.m,
+            folded: cpu.folded,
+            // One float is enough: the fused kernels bind this slot on every
+            // pre-op but only index it when the Hadamard stage runs.
+            no_signs: up_f32(&[0.0])?,
             cfg,
             device,
             backend,
-            emb,
+            head,
             layers,
             out_norm: up_f32(&cpu.out_norm)?,
             signs,
@@ -1056,6 +1342,11 @@ impl Qwen35Gpu {
     }
 
     fn had_fwd(&self, x: &Tensor) -> Result<Tensor> {
+        // An unfolded model's weights are not rotated, so neither is its
+        // activation: the readout feeds `ssm_out` directly.
+        if !self.folded {
+            return Ok(x.clone());
+        }
         // The signed Hadamard is per-row and the sign table covers one row, so a
         // multi-column batch reuses the single-row table. Keying on `numel` would
         // demand an `m * cols` table that the model does not have; keying on the
@@ -1069,6 +1360,30 @@ impl Qwen35Gpu {
     /// Returns `(x_r, down)` where `x_r = x + res` is the residual stream *before*
     /// the FFN output. The caller carries `down` forward as the pending residual,
     /// so the trailing `x += down` add is absorbed into the next layer's norm
+    /// `out = W x` for whichever quant the file used.
+    fn wgemv(&self, w: &GpuW, x: &Tensor) -> Result<Tensor> {
+        let b = &self.backend;
+        match w.kind {
+            QKind::Q2_0 => b.gemv_q2_0(x, &w.t, w.n, w.m),
+            QKind::Q4K => b.gemv_q4_k(x, &w.t, w.n, w.m),
+            QKind::Q5K => b.gemv_q5_k(x, &w.t, w.n, w.m),
+            QKind::Q6K => b.gemv_q6_k(x, &w.t, w.n, w.m),
+        }
+    }
+
+    /// The sign table for `width`, or the placeholder when nothing is folded.
+    ///
+    /// An unfolded model has no sign tables at all -- `signs_t` would fail, and
+    /// the fused kernels must still be handed *something* for a binding they
+    /// will not read.
+    fn signs_or_placeholder(&self, width: usize) -> Result<&Tensor> {
+        if self.folded {
+            self.signs_t(width)
+        } else {
+            Ok(&self.no_signs)
+        }
+    }
+
     /// instead of costing its own dispatch.
     #[allow(clippy::too_many_arguments)]
     fn ffn_gpu(
@@ -1076,22 +1391,30 @@ impl Qwen35Gpu {
         x: &Tensor,
         res: &Tensor,
         post_norm: &Tensor,
-        g: &Tensor,
-        u: &Tensor,
-        d: &Tensor,
+        g: &GpuW,
+        u: &GpuW,
+        d: &GpuW,
         ffn: usize,
         hidden: usize,
     ) -> Result<(Tensor, Tensor)> {
         let b = &self.backend;
-        // Fused residual-add + RMSNorm + Hadamard: one dispatch instead of two.
-        // The sign table is one row wide (the batch shares it across rows).
-        let (x_r, _h, ht) = b.had_pre(0, x, res, post_norm, self.signs_t(hidden)?, self.cfg.eps)?;
-        let gv = b.gemv_q2_0(&ht, g, ffn, hidden)?;
-        let uv = b.gemv_q2_0(&ht, u, ffn, hidden)?;
-        // Fused SwiGLU + Hadamard (the second half of the FFN's activation pair).
-        let signs_ffn = self.signs_t(ffn)?;
-        let (_gv, _uv, actt) = b.had_pre(2, &gv, &uv, signs_ffn, signs_ffn, self.cfg.eps)?;
-        let down = b.gemv_q2_0(&actt, d, hidden, ffn)?;
+        // Fused residual-add + RMSNorm [+ Hadamard]: one dispatch instead of
+        // two. The sign table is one row wide (the batch shares it across rows).
+        let (x_r, _h, ht) = b.had_pre(
+            0,
+            self.folded,
+            x,
+            res,
+            post_norm,
+            self.signs_or_placeholder(hidden)?,
+            self.cfg.eps,
+        )?;
+        let gv = self.wgemv(g, &ht)?;
+        let uv = self.wgemv(u, &ht)?;
+        // Fused SwiGLU [+ Hadamard] (the second half of the FFN's activation pair).
+        let signs_ffn = self.signs_or_placeholder(ffn)?;
+        let (_gv, _uv, actt) = b.had_pre(2, self.folded, &gv, &uv, signs_ffn, signs_ffn, self.cfg.eps)?;
+        let down = self.wgemv(d, &actt)?;
         Ok((x_r, down))
     }
 
@@ -1101,11 +1424,11 @@ impl Qwen35Gpu {
         let cfg = &self.cfg;
         let hidden = cfg.hidden;
         let ffn = cfg.ffn;
+        let n_k = cfg.ssm_groups;
         let n_v = cfg.ssm_dt_rank;
         let d_k = cfg.ssm_state;
         let d_v = cfg.ssm_inner / n_v;
         let conv_dim = cfg.ssm_inner + 2 * cfg.ssm_groups * cfg.ssm_state;
-        let kv_dim = cfg.n_kv * cfg.head_dim;
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
 
         // embed on CPU (row dequant + restore), upload
@@ -1126,23 +1449,23 @@ impl Qwen35Gpu {
             match (layer, st) {
                 (GpuLayer::Delta(l), GpuState::Delta { hist, state }) => {
                     // Fold the pending residual in, normalize and rotate in one dispatch.
-                    let (x_r, h, ht) = b.had_pre(0, &x, &pending, &l.attn_norm, self.signs_t(hidden)?, cfg.eps)?;
-                    let qkv = b.gemv_q2_0(&ht, &l.qkv, conv_dim, hidden)?;
-                    let z = b.gemv_q2_0(&ht, &l.z, hidden, hidden)?;
+                    let (x_r, h, ht) = b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, self.signs_or_placeholder(hidden)?, cfg.eps)?;
+                    let qkv = self.wgemv(&l.qkv, &ht)?;
+                    let z = self.wgemv(&l.z, &ht)?;
                     let (beta, gate) = b.gdn_gates(&h, &l.alpha_w, &l.beta_w, &l.dt_bias, &l.a, hidden, n_v)?;
                     let conv_out = b.gdn_conv(&qkv, &l.conv, hist, conv_dim, cfg.ssm_conv)?;
-                    let o = b.gdn_step(&conv_out, &z, state, &beta, &gate, &l.ssm_norm, n_v, d_k, d_v, cfg.eps)?;
+                    let o = b.gdn_step(&conv_out, &z, state, &beta, &gate, &l.ssm_norm, n_v, n_k, d_k, d_v, cfg.eps)?;
                     let ot = self.had_fwd(&o)?;
-                    let proj = b.gemv_q2_0(&ot, &l.out, hidden, hidden)?;
+                    let proj = self.wgemv(&l.out, &ot)?;
                     let (x_next, down) = self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
                     x = x_next;
                     pending = down;
                 }
                 (GpuLayer::Full(l), GpuState::Full { kc, vc, k_scales, v_scales, len }) => {
-                    let (x_r, _h, ht) = b.had_pre(0, &x, &pending, &l.attn_norm, self.signs_t(hidden)?, cfg.eps)?;
-                    let qg = b.gemv_q2_0(&ht, &l.wq, 2 * cfg.n_heads * cfg.head_dim, hidden)?;
-                    let kk = b.gemv_q2_0(&ht, &l.wk, kv_dim, hidden)?;
-                    let vv = b.gemv_q2_0(&ht, &l.wv, kv_dim, hidden)?;
+                    let (x_r, _h, ht) = b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, self.signs_or_placeholder(hidden)?, cfg.eps)?;
+                    let qg = self.wgemv(&l.wq, &ht)?;
+                    let kk = self.wgemv(&l.wk, &ht)?;
+                    let vv = self.wgemv(&l.wv, &ht)?;
                     let (q, k, g) = b.qknorm_rope(
                         &qg, &kk, &l.q_norm, &l.k_norm,
                         cfg.n_heads, cfg.n_kv, cfg.head_dim, cfg.rope_dim,
@@ -1185,8 +1508,8 @@ impl Qwen35Gpu {
                     };
                     // ---- end Q8 path ----------------------------------------------
 
-                    let (_a, _bv, ot) = b.had_pre(3, &attn, &g, self.signs_t(hidden)?, self.signs_t(hidden)?, cfg.eps)?;
-                    let proj = b.gemv_q2_0(&ot, &l.wo, hidden, hidden)?;
+                    let (_a, _bv, ot) = b.had_pre(3, self.folded, &attn, &g, self.signs_or_placeholder(hidden)?, self.signs_or_placeholder(hidden)?, cfg.eps)?;
+                    let proj = self.wgemv(&l.wo, &ot)?;
                     let (x_next, down) = self.ffn_gpu(&x_r, &proj, &l.post_norm, &l.ffn_gate, &l.ffn_up, &l.ffn_down, ffn, hidden)?;
                     x = x_next;
                     pending = down;
@@ -1195,8 +1518,8 @@ impl Qwen35Gpu {
             }
         }
 
-        let (_r, _h, ht) = b.had_pre(0, &x, &pending, &self.out_norm, self.signs_t(hidden)?, cfg.eps)?;
-        let logits = b.gemv_q2_0(&ht, &self.emb, cfg.vocab, self.emb_m)?;
+        let (_r, _h, ht) = b.had_pre(0, self.folded, &x, &pending, &self.out_norm, self.signs_or_placeholder(hidden)?, cfg.eps)?;
+        let logits = self.wgemv(&self.head, &ht)?;
         let toks = b.argmax_last_dim(&logits)?;
         Ok(toks[0])
     }
@@ -1367,11 +1690,11 @@ impl Qwen35Gpu {
         }
         let hidden = cfg.hidden;
         let ffn = cfg.ffn;
+        let n_k = cfg.ssm_groups;
         let n_v = cfg.ssm_dt_rank;
         let d_k = cfg.ssm_state;
         let d_v = cfg.ssm_inner / n_v;
         let conv_dim = cfg.ssm_inner + 2 * cfg.ssm_groups * cfg.ssm_state;
-        let kv_dim = cfg.n_kv * cfg.head_dim;
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
 
         // Embed every column on the CPU (row dequant + restore), upload as one block.
@@ -1401,14 +1724,14 @@ impl Qwen35Gpu {
             .to(self.device)
             .map_err(|e2| err(&format!("attention staging: {e2}")))?;
 
-        let signs_h = self.signs_t(hidden)?;
+        let signs_h = self.signs_or_placeholder(hidden)?;
 
         for (li, (layer, st)) in self.layers.iter().zip(states.iter_mut()).enumerate() {
             match (layer, st) {
                 (GpuLayer::Delta(l), GpuState::Delta { hist, state }) => {
-                    let (x_r, h, ht) = b.had_pre(0, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
-                    let qkv = b.gemv_q2_0(&ht, &l.qkv, conv_dim, hidden)?;
-                    let z = b.gemv_q2_0(&ht, &l.z, hidden, hidden)?;
+                    let (x_r, h, ht) = b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
+                    let qkv = self.wgemv(&l.qkv, &ht)?;
+                    let z = self.wgemv(&l.z, &ht)?;
 
                     // The recurrent scan: conv history and DeltaNet state carry
                     // row to row, so the columns are strictly sequential here.
@@ -1432,6 +1755,7 @@ impl Qwen35Gpu {
                             &gate,
                             &l.ssm_norm,
                             n_v,
+                            n_k,
                             d_k,
                             d_v,
                             cfg.eps,
@@ -1447,7 +1771,7 @@ impl Qwen35Gpu {
                     // Batched tail: the readout Hadamard and the FFN stream the
                     // weight once for all columns.
                     let ot = self.had_fwd(&o)?;
-                    let proj = b.gemv_q2_0(&ot, &l.out, hidden, hidden)?;
+                    let proj = self.wgemv(&l.out, &ot)?;
                     let (x_next, down) = self.ffn_gpu(
                         &x_r,
                         &proj,
@@ -1462,10 +1786,10 @@ impl Qwen35Gpu {
                     pending = down;
                 }
                 (GpuLayer::Full(l), GpuState::Full { kc, vc, k_scales, v_scales, len }) => {
-                    let (x_r, _h, ht) = b.had_pre(0, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
-                    let qg = b.gemv_q2_0(&ht, &l.wq, 2 * cfg.n_heads * cfg.head_dim, hidden)?;
-                    let kk = b.gemv_q2_0(&ht, &l.wk, kv_dim, hidden)?;
-                    let vv = b.gemv_q2_0(&ht, &l.wv, kv_dim, hidden)?;
+                    let (x_r, _h, ht) = b.had_pre(0, self.folded, &x, &pending, &l.attn_norm, signs_h, cfg.eps)?;
+                    let qg = self.wgemv(&l.wq, &ht)?;
+                    let kk = self.wgemv(&l.wk, &ht)?;
+                    let vv = self.wgemv(&l.wv, &ht)?;
                     let (q, k, g) = b.qknorm_rope(
                         &qg,
                         &kk,
@@ -1542,8 +1866,8 @@ impl Qwen35Gpu {
                         attn_staging.clone()
                     };
 
-                    let (_a, _bv, ot) = b.had_pre(3, &attn, &g, signs_h, signs_h, cfg.eps)?;
-                    let proj = b.gemv_q2_0(&ot, &l.wo, hidden, hidden)?;
+                    let (_a, _bv, ot) = b.had_pre(3, self.folded, &attn, &g, signs_h, signs_h, cfg.eps)?;
+                    let proj = self.wgemv(&l.wo, &ot)?;
                     let (x_next, down) = self.ffn_gpu(
                         &x_r,
                         &proj,
@@ -1566,7 +1890,7 @@ impl Qwen35Gpu {
             // Running the head here would compute `m` predictions nobody reads.
             return Ok(Vec::new());
         }
-        let (_r, _h, ht) = b.had_pre(0, &x, &pending, &self.out_norm, signs_h, cfg.eps)?;
+        let (_r, _h, ht) = b.had_pre(0, self.folded, &x, &pending, &self.out_norm, signs_h, cfg.eps)?;
         // A prefill chunk needs the prediction at its last position only. The
         // head is row-independent, so projecting that row on its own is the same
         // arithmetic as reading it out of the full `[m, vocab]` result.
@@ -1575,7 +1899,7 @@ impl Qwen35Gpu {
         } else {
             ht
         };
-        let logits = b.gemv_q2_0(&ht, &self.emb, cfg.vocab, self.emb_m)?;
+        let logits = self.wgemv(&self.head, &ht)?;
         b.argmax_last_dim(&logits)
     }
 
