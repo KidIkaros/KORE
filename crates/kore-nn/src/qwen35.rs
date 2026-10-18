@@ -51,6 +51,7 @@ use std::sync::Arc;
 use kore_core::{KoreError, Result};
 
 use crate::gguf_min::{MetaVal, MiniGguf};
+use crate::moe::{CacheOutcome, ExpertCache};
 use kore_kernels::k_quant;
 use kore_kernels::q2_0::gemv_q2_0;
 use oxillama_gguf::{ByteOwner, GgufTensorType, SharedBytes};
@@ -1581,6 +1582,163 @@ struct GpuFfn {
     down: GpuW,
 }
 
+/// A stacked expert matrix whose device copies stream through a small slot pool.
+///
+/// The host side is the file's own mapping: `host.expert(e, ..)` is a byte
+/// window, so a miss costs exactly one upload of the window that was asked for,
+/// and an expert outside the top-k is never touched at all. Replacement is
+/// [`ExpertCache`]'s LRU -- the policy is shared with the CPU-side prototype in
+/// `moe.rs` rather than reimplemented here.
+///
+/// Streaming is a *residency* concern only. A slot is fed to the same
+/// `gemv_q*` kernel that an all-resident bank would use, over the same bytes, so
+/// an offloaded run is bit-identical to a resident one by construction. The
+/// interesting failures are therefore all address arithmetic -- which window,
+/// which slot, which expert -- and `streamed_experts_match_resident_by_bit`
+/// below pins exactly that, evictions included.
+///
+/// Not yet consumed by the device FFN; the routed expert loop lands on top of
+/// this (see the P6.3/P6.4 notes in the revamp plan) and will drop this
+/// `allow`.
+#[allow(dead_code)]
+struct DeviceBank {
+    /// The whole stacked tensor; one expert every `host.byte_len()` bytes.
+    host: QW,
+    /// One entry per device slot: which expert it holds, and its device copy.
+    slots: Vec<Option<(usize, GpuW)>>,
+    cache: ExpertCache,
+    /// Bytes moved host -> device since construction.
+    uploaded: u64,
+}
+
+#[allow(dead_code)]
+impl DeviceBank {
+    /// A bank over `host`, with room for `n_slots` experts on the device.
+    ///
+    /// The slot count is raised to `n_expert_used` (never above `n_experts`):
+    /// one token needs its whole top-k, so a smaller pool would evict an expert
+    /// it is about to need again.
+    fn new(host: QW, n_experts: usize, n_slots: usize, n_expert_used: usize) -> Result<Self> {
+        let block = host.kind.block();
+        if host.m == 0 || !host.m.is_multiple_of(block) {
+            return Err(err(&format!(
+                "'{}': row width {} is not a whole number of {block}-weight blocks",
+                host.name, host.m
+            )));
+        }
+        if n_experts == 0 {
+            return Err(err(&format!("'{}': expert bank is empty", host.name)));
+        }
+        let per = host.byte_len();
+        let payload = host.owner.owned_bytes().len();
+        let end = per
+            .checked_mul(n_experts)
+            .and_then(|need| need.checked_add(host.off));
+        match end {
+            Some(end) if end <= payload => {}
+            _ => {
+                return Err(err(&format!(
+                    "'{}': {n_experts} experts at {per} B do not fit the {payload} B payload",
+                    host.name
+                )))
+            }
+        }
+        let n_slots = n_slots.max(n_expert_used).clamp(1, n_experts);
+        Ok(Self {
+            host,
+            slots: (0..n_slots).map(|_| None).collect(),
+            cache: ExpertCache::new(n_experts, n_slots),
+            uploaded: 0,
+        })
+    }
+
+    fn n_slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn hits(&self) -> u64 {
+        self.cache.hits()
+    }
+
+    fn misses(&self) -> u64 {
+        self.cache.misses()
+    }
+
+    fn uploaded(&self) -> u64 {
+        self.uploaded
+    }
+
+    /// The slot holding expert `e`, uploading it first if it is not resident.
+    ///
+    /// The returned `GpuW` is shaped like the host window, so callers hand it to
+    /// the same `wgemv` a resident weight uses; nothing about the matvec changes.
+    fn acquire(&mut self, e: usize, b: &dyn DeviceBackend, device: Device) -> Result<&GpuW> {
+        let slot = match self.cache.acquire(e) {
+            CacheOutcome::Hit => self.slot_holding(e).ok_or_else(|| {
+                err(&format!(
+                    "'{}': expert {e} is resident but owns no slot",
+                    self.host.name
+                ))
+            })?,
+            CacheOutcome::Miss { evicted } => {
+                let slot = match evicted {
+                    Some(v) => self.slot_holding(v).ok_or_else(|| {
+                        err(&format!(
+                            "'{}': evicted expert {v} owns no slot",
+                            self.host.name
+                        ))
+                    })?,
+                    None => self.slots.iter().position(|s| s.is_none()).ok_or_else(|| {
+                        err(&format!(
+                            "'{}': no free slot for expert {e}",
+                            self.host.name
+                        ))
+                    })?,
+                };
+                let w = self.host.expert(e, self.host.byte_len());
+                // The ternary kernel reads a padded, row-reordered copy. Every
+                // other format's payload goes up exactly as the file packs it,
+                // so a miss is one upload and no repacking.
+                let t = match w.kind {
+                    QKind::Q2_0 => {
+                        let packed = kore_kernels::q2_0::repack_q2_0(w.bytes(), w.m, w.n)?;
+                        let len = packed.len();
+                        self.uploaded += len as u64;
+                        Tensor::from_storage(b.upload_u8(&packed, device)?, &[len])
+                    }
+                    _ => {
+                        let bytes = w.bytes();
+                        self.uploaded += bytes.len() as u64;
+                        Tensor::from_storage(b.upload_u8(bytes, device)?, &[bytes.len()])
+                    }
+                };
+                self.slots[slot] = Some((
+                    e,
+                    GpuW {
+                        t,
+                        kind: w.kind,
+                        m: w.m,
+                        n: w.n,
+                    },
+                ));
+                slot
+            }
+        };
+        Ok(&self
+            .slots
+            .get(slot)
+            .and_then(|s| s.as_ref())
+            .expect("acquire fills the slot it returns")
+            .1)
+    }
+
+    fn slot_holding(&self, e: usize) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|s| matches!(s, Some((held, _)) if *held == e))
+    }
+}
+
 /// Qwen3.5 with all weights device-resident; single-token decode via the
 /// fused Vulkan kernels. Requires `n_k == n_v` and `d_k == d_v` (true for
 /// Bonsai-2B) plus head_dim == 256.
@@ -2500,5 +2658,142 @@ impl Qwen35Gpu {
             next = self.forward(cpu, tok, tokens.len() + k, &mut states)?;
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod device_bank_tests {
+    use super::*;
+
+    /// A [`ByteOwner`] over a buffer the test owns, so a bank can be built over
+    /// bytes that did not come out of a mapped file.
+    struct OwnedVec(Vec<u8>);
+
+    unsafe impl ByteOwner for OwnedVec {
+        fn owned_bytes(&self) -> &[u8] {
+            &self.0
+        }
+    }
+
+    /// `n_experts` stacked Q4_K matrices of `n` rows by `m` columns, with a
+    /// deterministic payload that differs at every byte.
+    fn stacked_q4k(n_experts: usize, m: usize, n: usize) -> QW {
+        let kind = QKind::Q4K;
+        let per = n * (m / kind.block()) * kind.block_bytes();
+        let mut bytes = vec![0u8; per * n_experts];
+        let mut s: u32 = 0x1234_5678;
+        for b in bytes.iter_mut() {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (s >> 24) as u8;
+        }
+        // A super-block's scales are random bytes after the loop above, and a
+        // garbage `d`/`dmin` pair can dequantize to all zeros -- which would
+        // make byte-identity vacuous. Give every block a finite scale.
+        for blk in bytes.chunks_mut(k_quant::Q4_K_BLOCK_BYTES) {
+            blk[0..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+            blk[2..4].copy_from_slice(&half::f16::from_f32(0.25).to_le_bytes());
+        }
+        let owner: Arc<dyn ByteOwner> = Arc::new(OwnedVec(bytes));
+        let shared =
+            SharedBytes::from_owner(owner.clone(), 0, per * n_experts).expect("whole-tensor view");
+        QW {
+            name: "test.exps".into(),
+            m,
+            n,
+            kind,
+            off: 0,
+            shared,
+            owner,
+        }
+    }
+
+    /// The P6.3 gate: an evicting slot pool must produce the same bits as an
+    /// all-resident bank. Both arms run the same kernel over the same payload,
+    /// so anything that differs is address arithmetic -- a wrong expert window,
+    /// a slot that was not overwritten, or a cache that lied about residency.
+    #[test]
+    fn streamed_experts_match_resident_by_bit() {
+        let device = Device::Vulkan(0);
+        // `new` registers the backend with `kore_core`, so `get_backend` can
+        // hand back the same instance the engine would use.
+        let Ok(vk) = kore_vulkan::VulkanBackend::new() else {
+            println!("no Vulkan backend available; skipping");
+            return;
+        };
+        let backend: Arc<dyn DeviceBackend> = Arc::new(vk);
+        assert!(get_backend(device).is_some(), "backend did not register");
+
+        let (n_experts, m, n) = (4usize, 256usize, 8usize);
+        let host = stacked_q4k(n_experts, m, n);
+        let per = host.byte_len();
+
+        // Reference: every expert resident, uploaded once, exactly as `up_w`.
+        let mut resident = Vec::with_capacity(n_experts);
+        for e in 0..n_experts {
+            let bytes = host.expert(e, per).bytes().to_vec();
+            let len = bytes.len();
+            let t = Tensor::from_storage(
+                Storage::from_bytes(DType::U8, len, bytes).expect("host storage"),
+                &[len],
+            )
+            .to(device)
+            .expect("resident upload");
+            resident.push(GpuW {
+                t,
+                kind: QKind::Q4K,
+                m,
+                n,
+            });
+        }
+
+        // One row, as every fused caller passes it.
+        let x: Vec<f32> = (0..m).map(|i| ((i % 17) as f32 - 8.0) * 0.03125).collect();
+        let xt = Tensor::from_f32(&x, &[1, m]).to(device).expect("upload x");
+        let run = |w: &GpuW| -> Vec<f32> {
+            backend
+                .gemv_q4_k(&xt, &w.t, n, m)
+                .expect("gemv")
+                .to(Device::Cpu)
+                .expect("readback")
+                .as_f32_slice()
+                .expect("f32 output")
+                .to_vec()
+        };
+
+        let want: Vec<Vec<f32>> = resident.iter().map(|w| run(w)).collect();
+        assert!(
+            want[0].iter().any(|v| *v != 0.0),
+            "reference is all zero: the fixture proves nothing"
+        );
+        // If the expert windows collapsed onto one slab, the comparison below
+        // would pass for the wrong reason.
+        for e in 1..n_experts {
+            assert_ne!(
+                want[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                want[e].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "experts 0 and {e} decode identically: the windows are not distinct"
+            );
+        }
+
+        // One slot, four experts: every acquire after the first must evict, and
+        // the repeated expert at the end must come back out of the pool.
+        let mut bank = DeviceBank::new(host.clone(), n_experts, 1, 1).expect("bank");
+        assert_eq!(bank.n_slots(), 1);
+        let order = [2usize, 0, 3, 1, 2, 2];
+        for &e in &order {
+            let got = run(bank.acquire(e, &*backend, device).expect("acquire"));
+            for i in 0..n {
+                assert_eq!(
+                    got[i].to_bits(),
+                    want[e][i].to_bits(),
+                    "expert {e} lane {i}: {} != {}",
+                    got[i],
+                    want[e][i]
+                );
+            }
+        }
+        assert_eq!(bank.misses(), 5, "five uploads for six acquisitions");
+        assert_eq!(bank.hits(), 1, "the repeat must hit the pool, not the file");
+        assert_eq!(bank.uploaded(), (per * 5) as u64);
     }
 }
