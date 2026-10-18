@@ -25,9 +25,11 @@
 > A/B over 9 order-rotating rounds gave **109.83 → 112.75 tok/s** median, with
 > all 9 paired rounds favouring the pooled arm and tokens byte-identical.
 >
-> The large levers that remain are **chunked prefill** (prefill still runs one
-> token at a time) and the **per-block row-wide reduction in `had_pre`** modes
-> 0/1. The **MoE expert-offload engine now exists and is verified at synthetic
+> The levers that were left have since landed: **chunked prefill** (2.13×, §2d)
+> and **prompt-lookup speculative decoding** (1.29–1.50×, §2e, byte-identical to
+> greedy). `had_pre`'s row-wide reduction is measured and **refuted** as a lever
+> (0.28 ms / 3.2% ceiling). The **MoE expert-offload engine now exists and is
+> verified at synthetic
 > scale** (byte-identical under thrashing; the miss path is ~1.5–1.6× faster
 > after removing two host-side copies) but could not be validated end-to-end on a
 > real MoE checkpoint on this 15 GB-RAM machine — see *Phase 3* and *Next
@@ -704,6 +706,107 @@ m=1 figure inside a chunk. A chunked parallel scan would collapse that to ~1×,
 worth roughly 10% of a chunk. `GpuState` snapshot/restore is still the missing
 piece for a prefill that is *re-run*.
 
+#### 2e. Prompt-lookup speculative decoding — LANDED, bit-identical, 1.29–1.50×
+
+§2c/§2d built the batched pass; §2e is its second consumer, and the one that
+attacks the *per-token* cost instead of the per-prompt one. A verify pass over
+`m` columns costs `ceil(m/4)·A + c·m` and returns one token per column, so the
+question is only whether the tokens fed to it are the ones the model would
+itself have chosen.
+
+**The drafter is the text.** No weights, no second model, no tree, no beam:
+look for the current context earlier in the text and propose whatever followed
+it there. That is the classic prompt-lookup (n-gram) trick, and it fits this
+engine unusually well because the things that echo are exactly the things a
+small model is asked to do — rewrites, summaries, extractions, code edits, and
+(measured, repeatedly) anything the model has fallen into a repetition loop
+about.
+
+**Two properties make it safe to ship.**
+
+- **Greedy acceptance is exact.** A pass is bit-identical to sequential
+  decoding column by column, and it is `Head::Every`, so column `r`'s argmax
+  *is* the token the scalar path would have produced at that position. A draft
+  is accepted iff it equals that argmax. A wrong draft can therefore only waste
+  a pass; it can never change the output.
+- **The trigger decides whether it pays.** A fired step at `m = 4` costs
+  ~22 ms against ~9 ms plain, so the *average* accepted prefix must clear ~1.7
+  tokens for a fire to be worth it. Firing on any match at all is measurably
+  **worse than not drafting** (1.11× at `k=3, n≥1` on the story prompt);
+  requiring a 4-gram is what turns the same machinery into 1.29×.
+
+**Rewind.** Cutting a batch short needs two different mechanisms because the
+two kinds of state are different (`Rewind`, `forward_verify`, `rewind(keep)`):
+
+- the **KV cache** rewinds with an integer — it is append-only and every read
+  stays inside `len`, so the stale bytes above the restored `len` are simply
+  overwritten by the next append;
+- the **DeltaNet state** cannot be rewound at all, because `gdn_step` updates
+  it *in place* and a recurrent state that has consumed a token cannot
+  un-consume it. It has to have been copied. 18 layers × 3 slots × (1.0 MB
+  state + 72 KB hist) ≈ **57 MB**, filled by 2 device copies per column per
+  DeltaNet layer. That copy is the entire cost of the feature, and it is why
+  `forward_verify` is still exactly `forward_batch` arithmetically.
+
+New plumbing: `copy_buffer`, the backend trait's first device→device memcpy,
+built on the same `elementwise` `copy_offset` dispatch (`op_type 8`, both
+offsets zero) that `scatter_row` already used.
+
+**Measurement — the pre-build replay, then the real thing.** `draft_headroom`
+records a real greedy decode, replays the *shipped* `longest_match` over the
+recorded stream offline (acceptance is exact by construction under greedy
+sampling), and prices each policy with an in-run `m = 1..4` pass cost. That is
+where the trigger was chosen: `k=3, n≥4`.
+
+`bench_draft` then runs the real loop, with every policy as an arm of one
+interleaved, order-rotating run and every arm's token stream required to equal
+plain greedy **element for element** before any timing is printed:
+
+| workload (prompt → new tokens) | `k=3 n≥4` | `k=3 n≥8` | `k=2 n≥4` | `k=1 n≥4` |
+|---|---|---|---|---|
+| story continuation (20 → 256) | **1.288×** | 1.280× | 1.251× | 1.179× |
+| code continuation (19 → 192) | **1.495×** | | | |
+| paragraph rewrite (37 → 192) | 1.482× | 1.451× | 1.398× | |
+| list continuation (26 → 96) | 1.342× | | | |
+
+`k=3, n≥4` on the story prompt: 29.3% of steps fired, 94.3% of drafts accepted,
+`P(j) = 2/0/1/38` — i.e. of 41 fired steps, 38 accepted all three drafts. The
+replay had projected 28.8% / 94.2% / 1.31× on the same prompt, so the shipped
+matcher and the scored matcher agree to the tenth of a percent. All arms,
+192–256 tokens, **byte-identical to `generate_greedy`**.
+
+**What this is not, and the honest envelope.**
+
+- **It is a no-echo tax of zero, not a win.** Where the context does not repeat
+  (a Q&A prompt that continues freshly), the drafter finds no 4-gram, takes a
+  plain step, and the ratio is 1.00 — the only overhead is the host-side scan
+  (µs, bounded by `search_back = 16384`). The measured Q&A arm here is not
+  usable as evidence because the model emitted EOS at once; the structural
+  argument is the load-bearing one.
+- **Degenerate repetition is not a workload.** A model looping on one sentence
+  accepts ~100% of drafts and approaches the `m = 4` ceiling (1.6×), because
+  continuation is trivially predictable. That is an artifact of a 2 B ternary
+  model, not a promise; it is reported for completeness and is *not* in the
+  table above.
+- **The drafter is the last ungated lever, and it is spent.** With this in
+  tree, the remaining decode-side levers all reassociate a summation
+  (`gdn_step`'s thread count, `dot_wide`'s FMA chain) and sit behind the
+  explicit tolerance gate, or need the `gemv_q2_0` weight-axis redesign
+  (`m > 4`, which the fit says buys nothing: the per-column term dominates).
+- **`GpuState` snapshot/restore** is still the missing piece for *prefix
+  caching* (re-running a prefill), which is a different feature from this one:
+  spec decode rewinds *within* a pass, prefix caching rewinds *between* calls.
+
+**Gates.** `verify_m` grew a rewind leg: for every `keep` in `1..=cols`, and for
+`cols ∈ {m, m-1}` so the arena is filled by two passes of *different* widths
+back to back, a probe step from the truncated state must agree with an
+independently built sequential state. Green at `m = 1, 2, 4` (7 keep-points at
+`m=4`). `spec.rs` carries 9 host-side unit tests for the matcher (longest wins,
+ties go to the most recent, `k` caps the draft but not the reported length, a
+match at the very end drafts nothing, `search_back` bounds the scan).
+`bench_draft` is the end-to-end token-identity gate. `cargo test -p kore-nn`
+159 pass, `-p kore-core` 91, `-p kore-vulkan` 22.
+
 ### 3. Small-op fusion/parallelisation (~25% of the token)
 
 ~150 latency-bound dispatches at ~4–7 µs of *exposed* latency each
@@ -894,8 +997,11 @@ cooled die on Bonsai-2, one pass over `m` positions buys **1.37× per token at
 byte-identical to that many single-token steps (`verify_m`, 325/325 at
 `m = 1, 2, 4`). **Chunked prefill is the first real consumer of it, and it
 landed at 2.13×** (§2d) — prefill is the one place the batch is free, because
-there is no draft that has to be accepted. Spec decode is the other consumer,
-and it is the one still missing `GpuState` snapshot/restore.
+there is no draft that has to be accepted. **Spec decode is the second, and it
+landed at 1.29–1.50×** (§2e): a prompt-lookup drafter whose drafts are accepted
+on the batched argmax, rewound column by column when they are not, so the
+output is byte-identical to plain greedy and a wrong draft can only cost a
+wasted pass.
 
 **What that leaves.** Three levers, none of them the *host-side* per-dispatch
 cost that the census was built to find (that turned out to be buffer creation,
@@ -936,8 +1042,22 @@ and it is now fixed):
    `forward_batch` uses for correctness, and that loop is exactly 4× the m=1
    cost of those three ops. A chunked *parallel* scan would collapse it back to
    ~1× — worth roughly 10% of a chunk, not another 1.6×. `GpuState`
-   snapshot/restore is still the missing piece for a prefill that is *re-run*.
-3. **MoE expert offload (the capability lever) — engine SHIPPED, model path
+   snapshot/restore is still the missing piece for a prefill that is *re-run*
+   (prefix caching), which is a different feature from §2e: spec decode rewinds
+   *within* a pass, prefix caching rewinds *between* calls.
+3. **Spec decode (the per-token lever) — LANDED at 1.29–1.50×, and it is the
+   last ungated decode lever.** Prompt-lookup drafting over the text itself:
+   the context's last 4-gram, last seen earlier in the prompt-or-output,
+   proposes what followed it there. `rewind` restores the DeltaNet state per
+   column (the KV cache needs only an integer `len`), and greedy acceptance is
+   exact, so the output is byte-identical to `generate_greedy` in every arm of
+   `bench_draft`. The trigger is load-bearing — firing on *any* match is worse
+   than not drafting (1.11× against 1.29× at `n≥4`), and a no-4-gram workload
+   is exactly 1.00×. Everything left on the decode side either reassociates a
+   summation (`gdn_step` thread count, `dot_wide`'s FMA chain — both behind the
+   tolerance gate) or needs the weight-axis redesign that the
+   `ceil(m/4)·A + c·m` fit says buys nothing.
+4. **MoE expert offload (the capability lever) — engine SHIPPED, model path
    BLOCKED.** Weights ≫ VRAM streamed from system RAM while the GPU computes hot
    experts. This is the only shape that "punches above the weight class" on an
    8 GB card: a 27B dense ternary (M1) cannot fit, but a ~30 B MoE with 2–3 B
