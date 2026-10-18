@@ -45,6 +45,7 @@
 //! bonsai  tiny.gguf <tokenizer.json> "The capital of France is" 8 cpu
 //! ```
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -822,6 +823,48 @@ fn top_k_experts(probs: &[f32], k: usize) -> Vec<(usize, f32)> {
     order[..k].iter().map(|&e| (e, probs[e] * inv)).collect()
 }
 
+/// Measurement hook: `KORE_MOE_ROUTE_DUMP=<path>` appends one line of picked
+/// expert ids per routed-FFN call, in call order, and is otherwise free.
+///
+/// The layer index is not written down, because it does not have to be: a token
+/// calls the routed FFN exactly once per routed layer, in a fixed order, so the
+/// position inside each block of `calls / tokens` lines *is* the layer. What the
+/// dump exists for is the union of picks across a hypothetical **chunk** of
+/// tokens -- the quantity that decides whether prefill chunks wider than one
+/// token would amortise expert traffic -- and that needs the order and the
+/// layer, and nothing else.
+///
+/// The handle is opened once per process. Reopening per call would dominate the
+/// step it is measuring, which is the classic way instrumentation lies.
+fn dump_route(picks: &[(usize, f32)]) -> Result<()> {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+    let Some(path) = PATH.get_or_init(|| std::env::var("KORE_MOE_ROUTE_DUMP").ok()) else {
+        return Ok(());
+    };
+    let mut guard = FILE.lock().expect("route dump handle");
+    if guard.is_none() {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| err(&format!("route dump '{path}': {e}")))?;
+        *guard = Some(f);
+    }
+    let mut line = String::with_capacity(4 * picks.len());
+    for (e, _) in picks {
+        line.push_str(&e.to_string());
+        line.push(' ');
+    }
+    line.push('\n');
+    guard
+        .as_mut()
+        .expect("route dump handle just opened")
+        .write_all(line.as_bytes())
+        .map_err(|e| err(&format!("route dump '{path}': {e}")))
+}
+
 impl Qwen35Model {
     pub fn from_gguf(path: &Path) -> Result<Self> {
         let gg = MiniGguf::load(path)?;
@@ -1266,6 +1309,7 @@ impl Qwen35Model {
 
         let probs = router_probs(&m.router, h, ne)?;
         let picks = top_k_experts(&probs, k);
+        dump_route(&picks)?;
 
         let mut out = vec![0.0f32; cfg.hidden];
         let mut g = vec![0.0f32; cfg.moe_ffn];
@@ -2554,6 +2598,8 @@ impl Qwen35Gpu {
             .ok_or_else(|| err("expert routing download did not come back as f32"))?;
         let t_router = Instant::now();
         let mut picks = top_k_experts(&router_probs(&m.router, h, m.n_experts)?, m.n_used);
+        // Records the *real* routing, before any ablation rewrites it.
+        dump_route(&picks)?;
         let route_us = t_router.elapsed().as_micros() as u64;
 
         // Ablation: pin every slot to one expert so the banks go resident after
