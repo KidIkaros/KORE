@@ -1782,6 +1782,12 @@ impl DeviceBank {
                         self.uploaded += len as u64;
                         Tensor::from_storage(b.upload_u8(&packed, device)?, &[len])
                     }
+                    QKind::Q3K => {
+                        let packed = kore_kernels::k_quant::repack_q3_k(w.bytes())?;
+                        let len = packed.len();
+                        self.uploaded += len as u64;
+                        Tensor::from_storage(b.upload_u8(&packed, device)?, &[len])
+                    }
                     _ => {
                         let bytes = w.bytes();
                         self.uploaded += bytes.len() as u64;
@@ -1868,13 +1874,7 @@ impl Qwen35Gpu {
             // discovering it mid-generation reads like a corrupt model.
             if matches!(
                 w.kind,
-                QKind::F32
-                    | QKind::F16
-                    | QKind::Q2K
-                    | QKind::Q3K
-                    | QKind::Q4_0
-                    | QKind::Q5_0
-                    | QKind::Q8_0
+                QKind::F32 | QKind::F16 | QKind::Q4_0 | QKind::Q5_0 | QKind::Q8_0
             ) {
                 return Err(err(&format!(
                     "the gpu lane has no kernel for {:?} weights (tensor '{}'); run the CPU lane",
@@ -1886,6 +1886,7 @@ impl Qwen35Gpu {
                 // per workgroup). The K-quant kernels read the file's own
                 // packing, so their payload goes up untouched.
                 QKind::Q2_0 => kore_kernels::q2_0::repack_q2_0(w.bytes(), w.m, w.n)?,
+                QKind::Q3K => kore_kernels::k_quant::repack_q3_k(w.bytes())?,
                 _ => w.bytes().to_vec(),
             };
             let len = bytes.len();
@@ -2044,14 +2045,16 @@ impl Qwen35Gpu {
         let b = &self.backend;
         match w.kind {
             QKind::Q2_0 => b.gemv_q2_0(x, &w.t, w.n, w.m),
+            QKind::Q2K => b.gemv_q2_k(x, &w.t, w.n, w.m),
+            QKind::Q3K => b.gemv_q3_k(x, &w.t, w.n, w.m),
             QKind::Q4K => b.gemv_q4_k(x, &w.t, w.n, w.m),
             QKind::Q5K => b.gemv_q5_k(x, &w.t, w.n, w.m),
             QKind::Q6K => b.gemv_q6_k(x, &w.t, w.n, w.m),
             QKind::F32 | QKind::F16 => Err(err(
                 "unpacked F32/F16 weights have no device kernel; run the CPU lane",
             )),
-            QKind::Q2K | QKind::Q3K | QKind::Q4_0 | QKind::Q5_0 | QKind::Q8_0 => Err(err(
-                "Q2_K/Q3_K/Q4_0/Q5_0/Q8_0 weights have no device kernel yet; run the CPU lane",
+            QKind::Q4_0 | QKind::Q5_0 | QKind::Q8_0 => Err(err(
+                "Q4_0/Q5_0/Q8_0 weights have no device kernel yet; run the CPU lane",
             )),
         }
     }

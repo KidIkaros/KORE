@@ -41,6 +41,8 @@ pub const Q6_K_TYPE_ID: u32 = 14;
 
 pub const Q2_K_BLOCK_BYTES: usize = 84;
 pub const Q3_K_BLOCK_BYTES: usize = 110;
+/// Q3_K with each block padded to a word boundary for the GPU kernel.
+pub const Q3_K_PACKED_BYTES: usize = 112;
 pub const Q4_K_BLOCK_BYTES: usize = 144;
 pub const Q5_K_BLOCK_BYTES: usize = 176;
 pub const Q6_K_BLOCK_BYTES: usize = 210;
@@ -120,6 +122,30 @@ pub fn unpack_scales_min(scales: &[u8]) -> ([f32; 8], [f32; 8]) {
 
 /// Dequantize `n` elements of packed Q4_K. `n` need not be a multiple of 256;
 /// the tail block is truncated, which is how GGUF pads the final row.
+/// Pad every 110-byte Q3_K block to 112 bytes.
+///
+/// The GPU kernel reads a weight buffer as `array<u32>`, and 110 is not a
+/// multiple of four: consecutive blocks would start at alternating half-word
+/// offsets, so a block's scale or `d` field could straddle two words. Two zero
+/// bytes per block (1.8%) make every block word-aligned. This is the same kind
+/// of upload-time adaptation as [`crate::q2_0::repack_q2_0`]; the file's own
+/// packing stays authoritative for the CPU lane.
+pub fn repack_q3_k(data: &[u8]) -> Result<Vec<u8>, KoreError> {
+    if !data.len().is_multiple_of(Q3_K_BLOCK_BYTES) {
+        return Err(err(format!(
+            "k_quant: Q3_K payload {} is not a whole number of {Q3_K_BLOCK_BYTES}-byte blocks",
+            data.len()
+        )));
+    }
+    let n = data.len() / Q3_K_BLOCK_BYTES;
+    let mut out = vec![0u8; n * Q3_K_PACKED_BYTES];
+    for b in 0..n {
+        let src = &data[b * Q3_K_BLOCK_BYTES..(b + 1) * Q3_K_BLOCK_BYTES];
+        out[b * Q3_K_PACKED_BYTES..b * Q3_K_PACKED_BYTES + Q3_K_BLOCK_BYTES].copy_from_slice(src);
+    }
+    Ok(out)
+}
+
 /// Unpack one Q2_K block (84 bytes, 256 weights).
 ///
 /// Sixteen sub-blocks of 16 weights. `scales[i]` is the low nibble for the scale
@@ -415,6 +441,26 @@ mod tests {
                 "type {id} zero block nonzero"
             );
         }
+    }
+
+    #[test]
+    fn repack_q3_k_only_pads() {
+        let raw: Vec<u8> = (0..Q3_K_BLOCK_BYTES * 3).map(|i| (i % 251) as u8).collect();
+        let packed = repack_q3_k(&raw).unwrap();
+        assert_eq!(packed.len(), 3 * Q3_K_PACKED_BYTES);
+        for b in 0..3 {
+            let pad =
+                &packed[b * Q3_K_PACKED_BYTES + Q3_K_BLOCK_BYTES..(b + 1) * Q3_K_PACKED_BYTES];
+            assert!(pad.iter().all(|v| *v == 0), "block {b} padding is not zero");
+        }
+        // Strip the padding back off and the specification must see the same
+        // tensor it saw before.
+        let stripped: Vec<u8> = packed
+            .chunks_exact(Q3_K_PACKED_BYTES)
+            .flat_map(|b| b[..Q3_K_BLOCK_BYTES].to_vec())
+            .collect();
+        assert_eq!(stripped, raw);
+        assert!(repack_q3_k(&raw[..100]).is_err());
     }
 
     #[test]

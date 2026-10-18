@@ -207,6 +207,24 @@ struct ArgmaxUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Q2KUniforms {
+    m: u32,
+    n: u32,
+    k: u32,
+    blocks_per_row: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Q3KUniforms {
+    m: u32,
+    n: u32,
+    k: u32,
+    blocks_per_row: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Q4KUniforms {
     m: u32,
     n: u32,
@@ -480,6 +498,8 @@ pub struct VulkanBackend {
     device_index: usize,
     gemm_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_pipeline: Arc<wgpu::ComputePipeline>,
+    gemv_q2_k_pipeline: Arc<wgpu::ComputePipeline>,
+    gemv_q3_k_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q4_k_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q5_k_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q6_k_pipeline: Arc<wgpu::ComputePipeline>,
@@ -800,6 +820,36 @@ impl VulkanBackend {
             },
         ));
 
+        let gemv_q3_k_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_gemv_q3_k_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gemv_q3_k.wgsl").into()),
+        });
+        let gemv_q3_k_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_gemv_q3_k_pipeline"),
+                layout: None,
+                module: &gemv_q3_k_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let gemv_q2_k_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_gemv_q2_k_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gemv_q2_k.wgsl").into()),
+        });
+        let gemv_q2_k_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_gemv_q2_k_pipeline"),
+                layout: None,
+                module: &gemv_q2_k_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
         let gemv_q4_k_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kore_gemv_q4_k_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gemv_q4_k.wgsl").into()),
@@ -1086,6 +1136,8 @@ impl VulkanBackend {
             device_index,
             gemm_pipeline,
             gemv_pipeline,
+            gemv_q2_k_pipeline,
+            gemv_q3_k_pipeline,
             gemv_q4_k_pipeline,
             gemv_q5_k_pipeline,
             gemv_q6_k_pipeline,
@@ -2727,6 +2779,133 @@ impl VulkanBackend {
     /// w_raw: [N * (K/256) * 144] in U8
     /// n: output dimension (number of rows in W)
     /// k: input dimension (number of columns in W)
+    /// Quantized Q3_K matrix-vector multiplication: y = x @ W^T
+    /// x: [M, K] in F32
+    /// w_raw: [N * (K/256) * 112] in U8, each 110-byte block padded to 112
+    ///        (`k_quant::repack_q3_k`); the shader assumes that alignment.
+    /// n: output dimension (number of rows in W)
+    /// k: input dimension (number of columns in W)
+    pub fn gemv_q3_k(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+        let x_shape = x.shape().dims();
+        // A 1-D input is a single row: `m` is 1, not its length.
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        let k_in = x.numel() / m;
+        if k_in != k || !k.is_multiple_of(256) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q3_k".into(),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+        let blocks_per_row = (k / 256) as u32;
+        // A raw 110-byte-per-block buffer would read out of bounds by two bytes
+        // per block and quietly return a wrong answer, so check the upload shape.
+        let need = n * blocks_per_row as usize * 112;
+        if w_raw.numel() < need {
+            return Err(VulkanError::ShapeMismatch {
+                op: format!(
+                    "gemv_q3_k weight buffer: {} < {need} padded bytes",
+                    w_raw.numel()
+                ),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+
+        let uniforms = Q3KUniforms {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            blocks_per_row,
+        };
+
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+
+        let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q3_k_out");
+
+        let workgroups_x = (n as u32).div_ceil(4).max(1);
+        let workgroups_y = (m as u32).div_ceil(4).max(1);
+        self.record_dispatch(
+            &self.gemv_q3_k_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            (workgroups_x, workgroups_y, 1),
+            "gemv_q3_k_compute_pass",
+        );
+
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![m, n]);
+        Ok(self.make_tensor(y_kore_buf, &[m, n]))
+    }
+
+    /// Quantized Q2_K matrix-vector multiplication: y = x @ W^T
+    /// x: [M, K] in F32
+    /// w_raw: [N * (K/256) * 84] in U8
+    /// n: output dimension (number of rows in W)
+    /// k: input dimension (number of columns in W)
+    pub fn gemv_q2_k(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+        let x_shape = x.shape().dims();
+        // A 1-D input is a single row: `m` is 1, not its length.
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        let k_in = x.numel() / m;
+        if k_in != k {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_k".into(),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+        if !k.is_multiple_of(256) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_k".into(),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+
+        let blocks_per_row = (k / 256) as u32;
+        let uniforms = Q2KUniforms {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            blocks_per_row,
+        };
+
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+
+        let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q2_k_out");
+
+        let workgroups_x = (n as u32).div_ceil(4).max(1);
+        let workgroups_y = (m as u32).div_ceil(4).max(1);
+        self.record_dispatch(
+            &self.gemv_q2_k_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            (workgroups_x, workgroups_y, 1),
+            "gemv_q2_k_compute_pass",
+        );
+
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![m, n]);
+        Ok(self.make_tensor(y_kore_buf, &[m, n]))
+    }
+
     pub fn gemv_q4_k(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
         let x_shape = x.shape().dims();
         // A 1-D input is a single row: `m` is 1, not its length. Reading
@@ -4180,6 +4359,28 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         intermediate_size: usize,
     ) -> kore_core::Result<Tensor> {
         self.swiglu_split(gate_up, intermediate_size)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gemv_q2_k(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q2_k(x, w_raw, n, k)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gemv_q3_k(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q3_k(x, w_raw, n, k)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 

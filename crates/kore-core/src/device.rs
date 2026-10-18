@@ -458,6 +458,46 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Quantized Q2_K matrix-vector multiplication on device:
+    /// y = x @ W^T
+    /// x: [M, K] in F32 (where M is 1 during decode)
+    /// w_raw: [N * (K / 256) * 84] raw Q2_K packed bytes (or U8 tensor)
+    /// n: output dimension (number of rows in W)
+    /// k: input dimension (number of columns in W)
+    /// Output: [M, N] in F32
+    fn gemv_q2_k(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q2_k not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Quantized Q3_K matrix-vector multiplication on device:
+    /// y = x @ W^T
+    /// x: [M, K] in F32 (where M is 1 during decode)
+    /// w_raw: [N * (K / 256) * 112] padded Q3_K packed bytes (or U8 tensor)
+    /// n: output dimension (number of rows in W)
+    /// k: input dimension (number of columns in W)
+    /// Output: [M, N] in F32
+    fn gemv_q3_k(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q3_k not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Quantized Q4_K matrix-vector multiplication on device:
     /// y = x @ W^T
     /// x: [M, K] in F32 (where M is 1 during decode)
