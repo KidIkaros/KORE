@@ -216,6 +216,15 @@ struct Q4KUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Q5KUniforms {
+    m: u32,
+    n: u32,
+    k: u32,
+    blocks_per_row: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Q6KUniforms {
     m: u32,
     n: u32,
@@ -455,6 +464,7 @@ pub struct VulkanBackend {
     gemm_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q4_k_pipeline: Arc<wgpu::ComputePipeline>,
+    gemv_q5_k_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q6_k_pipeline: Arc<wgpu::ComputePipeline>,
     repack_q6_k_pipeline: Arc<wgpu::ComputePipeline>,
     elementwise_pipeline: Arc<wgpu::ComputePipeline>,
@@ -782,6 +792,21 @@ impl VulkanBackend {
             },
         ));
 
+        let gemv_q5_k_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_gemv_q5_k_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gemv_q5_k.wgsl").into()),
+        });
+        let gemv_q5_k_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_gemv_q5_k_pipeline"),
+                layout: None,
+                module: &gemv_q5_k_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
         let gemv_q6_k_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kore_gemv_q6_k_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/gemv_q6_k.wgsl").into()),
@@ -1037,6 +1062,7 @@ impl VulkanBackend {
             gemm_pipeline,
             gemv_pipeline,
             gemv_q4_k_pipeline,
+            gemv_q5_k_pipeline,
             gemv_q6_k_pipeline,
             repack_q6_k_pipeline,
             elementwise_pipeline,
@@ -2564,6 +2590,57 @@ impl VulkanBackend {
             &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
             (workgroups_x, workgroups_y, 1),
             "gemv_q4_k_compute_pass",
+        );
+
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![m, n]);
+        Ok(self.make_tensor(y_kore_buf, &[m, n]))
+    }
+
+    /// Quantized Q5_K matrix-vector multiplication: y = x @ W^T
+    /// x: [M, K] in F32
+    /// w_raw: [N * (K/256) * 176] in U8
+    /// n: output dimension (number of rows in W)
+    /// k: input dimension (number of columns in W)
+    pub fn gemv_q5_k(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+    ) -> Result<Tensor> {
+        let x_shape = x.shape().dims();
+        let m = if x_shape.is_empty() { 1 } else { x_shape[0] };
+        let k_in = if x_shape.len() > 1 { x_shape[1] } else { x_shape[0] };
+        if k_in != k {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q5_k".into(),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+
+        let blocks_per_row = (k / 256) as u32;
+        let uniforms = Q5KUniforms {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+            blocks_per_row,
+        };
+
+        let x_buf = KoreVulkanBuffer::from_storage(x.storage_ref(), x_shape, &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(w_raw.storage_ref(), w_raw.shape().dims(), &self.device, &self.queue)?;
+
+        let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q5_k_out");
+
+        let workgroups_x = (n as u32).div_ceil(4).max(1);
+        let workgroups_y = (m as u32).div_ceil(4).max(1);
+        self.record_dispatch(
+            &self.gemv_q5_k_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            (workgroups_x, workgroups_y, 1),
+            "gemv_q5_k_compute_pass",
         );
 
         let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![m, n]);

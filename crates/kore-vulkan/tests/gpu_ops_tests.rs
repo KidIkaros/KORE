@@ -456,6 +456,109 @@ fn test_vulkan_gemv_q4_k_correctness() {
     println!("All Q4_K GPU GEMV tests passed! Row 0 = {}, Row 1 = {}, Row 2 = {}", y3_slice[0], y3_slice[1], y3_slice[2]);
 }
 
+#[test]
+fn test_vulkan_gemv_q5_k_correctness() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    // Q5_K is the Q4_K block with a 32-byte `qh` inserted after the scales:
+    //   d:f16 | dmin:f16 | scales[12] | qh[32] | qs[128]  = 176 bytes.
+    //
+    // Matrix W: 2 rows, 256 cols (1 block per row) = 352 bytes.
+    //
+    // Row 0 leaves `qh` zero, so it must reproduce the Q4_K result exactly:
+    //   d = 1.0, dmin = 0.0, all scales = 1, all mins = 0,
+    //   qs byte = 0x32 -> lower sub-blocks 2, upper sub-blocks 3.
+    //   dot with all-ones x = 128*2 + 128*3 = 640.
+    //
+    // Row 1 sets every high bit, which is the only thing Q5_K adds:
+    //   d = 2.0, dmin = 1.0, all scales = 2, all mins = 1,
+    //   qs byte = 0x75 -> nibbles 5 and 7, plus 16 from the high bit -> 21 / 23.
+    //   lower: 2*2*21 - 1 = 83, upper: 2*2*23 - 1 = 91
+    //   dot = 128*83 + 128*91 = 22272.
+    let mut raw = vec![0u8; 352];
+
+    // Row 0
+    raw[1] = 0x3C; // d = 1.0
+    for i in 4..8 {
+        raw[i] = 1;
+    }
+    for i in 12..16 {
+        raw[i] = 1;
+    }
+    // raw[16..48] stays 0: no high bits set.
+    for i in 48..176 {
+        raw[i] = 0x32;
+    }
+
+    // Row 1 at offset 176
+    raw[176 + 1] = 0x40; // d = 2.0
+    raw[176 + 3] = 0x3C; // dmin = 1.0
+    for i in 180..184 {
+        raw[i] = 2; // sc 0..3
+    }
+    for i in 184..188 {
+        raw[i] = 1; // mn 0..3
+    }
+    for i in 188..192 {
+        raw[i] = 0x12; // sc 4..7 = 2, mn 4..7 = 1
+    }
+    for i in 192..224 {
+        raw[i] = 0xFF; // every 5th bit set
+    }
+    for i in 224..352 {
+        raw[i] = 0x75;
+    }
+
+    let w_storage = kore_core::Storage::from_packed_bytes(kore_core::DType::U8, 352, raw);
+    let w_tensor = Tensor::from_storage(w_storage, &[352]);
+
+    // m = 1
+    let x = Tensor::from_f32(&vec![1.0f32; 256], &[1, 256]);
+    let y = backend
+        .gemv_q5_k(&x, &w_tensor, 2, 256)
+        .expect("gemv_q5_k failed");
+    assert_eq!(y.shape().dims(), &[1, 2]);
+    let y_cpu = y.to(kore_core::Device::Cpu).expect("to CPU");
+    let y_slice = y_cpu.as_f32_slice().expect("f32 slice");
+    assert!(
+        (y_slice[0] - 640.0).abs() < 1e-3,
+        "no-high-bit row: got {}",
+        y_slice[0]
+    );
+    assert!(
+        (y_slice[1] - 22272.0).abs() < 1e-3,
+        "high-bit row: got {}",
+        y_slice[1]
+    );
+
+    // m = 2, second column doubled: exercises the multi-column accumulate path.
+    let mut x2_data = vec![1.0f32; 256];
+    x2_data.extend(std::iter::repeat_n(2.0f32, 256));
+    let x2 = Tensor::from_f32(&x2_data, &[2, 256]);
+    let y2 = backend
+        .gemv_q5_k(&x2, &w_tensor, 2, 256)
+        .expect("gemv_q5_k m=2 failed");
+    assert_eq!(y2.shape().dims(), &[2, 2]);
+    let y2_cpu = y2.to(kore_core::Device::Cpu).expect("to CPU");
+    let y2_slice = y2_cpu.as_f32_slice().expect("f32 slice");
+    assert!((y2_slice[0] - 640.0).abs() < 1e-3, "m2 row0: got {}", y2_slice[0]);
+    assert!((y2_slice[1] - 22272.0).abs() < 1e-3, "m2 row1: got {}", y2_slice[1]);
+    assert!((y2_slice[2] - 1280.0).abs() < 1e-3, "m2 row0 x2: got {}", y2_slice[2]);
+    assert!(
+        (y2_slice[3] - 44544.0).abs() < 1e-3,
+        "m2 row1 x2: got {}",
+        y2_slice[3]
+    );
+
+    println!(
+        "Q5_K GPU GEMV passed: no-bit row = {}, high-bit row = {}",
+        y_slice[0], y_slice[1]
+    );
+}
+
 /// Quantize one F32 row to offset-binary INT8 + per-row scale (mirrors the CPU Q8 KV path).
 fn q8_quant_row(row: &[f32]) -> (Vec<u8>, f32) {
     let absmax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
