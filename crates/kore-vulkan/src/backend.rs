@@ -254,7 +254,13 @@ struct Q2KUniforms {
     id: u32,
     rows_per_expert: u32,
     expert_words: u32,
-    _pad1: u32,
+    /// Indexed mode: output row `r` belongs to position `r / rows_per_expert`
+    /// and reads that position's expert id from `idx[idx_off + position]`.
+    idx_off: u32,
+    /// Activation row stride in vec4 units; 0 means every position shares one row.
+    x_stride: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 #[repr(C)]
@@ -277,7 +283,13 @@ struct Q3KUniforms {
     id: u32,
     rows_per_expert: u32,
     expert_words: u32,
-    _pad1: u32,
+    /// Indexed mode: output row `r` belongs to position `r / rows_per_expert`
+    /// and reads that position's expert id from `idx[idx_off + position]`.
+    idx_off: u32,
+    /// Activation row stride in vec4 units; 0 means every position shares one row.
+    x_stride: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 #[repr(C)]
@@ -3416,7 +3428,10 @@ impl VulkanBackend {
             id: 0,
             rows_per_expert: 0,
             expert_words: 0,
-            _pad1: 0,
+            idx_off: 0,
+            x_stride: 0,
+            _pad2: 0,
+            _pad3: 0,
         };
 
         let x_buf =
@@ -3439,7 +3454,14 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.gemv_q3_k_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[x_buf.arc_buffer(), w_buf.arc_buffer(), y_buf.arc_buffer()],
+            // Binding 4 is the expert-id table; the non-indexed path never
+            // reads it, so `x` stands in as a valid read-only f32 buffer.
+            &[
+                x_buf.arc_buffer(),
+                w_buf.arc_buffer(),
+                y_buf.arc_buffer(),
+                x_buf.arc_buffer(),
+            ],
             (workgroups_x, workgroups_y, 1),
             "gemv_q3_k_compute_pass",
         );
@@ -3565,7 +3587,10 @@ impl VulkanBackend {
             id: 0,
             rows_per_expert: 0,
             expert_words: 0,
-            _pad1: 0,
+            idx_off: 0,
+            x_stride: 0,
+            _pad2: 0,
+            _pad3: 0,
         };
 
         let x_buf =
@@ -3588,7 +3613,14 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.gemv_q2_k_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[x_buf.arc_buffer(), w_buf.arc_buffer(), y_buf.arc_buffer()],
+            // Binding 4 is the expert-id table; the non-indexed path never
+            // reads it, so `x` stands in as a valid read-only f32 buffer.
+            &[
+                x_buf.arc_buffer(),
+                w_buf.arc_buffer(),
+                y_buf.arc_buffer(),
+                x_buf.arc_buffer(),
+            ],
             (workgroups_x, workgroups_y, 1),
             "gemv_q2_k_compute_pass",
         );
@@ -3609,6 +3641,9 @@ impl VulkanBackend {
         k: usize,
         expert_words: usize,
         rows_per_expert: usize,
+        idx: &Tensor,
+        idx_off: usize,
+        x_stride: usize,
     ) -> Result<Tensor> {
         if rows_per_expert == 0 || !n.is_multiple_of(rows_per_expert) {
             return Err(VulkanError::ShapeMismatch {
@@ -3625,11 +3660,22 @@ impl VulkanBackend {
             });
         }
         let experts = n / rows_per_expert;
-        if x.numel() < experts * k {
+        // `x_stride` is in vec4 units. Zero means every position reads the
+        // same activation row (gate/up); otherwise each position gets its own
+        // row, `x_stride * 4 >= k` floats apart.
+        let x_need = if x_stride == 0 { k } else { experts * x_stride * 4 };
+        if x.numel() < x_need {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q2_k_id x".into(),
                 lhs: vec![x.numel()],
-                rhs: vec![experts * k],
+                rhs: vec![x_need],
+            });
+        }
+        if idx.numel() < idx_off + experts {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_k_id idx".into(),
+                lhs: vec![idx.numel()],
+                rhs: vec![idx_off + experts],
             });
         }
         let blocks_per_row = (k / 256) as u32;
@@ -3653,6 +3699,12 @@ impl VulkanBackend {
             &self.device,
             &self.queue,
         )?;
+        let idx_buf = KoreVulkanBuffer::from_storage(
+            idx.storage_ref(),
+            idx.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
         let out_bytes = (n * std::mem::size_of::<f32>()).max(4);
         let y_buffer =
             crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q2_k_id_out");
@@ -3669,12 +3721,20 @@ impl VulkanBackend {
             id: 1,
             rows_per_expert: rows_per_expert as u32,
             expert_words: expert_words as u32,
-            _pad1: 0,
+            idx_off: idx_off as u32,
+            x_stride: x_stride as u32,
+            _pad2: 0,
+            _pad3: 0,
         };
         self.record_dispatch(
             &self.gemv_q2_k_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            &[
+                x_buf.arc_buffer(),
+                w_buf.arc_buffer(),
+                &y_buffer,
+                idx_buf.arc_buffer(),
+            ],
             (n.div_ceil(4).max(1) as u32, 1, 1),
             "gemv_q2_k_compute_pass",
         );
@@ -3692,6 +3752,9 @@ impl VulkanBackend {
         k: usize,
         expert_words: usize,
         rows_per_expert: usize,
+        idx: &Tensor,
+        idx_off: usize,
+        x_stride: usize,
     ) -> Result<Tensor> {
         if rows_per_expert == 0 || !n.is_multiple_of(rows_per_expert) {
             return Err(VulkanError::ShapeMismatch {
@@ -3708,11 +3771,19 @@ impl VulkanBackend {
             });
         }
         let experts = n / rows_per_expert;
-        if x.numel() < experts * k {
+        let x_need = if x_stride == 0 { k } else { experts * x_stride * 4 };
+        if x.numel() < x_need {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q3_k_id x".into(),
                 lhs: vec![x.numel()],
-                rhs: vec![experts * k],
+                rhs: vec![x_need],
+            });
+        }
+        if idx.numel() < idx_off + experts {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q3_k_id idx".into(),
+                lhs: vec![idx.numel()],
+                rhs: vec![idx_off + experts],
             });
         }
         let blocks_per_row = (k / 256) as u32;
@@ -3736,6 +3807,12 @@ impl VulkanBackend {
             &self.device,
             &self.queue,
         )?;
+        let idx_buf = KoreVulkanBuffer::from_storage(
+            idx.storage_ref(),
+            idx.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
         let out_bytes = (n * std::mem::size_of::<f32>()).max(4);
         let y_buffer =
             crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q3_k_id_out");
@@ -3752,12 +3829,20 @@ impl VulkanBackend {
             id: 1,
             rows_per_expert: rows_per_expert as u32,
             expert_words: expert_words as u32,
-            _pad1: 0,
+            idx_off: idx_off as u32,
+            x_stride: x_stride as u32,
+            _pad2: 0,
+            _pad3: 0,
         };
         self.record_dispatch(
             &self.gemv_q3_k_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            &[
+                x_buf.arc_buffer(),
+                w_buf.arc_buffer(),
+                &y_buffer,
+                idx_buf.arc_buffer(),
+            ],
             (n.div_ceil(4).max(1) as u32, 1, 1),
             "gemv_q3_k_compute_pass",
         );
@@ -5483,9 +5568,22 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         k: usize,
         expert_words: usize,
         rows_per_expert: usize,
+        idx: &Tensor,
+        idx_off: usize,
+        x_stride: usize,
     ) -> kore_core::Result<Tensor> {
-        self.gemv_q2_k_id(x, w_raw, n, k, expert_words, rows_per_expert)
-            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+        self.gemv_q2_k_id(
+            x,
+            w_raw,
+            n,
+            k,
+            expert_words,
+            rows_per_expert,
+            idx,
+            idx_off,
+            x_stride,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
     fn gemv_q3_k_id(
@@ -5496,9 +5594,22 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         k: usize,
         expert_words: usize,
         rows_per_expert: usize,
+        idx: &Tensor,
+        idx_off: usize,
+        x_stride: usize,
     ) -> kore_core::Result<Tensor> {
-        self.gemv_q3_k_id(x, w_raw, n, k, expert_words, rows_per_expert)
-            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+        self.gemv_q3_k_id(
+            x,
+            w_raw,
+            n,
+            k,
+            expert_words,
+            rows_per_expert,
+            idx,
+            idx_off,
+            x_stride,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
     fn gemv_q4_k(

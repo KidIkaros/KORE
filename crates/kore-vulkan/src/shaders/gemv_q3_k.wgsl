@@ -19,13 +19,22 @@ struct Q3KUniforms {
     id: u32,
     rows_per_expert: u32,
     expert_words: u32,
-    _pad1: u32,
+    // Indexed mode: output row `r` belongs to position `r / rows_per_expert`,
+    // whose expert id is `idx[idx_off + position]`. `x_stride` is the
+    // activation row stride in vec4 units (0 when every position shares the
+    // same input row, as gate/up do).
+    idx_off: u32,
+    x_stride: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Q3KUniforms;
 @group(0) @binding(1) var<storage, read> x: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> w: array<u32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
+// Expert ids from `moe_topk`, as f32. Only read in indexed mode.
+@group(0) @binding(4) var<storage, read> idx: array<f32>;
 
 var<workgroup> sdata: array<vec4<f32>, 128>;
 
@@ -89,13 +98,14 @@ fn main(
         var row_off: u32;
         var x_base: u32;
         if (params.id != 0u) {
-            // One dispatch covers every selected expert: output row `row`
-            // belongs to expert `row / rows_per_expert`, whose weights and
-            // activation row both start at that expert's slot.
-            let expert = row / params.rows_per_expert;
-            let local = row - expert * params.rows_per_expert;
+            // One dispatch covers every selected expert. The output row names
+            // a position in the routing order; `idx` maps it to an expert in
+            // the resident bank, so the weights are read in place.
+            let pos = row / params.rows_per_expert;
+            let expert = u32(idx[params.idx_off + pos]);
+            let local = row - pos * params.rows_per_expert;
             row_off = expert * params.expert_words + local * params.blocks_per_row * 28u;
-            x_base = expert * kv;
+            x_base = pos * params.x_stride;
         } else {
             row_off = params.w_off + row * params.blocks_per_row * 28u;
             x_base = 0u;

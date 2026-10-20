@@ -1906,11 +1906,6 @@ struct ResidentMoe {
     shexp_router_t: Tensor,
     /// A one-element tensor of ones, so `sigmoid_mul` reads as `sigmoid`.
     ones: Tensor,
-    /// One gather target for the token's `n_used` expert `down` matrices.
-    ///
-    /// Gathered in a single dispatch, then addressed per expert with
-    /// `gemv_q3_k_at`.
-    down_stage: Tensor,
 }
 
 /// The routed FFN on the device.
@@ -2470,13 +2465,6 @@ impl Qwen35Gpu {
                         let ones = Tensor::from_f32(&[1.0], &[1])
                             .to(device)
                             .map_err(|e| err(&format!("ones upload: {e}")))?;
-                        let down_bytes = n_used * down_per;
-                        let down_stage = Tensor::from_storage(
-                            Storage::from_bytes(DType::U8, down_bytes, vec![0u8; down_bytes])?,
-                            &[down_bytes],
-                        )
-                        .to(device)
-                        .map_err(|e| err(&format!("down stage upload: {e}")))?;
                         Some(ResidentMoe {
                             gate,
                             up,
@@ -2490,7 +2478,6 @@ impl Qwen35Gpu {
                             router_t,
                             shexp_router_t,
                             ones,
-                            down_stage,
                         })
                     } else {
                         None
@@ -2802,14 +2789,33 @@ impl Qwen35Gpu {
         x: &Tensor,
         expert_words: usize,
         rows_per_expert: usize,
+        idx: &Tensor,
+        idx_off: usize,
+        x_stride: usize,
     ) -> Result<Tensor> {
         match kind {
-            QKind::Q2K => self
-                .backend
-                .gemv_q2_k_id(x, t, n, k, expert_words, rows_per_expert),
-            QKind::Q3K => self
-                .backend
-                .gemv_q3_k_id(x, t, n, k, expert_words, rows_per_expert),
+            QKind::Q2K => self.backend.gemv_q2_k_id(
+                x,
+                t,
+                n,
+                k,
+                expert_words,
+                rows_per_expert,
+                idx,
+                idx_off,
+                x_stride,
+            ),
+            QKind::Q3K => self.backend.gemv_q3_k_id(
+                x,
+                t,
+                n,
+                k,
+                expert_words,
+                rows_per_expert,
+                idx,
+                idx_off,
+                x_stride,
+            ),
             _ => Err(err(&format!(
                 "expert-strided dispatch is only wired for the Q2_K/Q3_K down projection; got {kind:?}"
             ))),
@@ -3139,51 +3145,54 @@ impl Qwen35Gpu {
             });
         }
 
-        b.moe_gather(&r.gate, &idx, 0, n_used, &m.gate_stage, r.gate_per)?;
-        b.moe_gather(&r.up, &idx, 0, n_used, &m.up_stage, r.up_per)?;
-
-        if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
-            use std::sync::Once;
-            static ONCE2: Once = Once::new();
-            ONCE2.call_once(|| {
-                let st = m.gate_stage.to(Device::Cpu).expect("debug stage");
-                let a = st.storage_ref().as_bytes();
-                let bank = m.gate.lock().expect("debug bank");
-                let w = bank.host.expert(112, bank.host.byte_len());
-                let bb = w.bytes();
-                let n = r.gate_per.min(bb.len());
-                let same = a[..n].iter().zip(&bb[..n]).filter(|(x, y)| x == y).count();
-                eprintln!(
-                    "stage[0] vs expert 112: {same}/{n} bytes equal, stage0={:?} expert0={:?}",
-                    &a[..8],
-                    &bb[..8]
-                );
-            });
-        }
-
+        // The resident bank holds every expert, so the expert-strided GEMV
+        // reads the selected experts in place through `idx`: no gather, and
+        // the ids never leave the device.
         let rows = n_used * m.ffn_rows;
-        let gv = self.wgemv_at(r.gate_kind, &m.gate_stage, rows, m.ffn_cols, ht)?;
-        let uv = self.wgemv_at(r.up_kind, &m.up_stage, rows, m.ffn_cols, ht)?;
+        let gv = self.wgemv_id(
+            r.gate_kind,
+            &r.gate,
+            rows,
+            m.ffn_cols,
+            ht,
+            r.gate_per / 4,
+            m.ffn_rows,
+            &idx,
+            0,
+            0,
+        )?;
+        let uv = self.wgemv_id(
+            r.up_kind,
+            &r.up,
+            rows,
+            m.ffn_cols,
+            ht,
+            r.up_per / 4,
+            m.ffn_rows,
+            &idx,
+            0,
+            0,
+        )?;
         let gv = gv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
         let uv = uv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
         let signs = self.signs_or_placeholder(cfg.moe_ffn)?;
         let (_g, _u, act) = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?;
         let act = b.mul_rows(&act, &weights, n_used, m.ffn_rows)?;
 
-        b.moe_gather(&r.down, &idx, 0, n_used, &r.down_stage, r.down_per)?;
-
-        // All selected experts' `down` projections in one dispatch. The gather
-        // already laid their matrices out in selection order, and `act` is the
-        // matching `[n_used, k]` row block, so the kernel only needs the expert
-        // stride -- no per-expert launch or copy.
+        // All selected experts' `down` projections in one dispatch, read in
+        // place from the bank. `act` is the matching `[n_used, k]` row block
+        // and `idx` names each position's expert.
         let down_all = self.wgemv_id(
             r.down_kind,
-            &r.down_stage,
+            &r.down,
             n_used * m.ffn_cols,
             m.ffn_rows,
             &act,
             r.down_per / 4,
             m.ffn_cols,
+            &idx,
+            0,
+            m.ffn_rows / 4,
         )?;
         let down_sum = b.sum_rows(&down_all, n_used, m.ffn_cols)?;
 

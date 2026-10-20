@@ -612,9 +612,11 @@ pub trait DeviceBackend: Send + Sync {
 
     /// One expert-strided Q2_K matvec over a stacked bank.
     ///
-    /// Output row `r` reads expert `r / rows_per_expert`, whose weights start
-    /// `expert_words` u32 words into `w`, and activation row
-    /// `r / rows_per_expert` of `x` (`[n_experts, k]`).
+    /// Output row `r` belongs to routing position `r / rows_per_expert`,
+    /// whose expert id comes from `idx[idx_off + position]`. That expert's
+    /// weights start `expert_words` u32 words into `w`, and its activation
+    /// row starts at `position * x_stride` vec4 units in `x` (`x_stride == 0`
+    /// means every position shares one row).
     fn gemv_q2_k_id(
         &self,
         _x: &crate::Tensor,
@@ -623,6 +625,9 @@ pub trait DeviceBackend: Send + Sync {
         _k: usize,
         _expert_words: usize,
         _rows_per_expert: usize,
+        _idx: &crate::Tensor,
+        _idx_off: usize,
+        _x_stride: usize,
     ) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
             "gemv_q2_k_id not implemented for backend '{}'",
@@ -640,6 +645,9 @@ pub trait DeviceBackend: Send + Sync {
         _k: usize,
         _expert_words: usize,
         _rows_per_expert: usize,
+        _idx: &crate::Tensor,
+        _idx_off: usize,
+        _x_stride: usize,
     ) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
             "gemv_q3_k_id not implemented for backend '{}'",
