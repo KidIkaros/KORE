@@ -108,8 +108,8 @@ has its own section.
 ## 5. Megakernel / persistent kernel
 
 DeepInfer fuses an entire layer (or several) into one persistent kernel. The
-current device path is **903 dispatches/step, 15.5 ms** (no-sync census) and
-**54–55 tok/s** in the real loop, against llama.cpp's **80.25 tok/s**
+current device path is **823 dispatches/step, 14.9 ms** (no-sync census) and
+**57–58 tok/s** in the real loop, against llama.cpp's **80.25 tok/s**
 (12.5 ms/step) on the same file and card.
 
 The ablation changed the diagnosis. Dispatch count is not the wall: the step
@@ -120,7 +120,8 @@ reading the router in its native row-major layout moved the device lane from
 spread thin: `gdn_step` 4.9, attention 6.1 (Q4_K + Q8_0), MoE Q2_K 3.4,
 `had_pre` 2.9. The cheap fusions have been taken (`swiglu_rows` folds the
 routing weight in, `sum_rows_add` folds the shared expert in: 120 dispatches and
-+1.7 %), so what is left is kernel work, not launch work.
++1.7 %), and one router matvec now feeds both the top-k and the shared gate.
+What is left is kernel work, not launch work.
 
 That leaves the megakernel as a *second* milestone, not the first. Collapsing
 route → gate/up → SwiGLU → down → weighted sum into one or two dispatches is

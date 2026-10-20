@@ -457,6 +457,8 @@ cancel over the first 400 tokens.
 | **Row-major router matvec** (`router_matvec.wgsl`) | 29.8 → 17.0 ms/step; real loop 28.2 → 47.5–50.2 tok/s (`n=48`) |
 | **In-place expert read** (`idx` + `x_stride` in `gemv_q{2,3}_k`) | 1143 → 1023 dispatches, no gathers, no `down_stage`; ~+3 % |
 | **SwiGLU + routing scale, `sum_rows` + shared add** (`swiglu_rows`, `sum_rows_add`) | 1023 → 903 dispatches; 53.7 → 54.6 tok/s (+1.7 %, `n=64`, 3 interleaved rounds) |
+| **One router matvec for top-k + shared gate** (`moe_topk_gate`) | 903 → 823 dispatches; no-sync 15.53 → 14.93 ms; real loop 57.6 → 58.0 tok/s |
+| **`gdn_step` state i-major** | ~3.8 → ~2.9 ms of the step (ablation delta); 53.9 → 57.1 tok/s (+5.8 %) |
 | device routing, fused `down`, `flush_uploads` (previous session) | 11.8 → 17.1 tok/s (1.44×) |
 
 The two kernels were not "small dependent ops". They were the two halves of the
@@ -491,7 +493,7 @@ final 18.6 ms baseline:
 
 | label | ms/step | note |
 |---|---|---|
-| `gdn_step_pass` | 4.93 | largest single kernel now |
+| `gdn_step_pass` | 4.93 | largest single kernel then; ~2.9 after the i-major state layout |
 | `gemv_q4_k_compute_pass` | 3.49 | attention projections, 100 dispatches |
 | `gemv_q2_k_compute_pass` | 3.39 | 152 dispatches (MoE gate/up, shared expert) |
 | `had_pre_pass` | 2.87 | 171 dispatches (norms, SwiGLU) |
@@ -514,7 +516,8 @@ removed work without poisoning the inputs.
 | host-routed | 1383 | 75.5 ms | 13.2 |
 | device-routed, after fused down | 1143 | 54.5 ms | 18.4 |
 | device-routed, after in-place read | 1023 | 17.0 ms | 59.0 |
-| device-routed, with the two fusions | **903** | **15.5 ms** | **64.4** |
+| device-routed, with the two fusions | 903 | 15.5 ms | 64.4 |
+| device-routed, plus router fusion + `gdn_step` layout | **823** | **14.9 ms** | **67.0** |
 
 The real loop is ~20 ms/token (48–53 tok/s): the difference is the per-token
 argmax readback and the submission wait, not more dispatch overhead. The step is
@@ -572,9 +575,11 @@ policy: on the repetitive stream the fully-accepted cost per token falls to
 
 ### Next, in order
 
-1. **`gdn_step` (4.9 ms) and `gdn_gates` (1.8 ms).** The largest kernels left,
-   and shader-bound. The handoff already notes `gdn_step` is 10–17 % off at
-   large widths and hard-codes 128-wide staging.
+1. **`gdn_gates` (1.8 ms) and what is left of `gdn_step` (~2.9 ms).** The
+   i-major state made `gdn_step` coalesce; its three 128-step sweeps are still
+   one workgroup per head (16 workgroups), so it occupies half the CUs. Splitting
+   the sweeps across two thread groups per head would reassociate the sums, which
+   needs a tolerance argument rather than byte-identity.
 2. ~~Fuse SwiGLU with the routing scale, and `sum_rows` with the shared-expert
    add~~ Done: `swiglu_rows` (mode-2 `row_scale`) and `sum_rows_add` (bias
    binding), 120 dispatches and +1.7 %. The host lane reads the same kernels but
