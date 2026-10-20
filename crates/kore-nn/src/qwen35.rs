@@ -68,6 +68,49 @@ fn err(msg: &str) -> KoreError {
     KoreError::StorageError(format!("qwen35: {msg}"))
 }
 
+/// `KORE_STEP_PROFILE=1`: split one decode step into the regions the no-sync
+/// census cannot see -- the per-token activation upload, the layer chain (host
+/// encode time), and the argmax readback that ends the step.
+///
+/// The third number is the interesting one: because nothing syncs inside the
+/// chain, the readback *is* the queue drain, so it absorbs every dispatch the
+/// GPU had not finished. When `argmax+readback` dominates, the step is
+/// GPU-bound and the host round trip costs nothing; when it does not, the host
+/// is the limit.
+fn step_profile() -> Option<&'static Mutex<[f64; 4]>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("KORE_STEP_PROFILE").is_some()) {
+        return None;
+    }
+    static P: Mutex<[f64; 4]> = Mutex::new([0.0; 4]);
+    Some(&P)
+}
+
+fn step_profile_note(us: [f64; 3]) {
+    if let Some(p) = step_profile() {
+        let mut p = p.lock().expect("step profile");
+        p[0] += us[0];
+        p[1] += us[1];
+        p[2] += us[2];
+        p[3] += 1.0;
+    }
+}
+
+fn step_profile_report(label: &str) {
+    let Some(p) = step_profile() else { return };
+    let p = p.lock().expect("step profile");
+    let n = p[3].max(1.0);
+    eprintln!(
+        "{label} step profile over {} steps: embed {:.2} ms, layers {:.2} ms (host encode), \
+argmax+readback {:.2} ms (queue drain), total {:.2} ms",
+        p[3] as usize,
+        p[0] / n / 1000.0,
+        p[1] / n / 1000.0,
+        p[2] / n / 1000.0,
+        (p[0] + p[1] + p[2]) / n / 1000.0
+    );
+}
+
 /// Below this many cached keys the merge pass costs more than the sharding saves,
 /// so decode attention uses the single-workgroup kernel. Overridable with
 /// `KORE_ATTN_SPLIT_MIN` (set it above the context length to disable sharding).
@@ -3287,6 +3330,7 @@ impl Qwen35Gpu {
         let conv_dim = cfg.ssm_inner + 2 * cfg.ssm_groups * cfg.ssm_state;
         let scale = 1.0 / (cfg.head_dim as f32).sqrt();
 
+        let t_embed = Instant::now();
         // embed on CPU (row dequant + restore), upload
         let e = cpu.embed(token)?;
         let x0 = Tensor::from_f32(&e, &[1, hidden])
@@ -3300,6 +3344,7 @@ impl Qwen35Gpu {
         let mut pending = Tensor::from_f32(&vec![0.0f32; hidden], &[1, hidden])
             .to(self.device)
             .map_err(|e2| err(&format!("zero residual upload: {e2}")))?;
+        let embed_us = t_embed.elapsed().as_micros() as f64;
 
         for (layer, st) in self.layers.iter().zip(states.iter_mut()) {
             match (layer, st) {
@@ -3463,7 +3508,14 @@ impl Qwen35Gpu {
             cfg.eps,
         )?;
         let logits = self.wgemv(&self.head, &ht)?;
+        let t_argmax = Instant::now();
+        let layers_us = t_embed.elapsed().as_micros() as f64 - embed_us;
         let toks = b.argmax_last_dim(&logits)?;
+        step_profile_note([
+            embed_us,
+            layers_us,
+            t_argmax.elapsed().as_micros() as f64,
+        ]);
         Ok(toks[0])
     }
 
@@ -3933,6 +3985,7 @@ impl Qwen35Gpu {
             out.push(tok);
             next = self.forward(cpu, tok, tokens.len() + k, &mut states)?;
         }
+        step_profile_report("greedy");
         Ok(out)
     }
 }
