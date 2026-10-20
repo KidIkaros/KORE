@@ -410,3 +410,84 @@ The one thing to carry forward from this box is the discipline: cool the die,
 interleave the arms, warm the harness, state the shape, and gate byte-identity per
 batch shape. Every number in §4 survived that; every number that did not is marked
 retracted in §14.33.
+
+---
+
+## 13. MoE on the 16 GB AMD box: device routing, fused down, and the wall
+
+Measured 2026-08-13 on the RX 9060 XT, `Qwen_Qwen3.6-35B-A3B-Q2_K_L.gguf`,
+Vulkan, `-ngl` equivalent (every layer resident), 5-token prompt, `n=64`,
+`max_ctx=128`, arms interleaved 3 rounds with a 6 s gap. Correctness gate:
+`max|d|` against the host path and token ids against the oracle.
+
+### What moved
+
+| arm | tok/s (3 rounds) | ratio |
+|---|---|---|
+| host-routed expert stream (`default`) | 11.77 / 11.82 / 11.81 | 1.00× |
+| device-routed (`KORE_MOE_DEVICE_ROUTE=1`) | 17.11 / 17.22 / 16.99 | **1.44×** |
+
+The llama.cpp reference on the same file and card is **80.25 tok/s**, so the
+remaining gap is 4.7×. A warmed run after the dense benchmark reached 20.80
+tok/s: the die was at sclk 1184 MHz of 2620 during the interleaved rounds, so
+absolute numbers move with the power state. The 1.44× is interleaved and is the
+number to quote.
+
+Correctness: routed `down` output `max|d| = 2.2351742e-8` vs host, token ids
+exact (`11751 13 198 760 6511 314 9338 369`), repeated 8 times for `n=64`.
+
+### What was built
+
+- `moe_topk.wgsl` / `moe_gather.wgsl`: routing, softmax, top-k, and expert
+  gather on device. The host never sees the token's expert list.
+- One gather per projection instead of one per expert; the selected expert
+  matrices land in `gate_stage` / `up_stage` / `down_stage` in selection order.
+- `gemv_q2_k_at` / `gemv_q3_k_at` and their `_into` forms: a matvec against a
+  matrix at a word offset inside a stacked bank.
+- `gemv_q{2,3}_k_id`: one expert-strided dispatch for all eight routed `down`
+  projections, then one `sum_rows`. This is the `MUL_MAT_ID` shape, minus the
+  in-place bank read.
+- `flush_uploads`: bulk expert uploads now submit the staging belt. GTT peak
+  fell from ~16 GB to **1.5 GB**; without it the "resident" tier spilled.
+- Q2_0 gained a weight offset and the dense FFN now stores gate and up as one
+  packed matrix (rows `0..gate_n` gate, the rest up), read by one GEMV.
+
+### Census (ctx 6, 4 steps, no sync)
+
+| arm | dispatches/step | wall | tok/s |
+|---|---|---|---|
+| host-routed | 1383 | 75.5 ms | 13.2 |
+| device-routed | **1143** | 54.5 ms | 18.4 |
+
+The 280-dispatch cut (fused `down`) bought ~2 ms, i.e. **~6.5 µs per removed
+dispatch**. The step is latency-bound on small dependent ops, not launch-count
+bound: the remaining 54 ms is 40 layers of ~28 dependent dispatches, each doing a
+small matvec. That is why the gap to llama.cpp is a kernel-fusion gap, not a
+plumbing gap.
+
+### Closed this session (do not rebuild)
+
+| Lever | Verdict |
+|---|---|
+| **Full residency vs streaming** | Worthless on 16 GB: warm 16.56 (resident 128) vs 16.51 (streaming) tok/s. Keep `KORE_MOE_RESIDENT=all`; the win was the GTT fix, not the tier. |
+| **Accumulate `down` in place** | Slower: 15.75–17.33 vs 20.89 tok/s. The read-after-write on the 8 KB output serializes the GEMVs; `sum_rows` after independent writes is better. |
+| **Dense gate+up fusion** | Neutral: 321 vs 345 dispatches, 118 vs 118 tok/s in a 4-round A/B. Keep it (fewer launches, one upload) but it is not a speed lever. `KORE_DENSE_SPLIT_GATE_UP=1` restores the split path. |
+
+Dense at the current clock state: 118 tok/s greedy (`n=200`), 189 tok/s with
+spec `k=3, min_match=4` (100 % acceptance, 1.60×). The earlier 142/232 readings
+were taken with the die at a higher sclk; the ratio is the stable number.
+
+### Next, in order
+
+1. **One MoE layer, one dispatch (or two).** Route → gate/up → SwiGLU → down →
+   weighted sum, with the expert matvecs reading the **resident bank in place**
+   by `idx` (no gather, no stage buffers). The `gemv_q{2,3}_k_id` stride logic is
+   the prototype; it needs an `idx` binding and an `x_stride` of zero for
+   gate/up. This is the only path from 17 to the llama.cpp 80.
+2. **Per-expert routing counters** for hot-set pinning on 8 GB cards
+   (`KORE_MOE_RESIDENT=N` currently pins the first N, not the hottest N). See
+   `docs/deepinfer-scaled-down.md` §3.
+3. **Dense:** stop at the fused gate/up. The next dense lever is not another
+   dispatch merge; it is occupancy in the Q2_0 GEMV at `m=1`.
+
+DeepInfer mapping and verdicts: `docs/deepinfer-scaled-down.md`.
