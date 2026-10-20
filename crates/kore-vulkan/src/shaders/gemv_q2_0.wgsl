@@ -37,6 +37,12 @@ struct Q2Uniforms {
     n: u32,
     k: u32,
     blocks_per_row: u32,
+    // Weight base offset in u32 words. A fused gate+up matrix is one buffer,
+    // so the split path addresses its upper half without a second upload.
+    w_off: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Q2Uniforms;
@@ -138,22 +144,22 @@ fn main(
         var dd2 = 0.0;
         var dd3 = 0.0;
         if (row0 < n_len) {
-            let rw = row0 * row_words;
+            let rw = params.w_off + row0 * row_words;
             ww0 = w[rw + cw];
             dd0 = unpack2x16float(w[rw + swo] >> sw_sh).x;
         }
         if (row1 < n_len) {
-            let rw = row1 * row_words;
+            let rw = params.w_off + row1 * row_words;
             ww1 = w[rw + cw];
             dd1 = unpack2x16float(w[rw + swo] >> sw_sh).x;
         }
         if (row2 < n_len) {
-            let rw = row2 * row_words;
+            let rw = params.w_off + row2 * row_words;
             ww2 = w[rw + cw];
             dd2 = unpack2x16float(w[rw + swo] >> sw_sh).x;
         }
         if (row3 < n_len) {
-            let rw = row3 * row_words;
+            let rw = params.w_off + row3 * row_words;
             ww3 = w[rw + cw];
             dd3 = unpack2x16float(w[rw + swo] >> sw_sh).x;
         }

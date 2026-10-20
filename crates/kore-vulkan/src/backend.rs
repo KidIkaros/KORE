@@ -207,11 +207,54 @@ struct ArgmaxUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MoeTopkUniforms {
+    n: u32,
+    k: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct MoeGatherUniforms {
+    per_words: u32,
+    k: u32,
+    idx_off: u32,
+    groups: u32,
+    chunk: u32,
+    _pad: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SumRowsUniforms {
+    rows: u32,
+    n: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Q2KUniforms {
     m: u32,
     n: u32,
     k: u32,
     blocks_per_row: u32,
+    /// Weight base offset in u32 words (an expert inside a stacked bank).
+    w_off: u32,
+    /// Output base in f32 elements and add-vs-overwrite flag. Routed experts
+    /// accumulate into a single output buffer to save a dispatch per expert.
+    y_off: u32,
+    accum: u32,
+    _pad0: u32,
+    /// Expert-strided mode: when nonzero, output row `r` reads expert
+    /// `r / rows_per_expert`, whose weights start `expert_words` words in and
+    /// whose activation is row `r / rows_per_expert` of `x`.
+    id: u32,
+    rows_per_expert: u32,
+    expert_words: u32,
+    _pad1: u32,
 }
 
 #[repr(C)]
@@ -221,6 +264,20 @@ struct Q3KUniforms {
     n: u32,
     k: u32,
     blocks_per_row: u32,
+    /// Weight base offset in u32 words (an expert inside a stacked bank).
+    w_off: u32,
+    /// Output base in f32 elements and add-vs-overwrite flag. Routed experts
+    /// accumulate into a single output buffer to save a dispatch per expert.
+    y_off: u32,
+    accum: u32,
+    _pad0: u32,
+    /// Expert-strided mode: when nonzero, output row `r` reads expert
+    /// `r / rows_per_expert`, whose weights start `expert_words` words in and
+    /// whose activation is row `r / rows_per_expert` of `x`.
+    id: u32,
+    rows_per_expert: u32,
+    expert_words: u32,
+    _pad1: u32,
 }
 
 #[repr(C)]
@@ -369,6 +426,9 @@ struct Q2GemvUniforms {
     n: u32,
     k: u32,
     blocks_per_row: u32,
+    /// Weight base offset in u32 words (the upper half of a gate+up matrix).
+    w_off: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -398,7 +458,13 @@ struct HadPreUniforms {
     scale: f32,
     /// 1 = apply signs + Walsh-Hadamard, 0 = `out_had` is the pre-op value.
     had: u32,
-    _pad1: u32,
+    /// Element offset of `b` inside its buffer. A fused gate/up projection
+    /// writes both halves into one tensor, so `b` is the upper half.
+    b_off: u32,
+    /// Elements per source row of `a`. `cols` for the ordinary layout, and
+    /// `2*cols` when gate and up are fused.
+    a_stride: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -586,6 +652,9 @@ pub struct VulkanBackend {
     flash_decode_gqa_pipeline: Arc<wgpu::ComputePipeline>,
     rope_pipeline: Arc<wgpu::ComputePipeline>,
     argmax_pipeline: Arc<wgpu::ComputePipeline>,
+    moe_topk_pipeline: Arc<wgpu::ComputePipeline>,
+    moe_gather_pipeline: Arc<wgpu::ComputePipeline>,
+    sum_rows_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q4_k_split3_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q6_k_split3_pipeline: Arc<wgpu::ComputePipeline>,
     rope_pair_pipeline: Arc<wgpu::ComputePipeline>,
@@ -886,6 +955,51 @@ impl VulkanBackend {
                 label: Some("kore_argmax_pipeline"),
                 layout: None,
                 module: &argmax_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let moe_topk_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_moe_topk_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/moe_topk.wgsl").into()),
+        });
+        let moe_topk_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_moe_topk_pipeline"),
+                layout: None,
+                module: &moe_topk_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let moe_gather_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_moe_gather_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/moe_gather.wgsl").into()),
+        });
+        let moe_gather_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_moe_gather_pipeline"),
+                layout: None,
+                module: &moe_gather_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let sum_rows_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_sum_rows_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/sum_rows.wgsl").into()),
+        });
+        let sum_rows_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_sum_rows_pipeline"),
+                layout: None,
+                module: &sum_rows_shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
@@ -1243,6 +1357,9 @@ impl VulkanBackend {
             flash_decode_gqa_q8_combine_pipeline,
             rope_pipeline,
             argmax_pipeline,
+            moe_topk_pipeline,
+            moe_gather_pipeline,
+            sum_rows_pipeline,
             gemv_q4_k_split3_pipeline,
             gemv_q6_k_split3_pipeline,
             rope_pair_pipeline,
@@ -3004,6 +3121,183 @@ impl VulkanBackend {
         Ok(indices)
     }
 
+    /// Device-side router top-k: `logits[n]` -> (`idx[k]` as f32, `w[k]`).
+    ///
+    /// The ids stay in device memory for [`Self::moe_gather`]; nothing about the
+    /// routing decision round-trips to the host.
+    pub fn moe_topk(&self, logits: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
+        let n = logits.numel();
+        if k == 0 || k > 16 {
+            return Err(VulkanError::UnsupportedOperation(
+                "moe_topk: k must be in 1..=16".into(),
+            ));
+        }
+        if n == 0 {
+            return Err(VulkanError::ShapeMismatch {
+                op: "moe_topk".into(),
+                lhs: vec![n],
+                rhs: vec![1],
+            });
+        }
+        let logits_buf = KoreVulkanBuffer::from_storage(
+            logits.storage_ref(),
+            logits.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let out_bytes = (k * std::mem::size_of::<f32>()).max(4);
+        let idx_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_moe_topk_idx");
+        let w_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_moe_topk_w");
+
+        let uniforms = MoeTopkUniforms {
+            n: n as u32,
+            k: k as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        self.record_dispatch(
+            &self.moe_topk_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[logits_buf.arc_buffer(), &idx_buf, &w_buf],
+            (1, 1, 1),
+            "moe_topk_pass",
+        );
+
+        let idx = self.make_tensor(
+            KoreVulkanBuffer::new(idx_buf, DType::F32, vec![k]),
+            &[k],
+        );
+        let w = self.make_tensor(KoreVulkanBuffer::new(w_buf, DType::F32, vec![k]), &[k]);
+        Ok((idx, w))
+    }
+
+    /// Device-side expert gather: `dst[s*per..] = bank[idx[idx_off+s]*per..]`.
+    ///
+    /// `k` experts are copied in one dispatch; `idx_off` is how the down
+    /// projection walks one id at a time into its per-expert slot.
+    pub fn moe_gather(
+        &self,
+        bank: &Tensor,
+        idx: &Tensor,
+        idx_off: usize,
+        k: usize,
+        dst: &Tensor,
+        per: usize,
+    ) -> Result<()> {
+        if per == 0 || !per.is_multiple_of(4) {
+            return Err(VulkanError::UnsupportedOperation(
+                "moe_gather: per-expert bytes must be a non-zero multiple of 4".into(),
+            ));
+        }
+        if k == 0 {
+            return Ok(());
+        }
+        if idx.numel() < idx_off + k {
+            return Err(VulkanError::ShapeMismatch {
+                op: "moe_gather".into(),
+                lhs: vec![idx.numel()],
+                rhs: vec![idx_off + k],
+            });
+        }
+        if bank.numel() < per {
+            return Err(VulkanError::ShapeMismatch {
+                op: "moe_gather".into(),
+                lhs: vec![bank.numel()],
+                rhs: vec![per],
+            });
+        }
+        if dst.numel() < k * per {
+            return Err(VulkanError::ShapeMismatch {
+                op: "moe_gather".into(),
+                lhs: vec![dst.numel()],
+                rhs: vec![k * per],
+            });
+        }
+        let bank_buf = KoreVulkanBuffer::from_storage(
+            bank.storage_ref(),
+            bank.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let idx_buf = KoreVulkanBuffer::from_storage(
+            idx.storage_ref(),
+            idx.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let dst_buf = KoreVulkanBuffer::from_storage(
+            dst.storage_ref(),
+            dst.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+
+        // An expert is a few hundred kB; one workgroup cannot saturate memory,
+        // so split each expert into chunks serviced by separate workgroups.
+        let per_words = per / 4;
+        let groups = per_words.div_ceil(4096).clamp(1, 64);
+        let chunk = per_words.div_ceil(groups);
+        let uniforms = MoeGatherUniforms {
+            per_words: per_words as u32,
+            k: k as u32,
+            idx_off: idx_off as u32,
+            groups: groups as u32,
+            chunk: chunk as u32,
+            _pad: [0; 3],
+        };
+        self.record_dispatch(
+            &self.moe_gather_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[bank_buf.arc_buffer(), idx_buf.arc_buffer(), dst_buf.arc_buffer()],
+            ((k * groups) as u32, 1, 1),
+            "moe_gather_pass",
+        );
+        Ok(())
+    }
+
+    /// Sum `rows` contiguous `[n]` slices of `x` into one `[n]` F32 tensor.
+    ///
+    /// The routed `down` projection writes one row per selected expert; this
+    /// collapses them with one dispatch instead of one add per expert.
+    pub fn sum_rows(&self, x: &Tensor, rows: usize, n: usize) -> Result<Tensor> {
+        if rows == 0 || n == 0 {
+            return Err(VulkanError::UnsupportedOperation(
+                "sum_rows: rows and n must be non-zero".into(),
+            ));
+        }
+        if x.numel() < rows * n {
+            return Err(VulkanError::ShapeMismatch {
+                op: "sum_rows".into(),
+                lhs: vec![x.numel()],
+                rhs: vec![rows * n],
+            });
+        }
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x.shape().dims(), &self.device, &self.queue)?;
+
+        let out_bytes = (n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_sum_rows_out");
+
+        let uniforms = SumRowsUniforms {
+            rows: rows as u32,
+            n: n as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        let workgroups = (n as u32).div_ceil(256).max(1);
+        self.record_dispatch(
+            &self.sum_rows_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), &y_buffer],
+            (workgroups, 1, 1),
+            "sum_rows_pass",
+        );
+
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![n]);
+        Ok(self.make_tensor(y_kore_buf, &[n]))
+    }
+
     /// Quantized Q4_K matrix-vector multiplication: y = x @ W^T
     /// x: [M, K] in F32
     /// w_raw: [N * (K/256) * 144] in U8
@@ -3016,6 +3310,22 @@ impl VulkanBackend {
     /// n: output dimension (number of rows in W)
     /// k: input dimension (number of columns in W)
     pub fn gemv_q3_k(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+        self.gemv_q3_k_at(x, w_raw, n, k, 0)
+    }
+
+    /// Q3_K matvec against a matrix that starts `w_off_words` words into `w_raw`.
+    ///
+    /// This is what lets a resident expert bank be one allocation: the down
+    /// projection can be handed the bank plus an expert offset instead of a
+    /// copy per expert.
+    pub fn gemv_q3_k_at(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+    ) -> Result<Tensor> {
         let x_shape = x.shape().dims();
         // A 1-D input is a single row: `m` is 1, not its length.
         let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
@@ -3031,22 +3341,82 @@ impl VulkanBackend {
         // A raw 110-byte-per-block buffer would read out of bounds by two bytes
         // per block and quietly return a wrong answer, so check the upload shape.
         let need = n * blocks_per_row as usize * 112;
-        if w_raw.numel() < need {
+        let w_off_bytes = w_off_words * 4;
+        if w_raw.numel() < w_off_bytes + need {
             return Err(VulkanError::ShapeMismatch {
                 op: format!(
-                    "gemv_q3_k weight buffer: {} < {need} padded bytes",
-                    w_raw.numel()
+                    "gemv_q3_k weight buffer: {} < {} padded bytes",
+                    w_raw.numel(),
+                    w_off_bytes + need
                 ),
                 lhs: vec![m, k_in],
                 rhs: vec![n, k],
             });
         }
 
+        let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q3_k_out");
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![m, n]);
+        let y = self.make_tensor(y_kore_buf, &[m, n]);
+        self.gemv_q3_k_into(x, w_raw, n, k, w_off_words, &y, 0, false)?;
+        Ok(y)
+    }
+
+    /// Like [`gemv_q3_k_at`], but writes into `out` starting at `y_off` f32
+    /// elements. With `accum`, the kernel adds onto the existing contents
+    /// instead of overwriting, so the routed `down` experts can sum in place.
+    pub fn gemv_q3_k_into(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+        out: &Tensor,
+        y_off: usize,
+        accum: bool,
+    ) -> Result<()> {
+        let x_shape = x.shape().dims();
+        // A 1-D input is a single row: `m` is 1, not its length.
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        let k_in = x.numel() / m;
+        if k_in != k || !k.is_multiple_of(256) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q3_k".into(),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+        let blocks_per_row = (k / 256) as u32;
+        // A raw 110-byte-per-block buffer would read out of bounds by two bytes
+        // per block and quietly return a wrong answer, so check the upload shape.
+        let need = n * blocks_per_row as usize * 112;
+        let w_off_bytes = w_off_words * 4;
+        if w_raw.numel() < w_off_bytes + need {
+            return Err(VulkanError::ShapeMismatch {
+                op: format!(
+                    "gemv_q3_k weight buffer: {} < {} padded bytes",
+                    w_raw.numel(),
+                    w_off_bytes + need
+                ),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
         let uniforms = Q3KUniforms {
             m: m as u32,
             n: n as u32,
             k: k as u32,
             blocks_per_row,
+            w_off: w_off_words as u32,
+            y_off: y_off as u32,
+            accum: u32::from(accum),
+            _pad0: 0,
+            id: 0,
+            rows_per_expert: 0,
+            expert_words: 0,
+            _pad1: 0,
         };
 
         let x_buf =
@@ -3057,23 +3427,23 @@ impl VulkanBackend {
             &self.device,
             &self.queue,
         )?;
-
-        let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
-        let y_buffer =
-            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q3_k_out");
+        let y_buf = KoreVulkanBuffer::from_storage(
+            out.storage_ref(),
+            out.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
 
         let workgroups_x = (n as u32).div_ceil(4).max(1);
         let workgroups_y = (m as u32).div_ceil(4).max(1);
         self.record_dispatch(
             &self.gemv_q3_k_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), y_buf.arc_buffer()],
             (workgroups_x, workgroups_y, 1),
             "gemv_q3_k_compute_pass",
         );
-
-        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![m, n]);
-        Ok(self.make_tensor(y_kore_buf, &[m, n]))
+        Ok(())
     }
 
     /// Quantized Q2_K matrix-vector multiplication: y = x @ W^T
@@ -3082,6 +3452,18 @@ impl VulkanBackend {
     /// n: output dimension (number of rows in W)
     /// k: input dimension (number of columns in W)
     pub fn gemv_q2_k(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+        self.gemv_q2_k_at(x, w_raw, n, k, 0)
+    }
+
+    /// Q2_K matvec against a matrix starting `w_off_words` words into `w_raw`.
+    pub fn gemv_q2_k_at(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+    ) -> Result<Tensor> {
         let x_shape = x.shape().dims();
         // A 1-D input is a single row: `m` is 1, not its length.
         let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
@@ -3102,11 +3484,88 @@ impl VulkanBackend {
         }
 
         let blocks_per_row = (k / 256) as u32;
+        let need = n * blocks_per_row as usize * 84;
+        let w_off_bytes = w_off_words * 4;
+        if w_raw.numel() < w_off_bytes + need {
+            return Err(VulkanError::ShapeMismatch {
+                op: format!(
+                    "gemv_q2_k weight buffer: {} < {} bytes",
+                    w_raw.numel(),
+                    w_off_bytes + need
+                ),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+        let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q2_k_out");
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![m, n]);
+        let y = self.make_tensor(y_kore_buf, &[m, n]);
+        self.gemv_q2_k_into(x, w_raw, n, k, w_off_words, &y, 0, false)?;
+        Ok(y)
+    }
+
+    /// Like [`gemv_q2_k_at`], but writes into `out` starting at `y_off` f32
+    /// elements. With `accum`, the kernel adds onto the existing contents
+    /// instead of overwriting, so the routed `down` experts can sum in place.
+    pub fn gemv_q2_k_into(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+        out: &Tensor,
+        y_off: usize,
+        accum: bool,
+    ) -> Result<()> {
+        let x_shape = x.shape().dims();
+        // A 1-D input is a single row: `m` is 1, not its length.
+        let m = if x_shape.len() == 2 { x_shape[0] } else { 1 };
+        let k_in = x.numel() / m;
+        if k_in != k {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_k".into(),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+        if !k.is_multiple_of(256) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_k".into(),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
+
+        let blocks_per_row = (k / 256) as u32;
+        let need = n * blocks_per_row as usize * 84;
+        let w_off_bytes = w_off_words * 4;
+        if w_raw.numel() < w_off_bytes + need {
+            return Err(VulkanError::ShapeMismatch {
+                op: format!(
+                    "gemv_q2_k weight buffer: {} < {} bytes",
+                    w_raw.numel(),
+                    w_off_bytes + need
+                ),
+                lhs: vec![m, k_in],
+                rhs: vec![n, k],
+            });
+        }
         let uniforms = Q2KUniforms {
             m: m as u32,
             n: n as u32,
             k: k as u32,
             blocks_per_row,
+            w_off: w_off_words as u32,
+            y_off: y_off as u32,
+            accum: u32::from(accum),
+            _pad0: 0,
+            id: 0,
+            rows_per_expert: 0,
+            expert_words: 0,
+            _pad1: 0,
         };
 
         let x_buf =
@@ -3117,23 +3576,193 @@ impl VulkanBackend {
             &self.device,
             &self.queue,
         )?;
-
-        let out_bytes = (m * n * std::mem::size_of::<f32>()).max(4);
-        let y_buffer =
-            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q2_k_out");
+        let y_buf = KoreVulkanBuffer::from_storage(
+            out.storage_ref(),
+            out.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
 
         let workgroups_x = (n as u32).div_ceil(4).max(1);
         let workgroups_y = (m as u32).div_ceil(4).max(1);
         self.record_dispatch(
             &self.gemv_q2_k_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), y_buf.arc_buffer()],
             (workgroups_x, workgroups_y, 1),
             "gemv_q2_k_compute_pass",
         );
+        Ok(())
+    }
 
-        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![m, n]);
-        Ok(self.make_tensor(y_kore_buf, &[m, n]))
+    /// One expert-strided Q2_K GEMV over a stacked bank.
+    ///
+    /// Output row `r` reads expert `r / rows_per_expert`, whose weights start
+    /// `expert_words` words into `w`, and activation row `r / rows_per_expert`
+    /// of `x` (`[n_experts, k]`). One dispatch replaces one per expert; `m` is
+    /// fixed at 1 because the experts themselves are the batch.
+    pub fn gemv_q2_k_id(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        expert_words: usize,
+        rows_per_expert: usize,
+    ) -> Result<Tensor> {
+        if rows_per_expert == 0 || !n.is_multiple_of(rows_per_expert) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_k_id".into(),
+                lhs: vec![n],
+                rhs: vec![rows_per_expert],
+            });
+        }
+        if !k.is_multiple_of(256) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_k_id".into(),
+                lhs: vec![k],
+                rhs: vec![256],
+            });
+        }
+        let experts = n / rows_per_expert;
+        if x.numel() < experts * k {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_k_id x".into(),
+                lhs: vec![x.numel()],
+                rhs: vec![experts * k],
+            });
+        }
+        let blocks_per_row = (k / 256) as u32;
+        if w_raw.numel() < experts * expert_words * 4 {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q2_k_id w".into(),
+                lhs: vec![w_raw.numel()],
+                rhs: vec![experts * expert_words * 4],
+            });
+        }
+
+        let x_buf = KoreVulkanBuffer::from_storage(
+            x.storage_ref(),
+            x.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let out_bytes = (n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q2_k_id_out");
+
+        let uniforms = Q2KUniforms {
+            m: 1,
+            n: n as u32,
+            k: k as u32,
+            blocks_per_row,
+            w_off: 0,
+            y_off: 0,
+            accum: 0,
+            _pad0: 0,
+            id: 1,
+            rows_per_expert: rows_per_expert as u32,
+            expert_words: expert_words as u32,
+            _pad1: 0,
+        };
+        self.record_dispatch(
+            &self.gemv_q2_k_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            (n.div_ceil(4).max(1) as u32, 1, 1),
+            "gemv_q2_k_compute_pass",
+        );
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![n]);
+        Ok(self.make_tensor(y_kore_buf, &[n]))
+    }
+
+    /// One expert-strided Q3_K GEMV over a stacked bank. See
+    /// [`Self::gemv_q2_k_id`].
+    pub fn gemv_q3_k_id(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        expert_words: usize,
+        rows_per_expert: usize,
+    ) -> Result<Tensor> {
+        if rows_per_expert == 0 || !n.is_multiple_of(rows_per_expert) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q3_k_id".into(),
+                lhs: vec![n],
+                rhs: vec![rows_per_expert],
+            });
+        }
+        if !k.is_multiple_of(256) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q3_k_id".into(),
+                lhs: vec![k],
+                rhs: vec![256],
+            });
+        }
+        let experts = n / rows_per_expert;
+        if x.numel() < experts * k {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q3_k_id x".into(),
+                lhs: vec![x.numel()],
+                rhs: vec![experts * k],
+            });
+        }
+        let blocks_per_row = (k / 256) as u32;
+        if w_raw.numel() < experts * expert_words * 4 {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q3_k_id w".into(),
+                lhs: vec![w_raw.numel()],
+                rhs: vec![experts * expert_words * 4],
+            });
+        }
+
+        let x_buf = KoreVulkanBuffer::from_storage(
+            x.storage_ref(),
+            x.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let out_bytes = (n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_gemv_q3_k_id_out");
+
+        let uniforms = Q3KUniforms {
+            m: 1,
+            n: n as u32,
+            k: k as u32,
+            blocks_per_row,
+            w_off: 0,
+            y_off: 0,
+            accum: 0,
+            _pad0: 0,
+            id: 1,
+            rows_per_expert: rows_per_expert as u32,
+            expert_words: expert_words as u32,
+            _pad1: 0,
+        };
+        self.record_dispatch(
+            &self.gemv_q3_k_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            (n.div_ceil(4).max(1) as u32, 1, 1),
+            "gemv_q3_k_compute_pass",
+        );
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![n]);
+        Ok(self.make_tensor(y_kore_buf, &[n]))
     }
 
     pub fn gemv_q4_k(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
@@ -3801,6 +4430,20 @@ impl VulkanBackend {
     /// Q2_0 quantized GEMV: y[m,n] = x[m,k] @ W^T where W is [n,k] Q2_0-packed
     /// (64 elems/block, 18 bytes: fp16 scale + 16 bytes of 2-bit {-1,0,1,2} codes).
     pub fn gemv_q2_0(&self, x: &Tensor, w_raw: &Tensor, n: usize, k: usize) -> Result<Tensor> {
+        self.gemv_q2_0_at(x, w_raw, n, k, 0)
+    }
+
+    /// Q2_0 GEMV against a matrix starting `w_off_words` u32 words into
+    /// `w_raw`. A fused gate+up matrix shares one upload; the split path reads
+    /// its upper half through this offset.
+    pub fn gemv_q2_0_at(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+    ) -> Result<Tensor> {
         if !k.is_multiple_of(512) {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q2_0".into(),
@@ -3818,11 +4461,13 @@ impl VulkanBackend {
             });
         }
         let blocks_per_row = k / 64;
-        if w_raw.numel() != n * blocks_per_row * 18 {
+        let need = n * blocks_per_row * 18;
+        let w_off_bytes = w_off_words * 4;
+        if w_raw.numel() < w_off_bytes + need {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q2_0".into(),
                 lhs: w_raw.shape().dims().to_vec(),
-                rhs: vec![n * blocks_per_row * 18],
+                rhs: vec![w_off_bytes + need],
             });
         }
         if m > 4 {
@@ -3847,6 +4492,8 @@ impl VulkanBackend {
             n: n as u32,
             k: k as u32,
             blocks_per_row: blocks_per_row as u32,
+            w_off: w_off_words as u32,
+            _pad: [0; 3],
         };
         self.record_dispatch(
             &self.gemv_q2_0_pipeline,
@@ -3957,24 +4604,53 @@ impl VulkanBackend {
         eps: f32,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let shape = a.shape().dims();
-        let numel = a.numel();
+        let cols = if shape.len() == 2 { shape[1] } else { a.numel() };
+        self.had_pre_at(mode, had, a, b, a.numel(), cols, cols, 0, weight, signs, eps)
+    }
+
+    /// `had_pre` over `a_len` logical elements of `a` laid out as `[rows, cols]`
+    /// with a row stride of `a_stride` elements.
+    ///
+    /// The fused gate/up projection writes both halves into one `[rows, 2*cols]`
+    /// tensor, so `a` reads `[row*a_stride .. +cols]` and `b` reads the same row
+    /// at `b_off` elements further in. Outputs are packed as `[rows, cols]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn had_pre_at(
+        &self,
+        mode: u32,
+        had: bool,
+        a: &Tensor,
+        b: &Tensor,
+        a_len: usize,
+        cols: usize,
+        a_stride: usize,
+        b_off: usize,
+        weight: &Tensor,
+        signs: &Tensor,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         if mode > 3 {
             return Err(VulkanError::UnsupportedOperation(format!(
                 "had_pre mode {mode} (expected 0..=3)"
             )));
         }
-        if b.numel() != numel || numel == 0 {
+        if a_len == 0 || cols == 0 || !a_len.is_multiple_of(cols) {
             return Err(VulkanError::ShapeMismatch {
                 op: "had_pre".into(),
-                lhs: shape.to_vec(),
-                rhs: b.shape().dims().to_vec(),
+                lhs: vec![a_len],
+                rhs: vec![cols],
             });
         }
-        let (rows, cols) = if shape.len() == 2 {
-            (shape[0], shape[1])
-        } else {
-            (1, numel)
-        };
+        let rows = a_len / cols;
+        let need_a = (rows - 1) * a_stride + cols;
+        let need_b = (rows - 1) * a_stride + b_off + cols;
+        if a.numel() < need_a || b.numel() < need_b {
+            return Err(VulkanError::ShapeMismatch {
+                op: "had_pre".into(),
+                lhs: vec![a.numel(), b.numel()],
+                rhs: vec![need_a, need_b],
+            });
+        }
         if cols % 512 != 0 {
             return Err(VulkanError::ShapeMismatch {
                 op: "had_pre".into(),
@@ -3990,9 +4666,8 @@ impl VulkanBackend {
             });
         }
         // `signs` covers one row; the pattern is applied to every row of an
-        // `[rows, cols]` input. At `rows = 1` this is `signs.numel() < numel`.
-        // Only read when the Hadamard stage runs, so an unfolded model may pass
-        // any tensor here.
+        // `[rows, cols]` input. Only read when the Hadamard stage runs, so an
+        // unfolded model may pass any tensor here.
         if had && signs.numel() < cols {
             return Err(VulkanError::ShapeMismatch {
                 op: "had_pre".into(),
@@ -4001,10 +4676,18 @@ impl VulkanBackend {
             });
         }
 
-        let a_buf =
-            KoreVulkanBuffer::from_storage(a.storage_ref(), shape, &self.device, &self.queue)?;
-        let b_buf =
-            KoreVulkanBuffer::from_storage(b.storage_ref(), shape, &self.device, &self.queue)?;
+        let a_buf = KoreVulkanBuffer::from_storage(
+            a.storage_ref(),
+            a.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let b_buf = KoreVulkanBuffer::from_storage(
+            b.storage_ref(),
+            b.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
         let w_buf = KoreVulkanBuffer::from_storage(
             weight.storage_ref(),
             weight.shape().dims(),
@@ -4018,7 +4701,7 @@ impl VulkanBackend {
             &self.queue,
         )?;
 
-        let out_bytes = (numel * 4).max(4);
+        let out_bytes = (rows * cols * 4).max(4);
         let res_buf =
             crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_hadpre_res");
         let norm_buf =
@@ -4035,7 +4718,9 @@ impl VulkanBackend {
             eps,
             scale: 512f32.sqrt().recip(),
             had: had as u32,
-            _pad1: 0,
+            b_off: b_off as u32,
+            a_stride: a_stride as u32,
+            _pad: [0; 3],
         };
         self.record_dispatch(
             &self.had_pre_pipeline,
@@ -4053,18 +4738,19 @@ impl VulkanBackend {
             "had_pre_pass",
         );
 
+        let out_shape = [rows, cols];
         Ok((
             self.make_tensor(
-                KoreVulkanBuffer::new(res_buf, DType::F32, shape.to_vec()),
-                shape,
+                KoreVulkanBuffer::new(res_buf, DType::F32, out_shape.to_vec()),
+                &out_shape,
             ),
             self.make_tensor(
-                KoreVulkanBuffer::new(norm_buf, DType::F32, shape.to_vec()),
-                shape,
+                KoreVulkanBuffer::new(norm_buf, DType::F32, out_shape.to_vec()),
+                &out_shape,
             ),
             self.make_tensor(
-                KoreVulkanBuffer::new(had_buf, DType::F32, shape.to_vec()),
-                shape,
+                KoreVulkanBuffer::new(had_buf, DType::F32, out_shape.to_vec()),
+                &out_shape,
             ),
         ))
     }
@@ -4469,6 +5155,17 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         ))
     }
 
+    fn flush_uploads(&self) {
+        let mut batch = self.batch.lock();
+        if let Some(enc) = batch.take_encoder(&self.device) {
+            crate::buffer::submit_with_reclaim(&self.queue, enc);
+        }
+        // `write_buffer` stages into a belt that is drained by a submit, even an
+        // empty one; without this a bulk load accumulates the whole model in
+        // host-visible memory before the first command buffer runs.
+        self.queue.submit(std::iter::empty());
+    }
+
     fn copy_to_cpu(&self, storage: &kore_core::Storage) -> kore_core::Result<kore_core::Storage> {
         let dev_storage = storage.device_storage().ok_or_else(|| {
             kore_core::KoreError::StorageError("Storage is not a device storage".into())
@@ -4656,6 +5353,33 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    fn moe_topk(
+        &self,
+        logits: &Tensor,
+        k: usize,
+    ) -> kore_core::Result<(Tensor, Tensor)> {
+        self.moe_topk(logits, k)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn moe_gather(
+        &self,
+        bank: &Tensor,
+        idx: &Tensor,
+        idx_off: usize,
+        k: usize,
+        dst: &Tensor,
+        per: usize,
+    ) -> kore_core::Result<()> {
+        self.moe_gather(bank, idx, idx_off, k, dst, per)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn sum_rows(&self, x: &Tensor, rows: usize, n: usize) -> kore_core::Result<Tensor> {
+        self.sum_rows(x, rows, n)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
     fn silu(&self, a: &Tensor) -> kore_core::Result<Tensor> {
         self.silu(a)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
@@ -4686,6 +5410,18 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    fn gemv_q2_k_at(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q2_k_at(x, w_raw, n, k, w_off_words)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
     fn gemv_q3_k(
         &self,
         x: &Tensor,
@@ -4694,6 +5430,74 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         k: usize,
     ) -> kore_core::Result<Tensor> {
         self.gemv_q3_k(x, w_raw, n, k)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gemv_q3_k_at(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q3_k_at(x, w_raw, n, k, w_off_words)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gemv_q2_k_into(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+        out: &Tensor,
+        y_off: usize,
+        accum: bool,
+    ) -> kore_core::Result<()> {
+        self.gemv_q2_k_into(x, w_raw, n, k, w_off_words, out, y_off, accum)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gemv_q3_k_into(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+        out: &Tensor,
+        y_off: usize,
+        accum: bool,
+    ) -> kore_core::Result<()> {
+        self.gemv_q3_k_into(x, w_raw, n, k, w_off_words, out, y_off, accum)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gemv_q2_k_id(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        expert_words: usize,
+        rows_per_expert: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q2_k_id(x, w_raw, n, k, expert_words, rows_per_expert)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn gemv_q3_k_id(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        expert_words: usize,
+        rows_per_expert: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q3_k_id(x, w_raw, n, k, expert_words, rows_per_expert)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
@@ -4823,6 +5627,18 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    fn gemv_q2_0_at(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        k: usize,
+        w_off_words: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.gemv_q2_0_at(x, w_raw, n, k, w_off_words)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
     fn hadamard_signed(
         &self,
         x: &Tensor,
@@ -4845,6 +5661,24 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         eps: f32,
     ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
         self.had_pre(mode, had, a, b, weight, signs, eps)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn had_pre_at(
+        &self,
+        mode: u32,
+        had: bool,
+        a: &Tensor,
+        b: &Tensor,
+        a_len: usize,
+        cols: usize,
+        a_stride: usize,
+        b_off: usize,
+        weight: &Tensor,
+        signs: &Tensor,
+        eps: f32,
+    ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
+        self.had_pre_at(mode, had, a, b, a_len, cols, a_stride, b_off, weight, signs, eps)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 

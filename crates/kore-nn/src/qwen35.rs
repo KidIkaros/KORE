@@ -823,6 +823,81 @@ fn top_k_experts(probs: &[f32], k: usize) -> Vec<(usize, f32)> {
     order[..k].iter().map(|&e| (e, probs[e] * inv)).collect()
 }
 
+/// The router weight in the `[hidden, n_experts]` row-major layout the device
+/// `matmul` expects.
+///
+/// GGUF stores `[hidden, n_experts]` with the hidden axis contiguous, which is
+/// the transpose of a row-major matrix. `n_experts == 1` (the shared-expert
+/// gate) is its own transpose, so the same helper covers both.
+fn router_transposed(w: &QW) -> Result<Vec<f32>> {
+    if !matches!(w.kind, QKind::F32) {
+        return Err(err(&format!(
+            "device routing needs an F32 router, got {:?} ('{}')",
+            w.kind, w.name
+        )));
+    }
+    let bytes = w.bytes();
+    let (m, n) = (w.m, w.n);
+    if bytes.len() != m * n * 4 {
+        return Err(err(&format!(
+            "'{}': router payload is {} B, not {m}x{n} F32",
+            w.name,
+            bytes.len()
+        )));
+    }
+    let mut out = vec![0.0f32; m * n];
+    for i in 0..n {
+        for k in 0..m {
+            let off = (i * m + k) * 4;
+            out[k * n + i] =
+                f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        }
+    }
+    Ok(out)
+}
+
+/// One contiguous device copy of a whole stacked expert bank.
+///
+/// The repack is the per-expert one [`DeviceBank::acquire`] performs, so the
+/// bytes in the big buffer are exactly the bytes a miss would have uploaded.
+/// That is what keeps a device-routed run comparable with a streamed one, and
+/// it is why this only needs one allocation: thirty thousand small buffers cost
+/// far more driver memory than their payload, which is enough to push a bank
+/// that fits into system memory and destroy the very locality it was for.
+fn upload_bank(
+    host: &QW,
+    n_experts: usize,
+    b: &dyn DeviceBackend,
+    device: Device,
+) -> Result<(Tensor, usize)> {
+    let per = host.byte_len();
+    let mut stride = 0usize;
+    let mut all = Vec::with_capacity(per.saturating_mul(n_experts));
+    for e in 0..n_experts {
+        let w = host.expert(e, per);
+        let packed: Vec<u8> = match w.kind {
+            QKind::Q2_0 => kore_kernels::q2_0::repack_q2_0(w.bytes(), w.m, w.n)?,
+            QKind::Q3K => kore_kernels::k_quant::repack_q3_k(w.bytes())?,
+            QKind::Q8_0 => kore_kernels::q8_0::repack_q8_0(w.bytes())?,
+            _ => w.bytes().to_vec(),
+        };
+        if e == 0 {
+            stride = packed.len();
+        } else if packed.len() != stride {
+            return Err(err(&format!(
+                "'{}': expert {e} repacks to {} B, expert 0 to {stride} B",
+                host.name,
+                packed.len()
+            )));
+        }
+        all.extend_from_slice(&packed);
+    }
+    let len = all.len();
+    let t = Tensor::from_storage(b.upload_u8(&all, device)?, &[len]);
+    b.flush_uploads();
+    Ok((t, stride))
+}
+
 /// Measurement hook: `KORE_MOE_ROUTE_DUMP=<path>` appends one line of picked
 /// expert ids per routed-FFN call, in call order, and is otherwise free.
 ///
@@ -1804,16 +1879,47 @@ struct GpuW {
 // One per layer; a box would add a pointer chase to every FFN for 900 bytes.
 #[allow(clippy::large_enum_variant)]
 enum GpuFfn {
-    Dense { gate: GpuW, up: GpuW, down: GpuW },
+    /// Gate and up share one packed matrix: rows `0..gate_n` are gate, the
+    /// rest are up, so the pair costs a single GEMV.
+    Dense { gate_up: GpuW, gate_n: usize, down: GpuW },
     Moe(GpuMoe),
+}
+
+/// The device-routed expert tier: one contiguous device buffer per projection,
+/// plus the router weights in the layout the device matvec reads.
+///
+/// Built only for `KORE_MOE_DEVICE_ROUTE`. The streaming banks stay in
+/// [`GpuMoe`] for the host-routed path, which remains the default.
+struct ResidentMoe {
+    gate: Tensor,
+    up: Tensor,
+    down: Tensor,
+    gate_per: usize,
+    up_per: usize,
+    down_per: usize,
+    gate_kind: QKind,
+    up_kind: QKind,
+    down_kind: QKind,
+    /// `[hidden, n_experts]` F32, transposed from the GGUF layout.
+    router_t: Tensor,
+    /// `[hidden, 1]` F32 -- its own transpose.
+    shexp_router_t: Tensor,
+    /// A one-element tensor of ones, so `sigmoid_mul` reads as `sigmoid`.
+    ones: Tensor,
+    /// One gather target for the token's `n_used` expert `down` matrices.
+    ///
+    /// Gathered in a single dispatch, then addressed per expert with
+    /// `gemv_q3_k_at`.
+    down_stage: Tensor,
 }
 
 /// The routed FFN on the device.
 ///
-/// The router stays on the host. Its output is needed there anyway -- the expert
-/// windows have to be named before anything can be uploaded -- so a device-side
+/// Without `KORE_MOE_DEVICE_ROUTE` the router stays on the host: the expert
+/// windows have to be named before anything can be uploaded, so a device-side
 /// router would only add a readback on top of the one that is already
-/// unavoidable. Everything after the routing decision runs on the device.
+/// unavoidable. With it, the whole routing decision -- matvec, softmax, top-k,
+/// gather -- runs on the device and the step has no per-layer round trip.
 ///
 /// The banks are behind a `Mutex` because `forward` takes `&self`: the slot pool
 /// is mutable state that lives with the weights, not with the sequence, and a
@@ -1875,6 +1981,10 @@ struct GpuMoe {
     /// Read together they answer the question this exists for: how much of a
     /// step is host encoding, how much is waiting, and how much is bytes.
     times: Mutex<MoeTimes>,
+    /// Device-routed path: the whole expert tier in one buffer per projection
+    /// and the router weights on the device. `Some` means routing never leaves
+    /// the device.
+    res: Option<ResidentMoe>,
 }
 
 /// How well the previous token's routing at the same layer predicts this one's.
@@ -1957,6 +2067,8 @@ struct DeviceBank {
     /// One entry per device slot: which expert it holds, and its device copy.
     slots: Vec<Option<(usize, GpuW)>>,
     cache: ExpertCache,
+    /// Experts in the stacked tensor (`cache` caps capacity, not this).
+    n_experts: usize,
     /// Bytes moved host -> device since construction.
     uploaded: u64,
 }
@@ -1998,8 +2110,33 @@ impl DeviceBank {
             host,
             slots: (0..n_slots).map(|_| None).collect(),
             cache: ExpertCache::new(n_experts, n_slots),
+            n_experts,
             uploaded: 0,
         })
+    }
+
+    /// Upload every expert once, so every later [`Self::acquire`] is a hit.
+    ///
+    /// This is the resident mode: it only makes sense when the whole bank fits
+    /// in VRAM, and the caller decides that (the streaming pool stays the
+    /// fallback for a card that cannot hold it). The bytes each slot receives
+    /// are exactly the bytes a miss would have uploaded, so a resident run is
+    /// bit-identical to a streamed one -- only the timing moves.
+    fn preload(&mut self, b: &dyn DeviceBackend, device: Device) -> Result<()> {
+        self.preload_n(self.n_experts, b, device)
+    }
+
+    /// Preload the first `n` experts, leaving the rest to stream.
+    ///
+    /// `n` smaller than the bank is the honest fit test: a card with room for
+    /// some but not all of a routed tier should keep the resident experts it can
+    /// hold and stream the tail, rather than spilling the whole thing into
+    /// system memory and paying PCIe on every access.
+    fn preload_n(&mut self, n: usize, b: &dyn DeviceBackend, device: Device) -> Result<()> {
+        for e in 0..n.min(self.n_experts) {
+            self.acquire(e, b, device)?;
+        }
+        Ok(())
     }
 
     fn n_slots(&self) -> usize {
@@ -2153,7 +2290,7 @@ impl Qwen35Gpu {
                 .to(device)
                 .map_err(|e| err(&format!("upload: {e}")))
         };
-        let up_w = |w: &QW| -> Result<GpuW> {
+        let pack_w = |w: &QW| -> Result<Vec<u8>> {
             // Refuse at load rather than on the first token. A quant with no
             // device kernel is a property of the lane, not of the file, and
             // discovering it mid-generation reads like a corrupt model.
@@ -2163,7 +2300,7 @@ impl Qwen35Gpu {
                     w.kind, w.name
                 )));
             }
-            let bytes = match w.kind {
+            Ok(match w.kind {
                 // The ternary kernel reads a padded, reordered copy (four rows
                 // per workgroup). The K-quant kernels read the file's own
                 // packing, so their payload goes up untouched.
@@ -2173,14 +2310,18 @@ impl Qwen35Gpu {
                 // kernel reads a repacked 36-byte copy (see `kore_kernels::q8_0`).
                 QKind::Q8_0 => kore_kernels::q8_0::repack_q8_0(w.bytes())?,
                 _ => w.bytes().to_vec(),
-            };
+            })
+        };
+        let up_bytes = |bytes: Vec<u8>, name: &str| -> Result<Tensor> {
             let len = bytes.len();
             let s = Storage::from_bytes(DType::U8, len, bytes)?;
-            let t = Tensor::from_storage(s, &[len])
+            Tensor::from_storage(s, &[len])
                 .to(device)
-                .map_err(|e| err(&format!("upload '{}': {e}", w.name)))?;
+                .map_err(|e| err(&format!("upload '{name}': {e}")))
+        };
+        let up_w = |w: &QW| -> Result<GpuW> {
             Ok(GpuW {
-                t,
+                t: up_bytes(pack_w(w)?, &w.name)?,
                 kind: w.kind,
                 m: w.m,
                 n: w.n,
@@ -2193,11 +2334,28 @@ impl Qwen35Gpu {
         // would run and produce wrong tokens.
         let gpu_ffn = |w: &FfnW| -> Result<GpuFfn> {
             match w {
-                FfnW::Dense { gate, up, down } => Ok(GpuFfn::Dense {
-                    gate: up_w(gate)?,
-                    up: up_w(up)?,
-                    down: up_w(down)?,
-                }),
+                FfnW::Dense { gate, up, down } => {
+                    if gate.kind != up.kind || gate.m != up.m {
+                        return Err(err(&format!(
+                            "dense gate/up must share a quant and input width to fuse \
+                             (got {:?}/{:?}, {} vs {})",
+                            gate.kind, up.kind, gate.m, up.m
+                        )));
+                    }
+                    let gate_n = gate.n;
+                    let mut packed = pack_w(gate)?;
+                    packed.extend_from_slice(&pack_w(up)?);
+                    Ok(GpuFfn::Dense {
+                        gate_up: GpuW {
+                            t: up_bytes(packed, "gate_up")?,
+                            kind: gate.kind,
+                            m: gate.m,
+                            n: gate.n + up.n,
+                        },
+                        gate_n,
+                        down: up_w(down)?,
+                    })
+                }
                 FfnW::Moe(m) => {
                     // One token needs its whole top-k at once, and slots are
                     // filled lazily, so the cap costs nothing until experts are
@@ -2211,17 +2369,58 @@ impl Qwen35Gpu {
                     // and the per-layer routing readback is the other half. This
                     // stays at the floor and the VRAM goes to context instead.
                     // `KORE_MOE_SLOTS` overrides it for measurements.
-                    let n_slots = std::env::var("KORE_MOE_SLOTS")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(cfg.n_experts_used.max(1) * 4);
+                    // `KORE_MOE_RESIDENT` keeps a bank in VRAM instead of
+                    // streaming it: the value is how many experts *per layer*
+                    // to upload once at load, or `all`. That is only a win when
+                    // the bank fits, which is exactly the case this mode exists
+                    // for (a 16 GB card against an 11 GiB routed tier). A count
+                    // below `n_experts` keeps what the card can hold and streams
+                    // the tail -- spilling the whole bank into system memory is
+                    // far worse than streaming, because every access then pays
+                    // PCIe. Unset keeps the streaming pool, so an 8 GB card is
+                    // unchanged.
+                    // `KORE_MOE_DEVICE_ROUTE` moves the whole routing decision
+                    // onto the device: router matvec, softmax, top-k and the
+                    // expert gather. It needs the routed tier resident in one
+                    // buffer per projection, so it is opt-in and mutually
+                    // exclusive with the host-routed residency modes.
+                    let device_route = std::env::var_os("KORE_MOE_DEVICE_ROUTE").is_some();
+                    let resident = if device_route {
+                        None
+                    } else {
+                        std::env::var("KORE_MOE_RESIDENT").ok().and_then(|v| {
+                            if v == "all" {
+                                Some(m.n_experts)
+                            } else {
+                                v.parse::<usize>()
+                                    .ok()
+                                    .filter(|n| *n > 0)
+                                    .map(|n| n.min(m.n_experts))
+                            }
+                        })
+                    };
+                    let n_slots = if device_route {
+                        cfg.n_experts_used.max(1)
+                    } else {
+                        match resident {
+                            Some(n) => n,
+                            None => std::env::var("KORE_MOE_SLOTS")
+                                .ok()
+                                .and_then(|v| v.parse::<usize>().ok())
+                                .unwrap_or(cfg.n_experts_used.max(1) * 4),
+                        }
+                    };
                     let bank = |host: &QW| -> Result<Mutex<DeviceBank>> {
-                        Ok(Mutex::new(DeviceBank::new(
+                        let mut bank = DeviceBank::new(
                             host.clone(),
                             m.n_experts,
                             n_slots,
                             cfg.n_experts_used,
-                        )?))
+                        )?;
+                        if let Some(n) = resident {
+                            bank.preload_n(n, &*backend, device)?;
+                        }
+                        Ok(Mutex::new(bank))
                     };
                     let n_used = cfg.n_experts_used.min(m.n_experts);
                     // A zeroed device buffer of `n_used` expert matrices. Wasteful
@@ -2253,6 +2452,49 @@ impl Qwen35Gpu {
                                 .map_err(|e| err(&format!("expert act row upload: {e}")))
                         })
                         .collect::<Result<Vec<_>>>()?;
+                    let res = if device_route {
+                        let (gate, gate_per) =
+                            upload_bank(&m.gate, m.n_experts, &*backend, device)?;
+                        let (up, up_per) = upload_bank(&m.up, m.n_experts, &*backend, device)?;
+                        let (down, down_per) =
+                            upload_bank(&m.down, m.n_experts, &*backend, device)?;
+                        let router = router_transposed(&m.router)?;
+                        let router_t = Tensor::from_f32(&router, &[m.router.m, m.router.n])
+                            .to(device)
+                            .map_err(|e| err(&format!("router upload: {e}")))?;
+                        let shexp = router_transposed(&m.shexp_router)?;
+                        let shexp_router_t =
+                            Tensor::from_f32(&shexp, &[m.shexp_router.m, m.shexp_router.n])
+                                .to(device)
+                                .map_err(|e| err(&format!("shared router upload: {e}")))?;
+                        let ones = Tensor::from_f32(&[1.0], &[1])
+                            .to(device)
+                            .map_err(|e| err(&format!("ones upload: {e}")))?;
+                        let down_bytes = n_used * down_per;
+                        let down_stage = Tensor::from_storage(
+                            Storage::from_bytes(DType::U8, down_bytes, vec![0u8; down_bytes])?,
+                            &[down_bytes],
+                        )
+                        .to(device)
+                        .map_err(|e| err(&format!("down stage upload: {e}")))?;
+                        Some(ResidentMoe {
+                            gate,
+                            up,
+                            down,
+                            gate_per,
+                            up_per,
+                            down_per,
+                            gate_kind: m.gate.kind,
+                            up_kind: m.up.kind,
+                            down_kind: m.down.kind,
+                            router_t,
+                            shexp_router_t,
+                            ones,
+                            down_stage,
+                        })
+                    } else {
+                        None
+                    };
                     Ok(GpuFfn::Moe(GpuMoe {
                         router: m.router.clone(),
                         shexp_router: m.shexp_router.clone(),
@@ -2273,6 +2515,7 @@ impl Qwen35Gpu {
                         can_batch,
                         prefetch: Mutex::new(PrefetchStats::default()),
                         times: Mutex::new(MoeTimes::default()),
+                        res,
                     }))
                 }
             }
@@ -2519,6 +2762,60 @@ impl Qwen35Gpu {
         }
     }
 
+    /// A matvec against expert `e` of a stacked bank, without copying it out.
+    ///
+    /// Only the Q3_K down projection needs this today: the routed gate/up pair
+    /// is batched into one stage, but `down` has a different activation row per
+    /// expert, so it stays one matvec per expert and reads straight from the
+    /// gathered block.
+    fn wgemv_at_off(
+        &self,
+        kind: QKind,
+        t: &Tensor,
+        n: usize,
+        k: usize,
+        x: &Tensor,
+        byte_off: usize,
+    ) -> Result<Tensor> {
+        match kind {
+            QKind::Q2_0 => self.backend.gemv_q2_0_at(x, t, n, k, byte_off / 4),
+            QKind::Q2K => self.backend.gemv_q2_k_at(x, t, n, k, byte_off / 4),
+            QKind::Q3K => self.backend.gemv_q3_k_at(x, t, n, k, byte_off / 4),
+            _ => Err(err(&format!(
+                "a stacked-bank offset is only wired for the Q2_0/Q2_K/Q3_K projections; got {kind:?}"
+            ))),
+        }
+    }
+
+    /// One expert-strided matvec over a stacked bank: every selected expert's
+    /// `down` projection in a single dispatch.
+    ///
+    /// `x` is `[n_experts, k]`, one activation row per expert; output row `r`
+    /// reads expert `r / rows_per_expert`. `expert_words` is the per-expert
+    /// size of the bank in u32 words.
+    fn wgemv_id(
+        &self,
+        kind: QKind,
+        t: &Tensor,
+        n: usize,
+        k: usize,
+        x: &Tensor,
+        expert_words: usize,
+        rows_per_expert: usize,
+    ) -> Result<Tensor> {
+        match kind {
+            QKind::Q2K => self
+                .backend
+                .gemv_q2_k_id(x, t, n, k, expert_words, rows_per_expert),
+            QKind::Q3K => self
+                .backend
+                .gemv_q3_k_id(x, t, n, k, expert_words, rows_per_expert),
+            _ => Err(err(&format!(
+                "expert-strided dispatch is only wired for the Q2_K/Q3_K down projection; got {kind:?}"
+            ))),
+        }
+    }
+
     /// The sign table for `width`, or the placeholder when nothing is folded.
     ///
     /// An unfolded model has no sign tables at all -- `signs_t` would fail, and
@@ -2556,15 +2853,46 @@ impl Qwen35Gpu {
             self.cfg.eps,
         )?;
         let down = match w {
-            GpuFfn::Dense { gate, up, down } => {
-                let gv = self.wgemv(gate, &ht)?;
-                let uv = self.wgemv(up, &ht)?;
-                // Fused SwiGLU [+ Hadamard] (the second half of the FFN's
-                // activation pair).
+            GpuFfn::Dense { gate_up, gate_n, down } => {
+                let n_total = gate_up.n;
                 let signs_ffn = self.signs_or_placeholder(ffn)?;
-                let (_gv, _uv, actt) =
-                    b.had_pre(2, self.folded, &gv, &uv, signs_ffn, signs_ffn, self.cfg.eps)?;
-                self.wgemv(down, &actt)?
+                if std::env::var_os("KORE_DENSE_SPLIT_GATE_UP").is_some()
+                    && gate_up.kind == QKind::Q2_0
+                {
+                    let row_words = (gate_up.m / 64) * 18 / 4;
+                    let g =
+                        self.wgemv_at_off(QKind::Q2_0, &gate_up.t, *gate_n, gate_up.m, &ht, 0)?;
+                    let u = self.wgemv_at_off(
+                        QKind::Q2_0,
+                        &gate_up.t,
+                        *gate_n,
+                        gate_up.m,
+                        &ht,
+                        gate_n * row_words * 4,
+                    )?;
+                    let (_gv, _uv, actt) =
+                        b.had_pre(2, self.folded, &g, &u, signs_ffn, signs_ffn, self.cfg.eps)?;
+                    self.wgemv(down, &actt)?
+                } else {
+                    let gu = self.wgemv(gate_up, &ht)?;
+                    let dims = gu.shape().dims();
+                    let rows = if dims.len() == 2 { dims[0] } else { 1 };
+                    // Fused SwiGLU [+ Hadamard] over the two strided halves.
+                    let (_gv, _uv, actt) = b.had_pre_at(
+                        2,
+                        self.folded,
+                        &gu,
+                        &gu,
+                        rows * *gate_n,
+                        *gate_n,
+                        n_total,
+                        *gate_n,
+                        signs_ffn,
+                        signs_ffn,
+                        self.cfg.eps,
+                    )?;
+                    self.wgemv(down, &actt)?
+                }
             }
             GpuFfn::Moe(m) => self.moe_ffn_gpu(&ht, m)?,
         };
@@ -2589,6 +2917,16 @@ impl Qwen35Gpu {
     /// A grouped GEMM and m-wide recurrent state is not a trade for single
     /// digits.
     fn moe_ffn_gpu(&self, ht: &Tensor, m: &GpuMoe) -> Result<Tensor> {
+        if let Some(r) = &m.res {
+            return self.moe_ffn_gpu_resident(ht, m, r);
+        }
+        self.moe_ffn_gpu_host(ht, m)
+    }
+
+    /// The host-routed lane: download the column, route on the CPU, upload the
+    /// picked experts. The default, and the only lane that works when the tier
+    /// does not fit in VRAM.
+    fn moe_ffn_gpu_host(&self, ht: &Tensor, m: &GpuMoe) -> Result<Tensor> {
         let b = &self.backend;
         let cfg = &self.cfg;
         let dims = ht.shape().dims();
@@ -2760,6 +3098,135 @@ impl Qwen35Gpu {
             t.upload_us += upload_us;
             t.compute_us += compute_us;
             t.upload_bytes += expert_bytes_moved(m) - bytes_before;
+        }
+        Ok(out)
+    }
+
+    /// The routed FFN with the routing decision entirely on the device.
+    ///
+    /// Nothing here reads a tensor back to the host: the router matvec, softmax,
+    /// top-k and expert gather are all dispatches in the same command stream as
+    /// the matvecs that consume them. That is the difference that matters on a
+    /// card where the expert tier fits -- the streaming path's per-layer
+    /// readback drains the queue forty times a token.
+    fn moe_ffn_gpu_resident(&self, ht: &Tensor, m: &GpuMoe, r: &ResidentMoe) -> Result<Tensor> {
+        let b = &self.backend;
+        let cfg = &self.cfg;
+        let n_used = m.n_used;
+
+        let logits = b.matmul(ht, &r.router_t)?;
+        let (idx, weights) = b.moe_topk(&logits, n_used)?;
+
+        if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
+            use std::sync::Once;
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                let h_cpu = ht.to(Device::Cpu).expect("debug route download");
+                let h = h_cpu.as_f32_slice().expect("debug route f32");
+                let picks =
+                    top_k_experts(&router_probs(&m.router, h, m.n_experts).unwrap(), n_used);
+                eprintln!("host picks:  {picks:?}");
+                let idx_cpu = idx.to(Device::Cpu).expect("debug idx");
+                let w_cpu = weights.to(Device::Cpu).expect("debug weights");
+                eprintln!(
+                    "device idx:  {:?}",
+                    idx_cpu.as_f32_slice().unwrap_or(&[])
+                );
+                eprintln!(
+                    "device w:    {:?}",
+                    w_cpu.as_f32_slice().unwrap_or(&[])
+                );
+            });
+        }
+
+        b.moe_gather(&r.gate, &idx, 0, n_used, &m.gate_stage, r.gate_per)?;
+        b.moe_gather(&r.up, &idx, 0, n_used, &m.up_stage, r.up_per)?;
+
+        if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
+            use std::sync::Once;
+            static ONCE2: Once = Once::new();
+            ONCE2.call_once(|| {
+                let st = m.gate_stage.to(Device::Cpu).expect("debug stage");
+                let a = st.storage_ref().as_bytes();
+                let bank = m.gate.lock().expect("debug bank");
+                let w = bank.host.expert(112, bank.host.byte_len());
+                let bb = w.bytes();
+                let n = r.gate_per.min(bb.len());
+                let same = a[..n].iter().zip(&bb[..n]).filter(|(x, y)| x == y).count();
+                eprintln!(
+                    "stage[0] vs expert 112: {same}/{n} bytes equal, stage0={:?} expert0={:?}",
+                    &a[..8],
+                    &bb[..8]
+                );
+            });
+        }
+
+        let rows = n_used * m.ffn_rows;
+        let gv = self.wgemv_at(r.gate_kind, &m.gate_stage, rows, m.ffn_cols, ht)?;
+        let uv = self.wgemv_at(r.up_kind, &m.up_stage, rows, m.ffn_cols, ht)?;
+        let gv = gv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
+        let uv = uv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
+        let signs = self.signs_or_placeholder(cfg.moe_ffn)?;
+        let (_g, _u, act) = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?;
+        let act = b.mul_rows(&act, &weights, n_used, m.ffn_rows)?;
+
+        b.moe_gather(&r.down, &idx, 0, n_used, &r.down_stage, r.down_per)?;
+
+        // All selected experts' `down` projections in one dispatch. The gather
+        // already laid their matrices out in selection order, and `act` is the
+        // matching `[n_used, k]` row block, so the kernel only needs the expert
+        // stride -- no per-expert launch or copy.
+        let down_all = self.wgemv_id(
+            r.down_kind,
+            &r.down_stage,
+            n_used * m.ffn_cols,
+            m.ffn_rows,
+            &act,
+            r.down_per / 4,
+            m.ffn_cols,
+        )?;
+        let down_sum = b.sum_rows(&down_all, n_used, m.ffn_cols)?;
+
+        let sg = b.matmul(ht, &r.shexp_router_t)?;
+        // `sigmoid_mul(a, b)` is `a * sigmoid(b)`, so the ones tensor is the
+        // multiplier and the router logit is the gate.
+        let gs = b.sigmoid_mul(&r.ones, &sg)?;
+        let sgate = self.wgemv(&m.shexp_gate, ht)?;
+        let sup = self.wgemv(&m.shexp_up, ht)?;
+        let ssigns = self.signs_or_placeholder(cfg.shexp_ffn)?;
+        let (_g, _u, sact) = b.had_pre(2, self.folded, &sgate, &sup, ssigns, ssigns, cfg.eps)?;
+        let sact = b.mul_rows(&sact, &gs, 1, cfg.shexp_ffn)?;
+        let sd = self.wgemv(&m.shexp_down, &sact)?;
+        let out = b.add(&down_sum, &sd)?;
+        if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static DONE: AtomicBool = AtomicBool::new(false);
+            if !DONE.swap(true, Ordering::Relaxed) {
+                let host = self.moe_ffn_gpu_host(ht, m)?;
+                let dc = out
+                    .to(Device::Cpu)
+                    .map_err(|e| err(&format!("debug out: {e}")))?;
+                let hc = host
+                    .to(Device::Cpu)
+                    .map_err(|e| err(&format!("debug host: {e}")))?;
+                let da = dc.as_f32_slice().unwrap_or(&[]);
+                let ha = hc.as_f32_slice().unwrap_or(&[]);
+                let mut maxd = 0.0f32;
+                let mut first = 0usize;
+                for i in 0..da.len().min(ha.len()) {
+                    let d = (da[i] - ha[i]).abs();
+                    if d > maxd {
+                        maxd = d;
+                        first = i;
+                    }
+                }
+                eprintln!(
+                    "moe host vs device: n={} max|d|={maxd:e} at {first} (device={:?} host={:?})",
+                    da.len().min(ha.len()),
+                    da.get(first),
+                    ha.get(first)
+                );
+            }
         }
         Ok(out)
     }

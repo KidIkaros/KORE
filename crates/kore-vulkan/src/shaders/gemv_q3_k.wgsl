@@ -3,6 +3,23 @@ struct Q3KUniforms {
     n: u32,
     k: u32,
     blocks_per_row: u32,
+    // Base of this matrix inside `w`, in u32 words. A resident expert bank
+    // stacks every expert in one buffer, so a row's weights start at
+    // `w_off + row * blocks_per_row * 28`.
+    w_off: u32,
+    // Output base in f32 elements, and whether to add onto it instead of
+    // overwriting. The routed `down` projection accumulates its experts here,
+    // which removes one dispatch per expert.
+    y_off: u32,
+    accum: u32,
+    _pad0: u32,
+    // Expert-strided mode: when nonzero, output row `r` reads expert
+    // `r / rows_per_expert`, whose weights start `expert_words` words in and
+    // whose activation is row `r / rows_per_expert` of `x`.
+    id: u32,
+    rows_per_expert: u32,
+    expert_words: u32,
+    _pad1: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: Q3KUniforms;
@@ -69,7 +86,20 @@ fn main(
         let hm = 4u * ((tid / 4u) % 2u) + (tid % 4u);  // word 0..7
         let bit1 = tid / 8u;                           // 0..3
         let bit2 = bit1 + 4u;                          // 4..7
-        let row_off = row * params.blocks_per_row * 28u;
+        var row_off: u32;
+        var x_base: u32;
+        if (params.id != 0u) {
+            // One dispatch covers every selected expert: output row `row`
+            // belongs to expert `row / rows_per_expert`, whose weights and
+            // activation row both start at that expert's slot.
+            let expert = row / params.rows_per_expert;
+            let local = row - expert * params.rows_per_expert;
+            row_off = expert * params.expert_words + local * params.blocks_per_row * 28u;
+            x_base = expert * kv;
+        } else {
+            row_off = params.w_off + row * params.blocks_per_row * 28u;
+            x_base = 0u;
+        }
 
         for (var b: u32 = 0u; b < params.blocks_per_row; b = b + 1u) {
             let bo = row_off + b * 28u;
@@ -96,28 +126,28 @@ fn main(
             let xi_b = b * 64u + 32u + tid;
 
             {
-                let xb = (m_base + 0u) * kv;
+                let xb = x_base + (m_base + 0u) * kv;
                 let xa = x[xb + xi_a];
                 let xc = x[xb + xi_b];
                 sum0 += dl1 * (dot(ql1, xa) - 4.0 * dot(off1, xa))
                       + dl2 * (dot(ql2, xc) - 4.0 * dot(off2, xc));
             }
             if (m_rem > 1u) {
-                let xb = (m_base + 1u) * kv;
+                let xb = x_base + (m_base + 1u) * kv;
                 let xa = x[xb + xi_a];
                 let xc = x[xb + xi_b];
                 sum1 += dl1 * (dot(ql1, xa) - 4.0 * dot(off1, xa))
                       + dl2 * (dot(ql2, xc) - 4.0 * dot(off2, xc));
             }
             if (m_rem > 2u) {
-                let xb = (m_base + 2u) * kv;
+                let xb = x_base + (m_base + 2u) * kv;
                 let xa = x[xb + xi_a];
                 let xc = x[xb + xi_b];
                 sum2 += dl1 * (dot(ql1, xa) - 4.0 * dot(off1, xa))
                       + dl2 * (dot(ql2, xc) - 4.0 * dot(off2, xc));
             }
             if (m_rem > 3u) {
-                let xb = (m_base + 3u) * kv;
+                let xb = x_base + (m_base + 3u) * kv;
                 let xa = x[xb + xi_a];
                 let xc = x[xb + xi_b];
                 sum3 += dl1 * (dot(ql1, xa) - 4.0 * dot(off1, xa))
@@ -152,9 +182,19 @@ fn main(
     if (tid == 0u && row < params.n) {
         let total = sdata[base_sdata] + sdata[base_sdata + 1u];
         let n_len = params.n;
-        y[(m_base + 0u) * n_len + row] = total.x;
-        if (m_rem > 1u) { y[(m_base + 1u) * n_len + row] = total.y; }
-        if (m_rem > 2u) { y[(m_base + 2u) * n_len + row] = total.z; }
-        if (m_rem > 3u) { y[(m_base + 3u) * n_len + row] = total.w; }
+        let o0 = params.y_off + m_base * n_len + row;
+        if (params.accum == 0u) { y[o0] = total.x; } else { y[o0] += total.x; }
+        if (m_rem > 1u) {
+            let o1 = params.y_off + (m_base + 1u) * n_len + row;
+            if (params.accum == 0u) { y[o1] = total.y; } else { y[o1] += total.y; }
+        }
+        if (m_rem > 2u) {
+            let o2 = params.y_off + (m_base + 2u) * n_len + row;
+            if (params.accum == 0u) { y[o2] = total.z; } else { y[o2] += total.z; }
+        }
+        if (m_rem > 3u) {
+            let o3 = params.y_off + (m_base + 3u) * n_len + row;
+            if (params.accum == 0u) { y[o3] = total.w; } else { y[o3] += total.w; }
+        }
     }
 }

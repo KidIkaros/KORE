@@ -145,6 +145,14 @@ pub trait DeviceBackend: Send + Sync {
         self.copy_to_device(&storage, target)
     }
 
+    /// Submit anything queued for upload.
+    ///
+    /// Bulk weight loads that write far more than a step's staging belt would
+    /// otherwise accumulate in driver-visible host memory, which puts the very
+    /// weights being loaded on the far side of PCIe. A backend with no staging
+    /// queue can leave this empty.
+    fn flush_uploads(&self) {}
+
     /// Matrix multiplication on device: C = A @ B
     fn matmul(&self, _a: &crate::Tensor, _b: &crate::Tensor) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
@@ -512,6 +520,21 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Q2_K matvec against a matrix starting `w_off_words` words into `w_raw`.
+    fn gemv_q2_k_at(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+        _w_off_words: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q2_k_at not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Quantized Q3_K matrix-vector multiplication on device:
     /// y = x @ W^T
     /// x: [M, K] in F32 (where M is 1 during decode)
@@ -528,6 +551,98 @@ pub trait DeviceBackend: Send + Sync {
     ) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
             "gemv_q3_k not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Q3_K matvec against a matrix starting `w_off_words` words into `w_raw`.
+    fn gemv_q3_k_at(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+        _w_off_words: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q3_k_at not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Q2_K matvec that writes into `out` starting at `y_off` f32 elements.
+    /// With `accum`, the kernel adds onto the existing contents instead of
+    /// overwriting, so several experts can sum into one buffer.
+    fn gemv_q2_k_into(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+        _w_off_words: usize,
+        _out: &crate::Tensor,
+        _y_off: usize,
+        _accum: bool,
+    ) -> crate::Result<()> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q2_k_into not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Q3_K matvec that writes into `out` starting at `y_off` f32 elements.
+    /// With `accum`, the kernel adds onto the existing contents instead of
+    /// overwriting, so several experts can sum into one buffer.
+    fn gemv_q3_k_into(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+        _w_off_words: usize,
+        _out: &crate::Tensor,
+        _y_off: usize,
+        _accum: bool,
+    ) -> crate::Result<()> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q3_k_into not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// One expert-strided Q2_K matvec over a stacked bank.
+    ///
+    /// Output row `r` reads expert `r / rows_per_expert`, whose weights start
+    /// `expert_words` u32 words into `w`, and activation row
+    /// `r / rows_per_expert` of `x` (`[n_experts, k]`).
+    fn gemv_q2_k_id(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+        _expert_words: usize,
+        _rows_per_expert: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q2_k_id not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// One expert-strided Q3_K matvec over a stacked bank. See
+    /// [`Self::gemv_q2_k_id`].
+    fn gemv_q3_k_id(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+        _expert_words: usize,
+        _rows_per_expert: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q3_k_id not implemented for backend '{}'",
             self.device_name()
         )))
     }
@@ -725,10 +840,73 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// `had_pre` over the first `a_len` elements of `a`, with the `b` operand
+    /// offset `b_off` elements into its buffer.
+    fn had_pre_at(
+        &self,
+        _mode: u32,
+        _had: bool,
+        _a: &crate::Tensor,
+        _b: &crate::Tensor,
+        _a_len: usize,
+        _cols: usize,
+        _a_stride: usize,
+        _b_off: usize,
+        _weight: &crate::Tensor,
+        _signs: &crate::Tensor,
+        _eps: f32,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor, crate::Tensor)> {
+        Err(crate::KoreError::StorageError(format!(
+            "had_pre_at not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Argmax along the last dimension of a 2D `[rows, cols]` tensor on device, returning `rows` token IDs.
     fn argmax_last_dim(&self, _input: &crate::Tensor) -> crate::Result<Vec<u32>> {
         Err(crate::KoreError::StorageError(format!(
             "argmax_last_dim not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Device-side router top-k: `logits[n]` -> (`idx[k]` as f32, `w[k]`), no readback.
+    fn moe_topk(
+        &self,
+        _logits: &crate::Tensor,
+        _k: usize,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor)> {
+        Err(crate::KoreError::StorageError(format!(
+            "moe_topk not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Device-side gather of `k` experts (`per` bytes each) out of a resident bank.
+    fn moe_gather(
+        &self,
+        _bank: &crate::Tensor,
+        _idx: &crate::Tensor,
+        _idx_off: usize,
+        _k: usize,
+        _dst: &crate::Tensor,
+        _per: usize,
+    ) -> crate::Result<()> {
+        Err(crate::KoreError::StorageError(format!(
+            "moe_gather not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Sum `rows` contiguous `[n]` slices of `x` into one `[n]` tensor.
+    fn sum_rows(
+        &self,
+        _x: &crate::Tensor,
+        _rows: usize,
+        _n: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "sum_rows not implemented for backend '{}'",
             self.device_name()
         )))
     }
@@ -781,6 +959,22 @@ pub trait DeviceBackend: Send + Sync {
     ) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
             "gemv_q2_0 not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
+    /// Q2_0 GEMV against a matrix starting `w_off_words` u32 words into
+    /// `w_raw`.
+    fn gemv_q2_0_at(
+        &self,
+        _x: &crate::Tensor,
+        _w_raw: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+        _w_off_words: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "gemv_q2_0_at not implemented for backend '{}'",
             self.device_name()
         )))
     }

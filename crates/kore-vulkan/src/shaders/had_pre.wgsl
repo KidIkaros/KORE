@@ -42,7 +42,11 @@ struct HadPreUniforms {
     eps: f32,
     scale: f32,    // 1/sqrt(512)
     had: u32,      // 1 = apply signs + WHT, 0 = out_had is the pre-op value
+    b_off: u32,    // element offset of the `b` operand in its buffer
+    a_stride: u32, // elements per row of `a` (2*cols when gate/up are fused)
+    _pad0: u32,
     _pad1: u32,
+    _pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: HadPreUniforms;
@@ -73,8 +77,10 @@ fn main(
     }
 
     let cols = params.cols;
-    let base = row * cols;
+    let base = row * params.a_stride;
     let bb = base + blk * 512u;
+    // Outputs are packed as `[rows, cols]` even when the inputs are strided.
+    let ob = row * cols + blk * 512u;
     let cidx = blk * 512u + tid * 4u; // first column of this thread's group
     let mode = params.mode;
 
@@ -88,14 +94,14 @@ fn main(
         for (var c: u32 = tid; c < cols; c = c + 256u) {
             var v = a[base + c];
             if (mode == 0u) {
-                v = v + b[base + c];
+                v = v + b[params.b_off + base + c];
             }
             s0 = s0 + v * v;
         }
         for (var c: u32 = tid + 128u; c < cols; c = c + 256u) {
             var v = a[base + c];
             if (mode == 0u) {
-                v = v + b[base + c];
+                v = v + b[params.b_off + base + c];
             }
             s1 = s1 + v * v;
         }
@@ -118,21 +124,21 @@ fn main(
         let j = tid * 4u + i;
         var v: f32 = 0.0;
         if (mode == 0u) {
-            let r = a[bb + j] + b[bb + j];
-            out_res[bb + j] = r;
+            let r = a[bb + j] + b[params.b_off + bb + j];
+            out_res[ob + j] = r;
             let h = r * rms * weight[cidx + i];
-            out_norm[bb + j] = h;
+            out_norm[ob + j] = h;
             v = h;
         } else if (mode == 1u) {
             let h = a[bb + j] * rms * weight[cidx + i];
-            out_norm[bb + j] = h;
+            out_norm[ob + j] = h;
             v = h;
         } else if (mode == 2u) {
             let gv = a[bb + j];
             let sig = 1.0 / (1.0 + exp(-gv));
-            v = gv * sig * b[bb + j];
+            v = gv * sig * b[params.b_off + bb + j];
         } else {
-            v = a[bb + j] / (1.0 + exp(-b[bb + j]));
+            v = a[bb + j] / (1.0 + exp(-b[params.b_off + bb + j]));
         }
         vv[i] = v;
     }
@@ -142,7 +148,7 @@ fn main(
     // together and no barrier is left half-reached.
     if (params.had == 0u) {
         for (var i = 0u; i < 4u; i = i + 1u) {
-            out_had[bb + tid * 4u + i] = vv[i];
+            out_had[ob + tid * 4u + i] = vv[i];
         }
         return;
     }
@@ -223,6 +229,6 @@ fn main(
 
     for (var i = 0u; i < 4u; i = i + 1u) {
         let j = tid * 4u + i;
-        out_had[bb + j] = buf_b[j] * params.scale;
+        out_had[ob + j] = buf_b[j] * params.scale;
     }
 }
