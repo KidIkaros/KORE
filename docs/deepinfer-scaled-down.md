@@ -108,8 +108,8 @@ has its own section.
 ## 5. Megakernel / persistent kernel
 
 DeepInfer fuses an entire layer (or several) into one persistent kernel. The
-current device path is **1023 dispatches/step, 17.0 ms** (no-sync census) and
-**51–53 tok/s** in the real loop, against llama.cpp's **80.25 tok/s**
+current device path is **903 dispatches/step, 15.5 ms** (no-sync census) and
+**54–55 tok/s** in the real loop, against llama.cpp's **80.25 tok/s**
 (12.5 ms/step) on the same file and card.
 
 The ablation changed the diagnosis. Dispatch count is not the wall: the step
@@ -118,7 +118,9 @@ and the transposed F32 router matvec (~15 ms). Parallelising the first and
 reading the router in its native row-major layout moved the device lane from
 1.44× to **3.8×** the host without fusing a single layer. The remaining 17 ms is
 spread thin: `gdn_step` 4.9, attention 6.1 (Q4_K + Q8_0), MoE Q2_K 3.4,
-`had_pre` 2.9, `sum_rows` 1.6.
+`had_pre` 2.9. The cheap fusions have been taken (`swiglu_rows` folds the
+routing weight in, `sum_rows_add` folds the shared expert in: 120 dispatches and
++1.7 %), so what is left is kernel work, not launch work.
 
 That leaves the megakernel as a *second* milestone, not the first. Collapsing
 route → gate/up → SwiGLU → down → weighted sum into one or two dispatches is
@@ -140,6 +142,9 @@ kernel project, behind the GDN shader work.
 - **In-place expert read** (`idx` + `x_stride` in `gemv_q{2,3}_k_id`): the three
   per-layer gathers and the down staging buffer are gone; 1143 → 1023
   dispatches, ~165 MB less traffic per token.
+- **`swiglu_rows` / `sum_rows_add`**: the routing scale rides out with SwiGLU
+  (mode-2 `row_scale`) and the shared expert rides in with the `down` reduction
+  (bias binding). 1023 → 903 dispatches, bit-identical to the split ops.
 - **`flush_uploads`** for the bulk expert upload: GTT peak fell from ~16 GB to
   ~1.5 GB by submitting the staging belt instead of letting it pile up.
 

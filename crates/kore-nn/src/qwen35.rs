@@ -3034,17 +3034,25 @@ impl Qwen35Gpu {
             // row boundary.
             let gv = gv.reshape(&[picks.len() as isize, m.ffn_rows as isize])?;
             let uv = uv.reshape(&[picks.len() as isize, m.ffn_rows as isize])?;
-            let (_g, _u, act) = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?;
-            // The router weight is a per-expert scalar. Scale the whole block in
-            // one dispatch instead of one per expert; `down` is linear, so this
-            // is the same arithmetic as scaling its 2048-wide output.
+            // The router weight is a per-expert scalar. SwiGLU folds it in on
+            // the way out, one dispatch instead of two; `down` is linear, so
+            // this is the same arithmetic as scaling its 2048-wide output.
             let scales = Tensor::from_f32(
                 &picks.iter().map(|(_, w)| *w).collect::<Vec<f32>>(),
                 &[picks.len()],
             )
             .to(self.device)
             .map_err(|e| err(&format!("expert weight upload: {e}")))?;
-            let act = b.mul_rows(&act, &scales, picks.len(), m.ffn_rows)?;
+            let act = b.swiglu_rows(
+                &gv,
+                &uv,
+                picks.len(),
+                m.ffn_rows,
+                &scales,
+                signs,
+                self.folded,
+                cfg.eps,
+            )?;
             // `down` per expert: its input is that expert's 512-wide row.
             for (i, a) in m.act_rows.iter().enumerate().take(picks.len()) {
                 b.copy_buffer_range(a, 0, &act, i * m.ffn_rows * 4, m.ffn_rows * 4)?;
@@ -3072,9 +3080,9 @@ impl Qwen35Gpu {
                 let t_c = Instant::now();
                 let gv = self.wgemv(&gate, ht)?;
                 let uv = self.wgemv(&up, ht)?;
-                let (_g, _u, act) = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?;
                 // `down` is linear, so scaling the activation is the same arithmetic
                 // as scaling its 2048-wide output, for a quarter of the dispatch.
+                let act = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?.2;
                 let act = b.mul_scalar(&act, weight)?;
                 let dv = self.wgemv(&down, &act)?;
                 acc = Some(match acc {
@@ -3093,7 +3101,7 @@ impl Qwen35Gpu {
         let sgate = self.wgemv(&m.shexp_gate, ht)?;
         let sup = self.wgemv(&m.shexp_up, ht)?;
         let signs = self.signs_or_placeholder(cfg.shexp_ffn)?;
-        let (_g, _u, sact) = b.had_pre(2, self.folded, &sgate, &sup, signs, signs, cfg.eps)?;
+        let sact = b.had_pre(2, self.folded, &sgate, &sup, signs, signs, cfg.eps)?.2;
         let sact = b.mul_scalar(&sact, gs)?;
         let sd = self.wgemv(&m.shexp_down, &sact)?;
         compute_us += t_c.elapsed().as_micros() as u64;
@@ -3181,8 +3189,19 @@ impl Qwen35Gpu {
         let gv = gv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
         let uv = uv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
         let signs = self.signs_or_placeholder(cfg.moe_ffn)?;
-        let (_g, _u, act) = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?;
-        let act = b.mul_rows(&act, &weights, n_used, m.ffn_rows)?;
+        // SwiGLU and the router weight in one dispatch; the weight multiplies
+        // the whole 2048-wide row block, and `down` is linear, so scaling the
+        // activation is the same arithmetic as scaling its output.
+        let act = b.swiglu_rows(
+            &gv,
+            &uv,
+            n_used,
+            m.ffn_rows,
+            &weights,
+            signs,
+            self.folded,
+            cfg.eps,
+        )?;
 
         // All selected experts' `down` projections in one dispatch, read in
         // place from the bank. `act` is the matching `[n_used, k]` row block
@@ -3199,8 +3218,9 @@ impl Qwen35Gpu {
             0,
             m.ffn_rows / 4,
         )?;
-        let down_sum = b.sum_rows(&down_all, n_used, m.ffn_cols)?;
-
+        // Shared expert: always evaluated, gated by `sigmoid` of its own row.
+        // It does not depend on the routed experts, so it is computed first and
+        // its output folded into the `down` reduction below.
         let sg = b.router_matvec(ht, &r.shexp_router_w, 1)?;
         // `sigmoid_mul(a, b)` is `a * sigmoid(b)`, so the ones tensor is the
         // multiplier and the router logit is the gate.
@@ -3208,10 +3228,18 @@ impl Qwen35Gpu {
         let sgate = self.wgemv(&m.shexp_gate, ht)?;
         let sup = self.wgemv(&m.shexp_up, ht)?;
         let ssigns = self.signs_or_placeholder(cfg.shexp_ffn)?;
-        let (_g, _u, sact) = b.had_pre(2, self.folded, &sgate, &sup, ssigns, ssigns, cfg.eps)?;
-        let sact = b.mul_rows(&sact, &gs, 1, cfg.shexp_ffn)?;
+        let sact = b.swiglu_rows(
+            &sgate,
+            &sup,
+            1,
+            cfg.shexp_ffn,
+            &gs,
+            ssigns,
+            self.folded,
+            cfg.eps,
+        )?;
         let sd = self.wgemv(&m.shexp_down, &sact)?;
-        let out = b.add(&down_sum, &sd)?;
+        let out = b.sum_rows_add(&down_all, n_used, m.ffn_cols, &sd)?;
         if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static DONE: AtomicBool = AtomicBool::new(false);

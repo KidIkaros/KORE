@@ -44,7 +44,10 @@ struct HadPreUniforms {
     had: u32,      // 1 = apply signs + WHT, 0 = out_had is the pre-op value
     b_off: u32,    // element offset of the `b` operand in its buffer
     a_stride: u32, // elements per row of `a` (2*cols when gate/up are fused)
-    _pad0: u32,
+    // Mode 2 only: when set, `weight[row]` scales the row on the way out.
+    // That folds the routing weight (or the shared-expert sigmoid gate) into
+    // SwiGLU and removes the `mul_rows` dispatch that used to follow it.
+    row_scale: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -78,6 +81,9 @@ fn main(
 
     let cols = params.cols;
     let base = row * params.a_stride;
+    // The per-row multiplier is uniform across the workgroup's block, so it is
+    // read once here; 1.0 is exact and leaves the unscaled path bit-identical.
+    let rscale = select(1.0, weight[row], params.row_scale != 0u);
     let bb = base + blk * 512u;
     // Outputs are packed as `[rows, cols]` even when the inputs are strided.
     let ob = row * cols + blk * 512u;
@@ -148,7 +154,8 @@ fn main(
     // together and no barrier is left half-reached.
     if (params.had == 0u) {
         for (var i = 0u; i < 4u; i = i + 1u) {
-            out_had[ob + tid * 4u + i] = vv[i];
+            out_had[ob + tid * 4u + i] =
+                select(vv[i], vv[i] * rscale, params.row_scale != 0u);
         }
         return;
     }
@@ -229,6 +236,7 @@ fn main(
 
     for (var i = 0u; i < 4u; i = i + 1u) {
         let j = tid * 4u + i;
-        out_had[ob + j] = buf_b[j] * params.scale;
+        let h = buf_b[j] * params.scale;
+        out_had[ob + j] = select(h, h * rscale, params.row_scale != 0u);
     }
 }

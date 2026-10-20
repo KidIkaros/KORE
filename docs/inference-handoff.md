@@ -456,6 +456,7 @@ cancel over the first 400 tokens.
 | **Parallel router top-k** (`moe_topk.wgsl`) | 49.4 → 29.8 ms/step; real loop 17.6 → 28.2 tok/s (`n=48`) |
 | **Row-major router matvec** (`router_matvec.wgsl`) | 29.8 → 17.0 ms/step; real loop 28.2 → 47.5–50.2 tok/s (`n=48`) |
 | **In-place expert read** (`idx` + `x_stride` in `gemv_q{2,3}_k`) | 1143 → 1023 dispatches, no gathers, no `down_stage`; ~+3 % |
+| **SwiGLU + routing scale, `sum_rows` + shared add** (`swiglu_rows`, `sum_rows_add`) | 1023 → 903 dispatches; 53.7 → 54.6 tok/s (+1.7 %, `n=64`, 3 interleaved rounds) |
 | device routing, fused `down`, `flush_uploads` (previous session) | 11.8 → 17.1 tok/s (1.44×) |
 
 The two kernels were not "small dependent ops". They were the two halves of the
@@ -512,7 +513,8 @@ removed work without poisoning the inputs.
 |---|---|---|---|
 | host-routed | 1383 | 75.5 ms | 13.2 |
 | device-routed, after fused down | 1143 | 54.5 ms | 18.4 |
-| device-routed, final | **1023** | **17.0 ms** | **59.0** |
+| device-routed, after in-place read | 1023 | 17.0 ms | 59.0 |
+| device-routed, with the two fusions | **903** | **15.5 ms** | **64.4** |
 
 The real loop is ~20 ms/token (48–53 tok/s): the difference is the per-token
 argmax readback and the submission wait, not more dispatch overhead. The step is
@@ -520,7 +522,13 @@ no longer launch-bound; it is spread across GDN, attention and the MoE matvecs.
 
 ### Correctness
 
-- Token ids exact against the host lane, repeated after both kernel rewrites:
+- `swiglu_rows` and `sum_rows_add` are gated bit-for-bit against the two
+  dispatches they replace (`test_vulkan_swiglu_rows_matches_two_dispatches`,
+  `test_vulkan_sum_rows_add_matches_add`), for both folded and unfolded layouts.
+  The fused SwiGLU keeps the scale in the same place `mul_rows` put it:
+  `select(h, h*scale, row_scale)`, so the unscaled path is untouched.
+- Token ids exact against the host lane, repeated after both kernel rewrites and
+  after the fusions:
   `[314, 9338, 11, 11751]` for the gate run, `[11751, 13, 198, 760, 6511, 314,
   9338, 369]` for the oracle prompt.
 - Host and device picks are identical (`112 181 238 200 254 208 207 81`).
@@ -567,10 +575,10 @@ policy: on the repetitive stream the fully-accepted cost per token falls to
 1. **`gdn_step` (4.9 ms) and `gdn_gates` (1.8 ms).** The largest kernels left,
    and shader-bound. The handoff already notes `gdn_step` is 10–17 % off at
    large widths and hard-codes 128-wide staging.
-2. **Fuse SwiGLU with the routing scale, and `sum_rows` with the shared-expert
-   add** (80 + 40 dispatches). `had_pre` mode 2 could take the per-expert weight;
-   `sum_rows` could take a bias. Small individually, but they are on the critical
-   chain.
+2. ~~Fuse SwiGLU with the routing scale, and `sum_rows` with the shared-expert
+   add~~ Done: `swiglu_rows` (mode-2 `row_scale`) and `sum_rows_add` (bias
+   binding), 120 dispatches and +1.7 %. The host lane reads the same kernels but
+   is bandwidth-bound, so its tok/s did not move (15.7 vs 15.7, `n=64`).
 3. **Fuse routed gate+up into one dispatch** by uploading one packed bank
    (`gate_per + up_per` per expert) and reading it with `had_pre_at`, as the
    dense FFN already does. 40 dispatches, one less dependency.

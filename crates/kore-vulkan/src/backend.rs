@@ -239,7 +239,8 @@ struct MoeGatherUniforms {
 struct SumRowsUniforms {
     rows: u32,
     n: u32,
-    _pad0: u32,
+    /// 1 = add `bias[i]` to the collapsed output.
+    has_bias: u32,
     _pad1: u32,
 }
 
@@ -485,7 +486,10 @@ struct HadPreUniforms {
     /// Elements per source row of `a`. `cols` for the ordinary layout, and
     /// `2*cols` when gate and up are fused.
     a_stride: u32,
-    _pad: [u32; 3],
+    /// Mode 2 only: when set, `weight[row]` scales row `row` on the way out,
+    /// folding the routing weight into SwiGLU.
+    row_scale: u32,
+    _pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -3335,6 +3339,31 @@ impl VulkanBackend {
     /// The routed `down` projection writes one row per selected expert; this
     /// collapses them with one dispatch instead of one add per expert.
     pub fn sum_rows(&self, x: &Tensor, rows: usize, n: usize) -> Result<Tensor> {
+        self.sum_rows_impl(x, rows, n, None)
+    }
+
+    /// Collapse `rows` rows and add `bias` in the same dispatch.
+    ///
+    /// This is the routed `down` reduction plus the shared expert's output --
+    /// they are adjacent on the decode chain, and `bias` is independent of the
+    /// routed rows, so the add folds in without a second launch.
+    pub fn sum_rows_add(
+        &self,
+        x: &Tensor,
+        rows: usize,
+        n: usize,
+        bias: &Tensor,
+    ) -> Result<Tensor> {
+        self.sum_rows_impl(x, rows, n, Some(bias))
+    }
+
+    fn sum_rows_impl(
+        &self,
+        x: &Tensor,
+        rows: usize,
+        n: usize,
+        bias: Option<&Tensor>,
+    ) -> Result<Tensor> {
         if rows == 0 || n == 0 {
             return Err(VulkanError::UnsupportedOperation(
                 "sum_rows: rows and n must be non-zero".into(),
@@ -3347,8 +3376,33 @@ impl VulkanBackend {
                 rhs: vec![rows * n],
             });
         }
+        if let Some(b) = bias {
+            if b.numel() < n {
+                return Err(VulkanError::ShapeMismatch {
+                    op: "sum_rows_add bias".into(),
+                    lhs: vec![b.numel()],
+                    rhs: vec![n],
+                });
+            }
+        }
         let x_buf =
             KoreVulkanBuffer::from_storage(x.storage_ref(), x.shape().dims(), &self.device, &self.queue)?;
+        // Binding 3 is never read when `has_bias` is 0, so `x` stands in as a
+        // valid read-only buffer for the plain reduction.
+        let bias_buf = match bias {
+            Some(b) => KoreVulkanBuffer::from_storage(
+                b.storage_ref(),
+                b.shape().dims(),
+                &self.device,
+                &self.queue,
+            )?,
+            None => KoreVulkanBuffer::from_storage(
+                x.storage_ref(),
+                x.shape().dims(),
+                &self.device,
+                &self.queue,
+            )?,
+        };
 
         let out_bytes = (n * std::mem::size_of::<f32>()).max(4);
         let y_buffer =
@@ -3357,14 +3411,18 @@ impl VulkanBackend {
         let uniforms = SumRowsUniforms {
             rows: rows as u32,
             n: n as u32,
-            _pad0: 0,
+            has_bias: u32::from(bias.is_some()),
             _pad1: 0,
         };
         let workgroups = (n as u32).div_ceil(256).max(1);
         self.record_dispatch(
             &self.sum_rows_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[x_buf.arc_buffer(), &y_buffer],
+            &[
+                x_buf.arc_buffer(),
+                &y_buffer,
+                bias_buf.arc_buffer(),
+            ],
             (workgroups, 1, 1),
             "sum_rows_pass",
         );
@@ -4777,6 +4835,69 @@ impl VulkanBackend {
         signs: &Tensor,
         eps: f32,
     ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.had_pre_scaled_at(
+            mode, had, a, b, a_len, cols, a_stride, b_off, weight, signs, false, eps,
+        )
+    }
+
+    /// SwiGLU followed by a per-row scale, in one dispatch.
+    ///
+    /// `scale[row]` is the routed expert's weight (or the shared expert's
+    /// sigmoid gate), applied on the way out exactly as `mul_rows` would. The
+    /// two dispatches were adjacent on the decode chain, so folding them saves
+    /// one launch per SwiGLU -- two per MoE layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swiglu_rows(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        rows: usize,
+        cols: usize,
+        scale: &Tensor,
+        signs: &Tensor,
+        had: bool,
+        eps: f32,
+    ) -> Result<Tensor> {
+        if scale.numel() != rows {
+            return Err(VulkanError::ShapeMismatch {
+                op: "swiglu_rows scale".into(),
+                lhs: vec![scale.numel()],
+                rhs: vec![rows],
+            });
+        }
+        let (_res, _norm, out) = self.had_pre_scaled_at(
+            2,
+            had,
+            a,
+            b,
+            rows * cols,
+            cols,
+            cols,
+            0,
+            scale,
+            signs,
+            true,
+            eps,
+        )?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn had_pre_scaled_at(
+        &self,
+        mode: u32,
+        had: bool,
+        a: &Tensor,
+        b: &Tensor,
+        a_len: usize,
+        cols: usize,
+        a_stride: usize,
+        b_off: usize,
+        weight: &Tensor,
+        signs: &Tensor,
+        row_scale: bool,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         if mode > 3 {
             return Err(VulkanError::UnsupportedOperation(format!(
                 "had_pre mode {mode} (expected 0..=3)"
@@ -4812,6 +4933,11 @@ impl VulkanBackend {
                 lhs: vec![cols],
                 rhs: vec![weight.numel()],
             });
+        }
+        if row_scale && mode != 2 {
+            return Err(VulkanError::UnsupportedOperation(
+                "row scaling is only defined for had_pre mode 2 (swiglu)".into(),
+            ));
         }
         // `signs` covers one row; the pattern is applied to every row of an
         // `[rows, cols]` input. Only read when the Hadamard stage runs, so an
@@ -4868,7 +4994,8 @@ impl VulkanBackend {
             had: had as u32,
             b_off: b_off as u32,
             a_stride: a_stride as u32,
-            _pad: [0; 3],
+            row_scale: u32::from(row_scale),
+            _pad: [0; 2],
         };
         self.record_dispatch(
             &self.had_pre_pipeline,
@@ -5501,6 +5628,21 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    fn swiglu_rows(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        rows: usize,
+        cols: usize,
+        scale: &Tensor,
+        signs: &Tensor,
+        had: bool,
+        eps: f32,
+    ) -> kore_core::Result<Tensor> {
+        self.swiglu_rows(a, b, rows, cols, scale, signs, had, eps)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
     fn router_matvec(
         &self,
         x: &Tensor,
@@ -5535,6 +5677,17 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
 
     fn sum_rows(&self, x: &Tensor, rows: usize, n: usize) -> kore_core::Result<Tensor> {
         self.sum_rows(x, rows, n)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn sum_rows_add(
+        &self,
+        x: &Tensor,
+        rows: usize,
+        n: usize,
+        bias: &Tensor,
+    ) -> kore_core::Result<Tensor> {
+        self.sum_rows_add(x, rows, n, bias)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 

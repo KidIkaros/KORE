@@ -870,6 +870,26 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// SwiGLU followed by a per-row scale, in one dispatch.
+    ///
+    /// `scale[r]` multiplies row `r` of the SwiGLU output, which is what
+    /// `mul_rows` would do immediately afterwards. Backends without a fused
+    /// kernel compose the two, so results stay identical either way.
+    fn swiglu_rows(
+        &self,
+        a: &crate::Tensor,
+        b: &crate::Tensor,
+        rows: usize,
+        cols: usize,
+        scale: &crate::Tensor,
+        signs: &crate::Tensor,
+        had: bool,
+        eps: f32,
+    ) -> crate::Result<crate::Tensor> {
+        let (_res, _norm, act) = self.had_pre(2, had, a, b, scale, signs, eps)?;
+        self.mul_rows(&act, scale, rows, cols)
+    }
+
     /// Argmax along the last dimension of a 2D `[rows, cols]` tensor on device, returning `rows` token IDs.
     fn argmax_last_dim(&self, _input: &crate::Tensor) -> crate::Result<Vec<u32>> {
         Err(crate::KoreError::StorageError(format!(
@@ -933,6 +953,19 @@ pub trait DeviceBackend: Send + Sync {
             "sum_rows not implemented for backend '{}'",
             self.device_name()
         )))
+    }
+
+    /// Collapse `rows` rows of `x` and add `bias`, in as few dispatches as the
+    /// backend allows. The default composes the two existing ops.
+    fn sum_rows_add(
+        &self,
+        x: &crate::Tensor,
+        rows: usize,
+        n: usize,
+        bias: &crate::Tensor,
+    ) -> crate::Result<crate::Tensor> {
+        let sum = self.sum_rows(x, rows, n)?;
+        self.add(&sum, bias)
     }
 
     /// Elementwise SiLU activation: C = silu(A) = A / (1 + exp(-A))

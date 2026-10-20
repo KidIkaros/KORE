@@ -1416,6 +1416,121 @@ fn test_vulkan_had_pre_without_hadamard() {
         .expect("had=false must not require a full-width sign table");
 }
 
+/// The fused SwiGLU + routing scale must be bit-identical to the two dispatches
+/// it replaces: `had_pre(2, ..)` followed by `mul_rows`. `down` is linear and
+/// the routing weight is a per-expert scalar, so the MoE expert lane depends on
+/// the scale landing in exactly the same place.
+#[test]
+fn test_vulkan_swiglu_rows_matches_two_dispatches() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+    let (rows, cols) = (8usize, 1024usize);
+    let phase = |i: usize| (i as f32 * 0.007).sin();
+    let a: Vec<f32> = (0..rows * cols).map(|i| phase(i) * 2.5).collect();
+    let b: Vec<f32> = (0..rows * cols).map(|i| phase(i + 11) * 0.75).collect();
+    let scale: Vec<f32> = (0..rows).map(|r| 0.05 * (r as f32 + 1.0)).collect();
+    let signs: Vec<f32> = (0..cols)
+        .map(|i| {
+            if (i * 2654435761usize) % 7 < 3 {
+                -1.0
+            } else {
+                1.0
+            }
+        })
+        .collect();
+    let eps = 1e-6f32;
+    let a = Tensor::from_f32(&a, &[rows, cols]).to(dev).unwrap();
+    let b = Tensor::from_f32(&b, &[rows, cols]).to(dev).unwrap();
+    let scale = Tensor::from_f32(&scale, &[rows]).to(dev).unwrap();
+    let signs = Tensor::from_f32(&signs, &[cols]).to(dev).unwrap();
+    let to_cpu = |t: &Tensor| {
+        t.to(kore_core::Device::Cpu)
+            .unwrap()
+            .as_f32_slice()
+            .unwrap()
+            .to_vec()
+    };
+
+    for had in [false, true] {
+        let (_, _, act) = backend
+            .had_pre(2, had, &a, &b, &signs, &signs, eps)
+            .expect("had_pre mode 2");
+        let want = to_cpu(&backend.mul_rows(&act, &scale, rows, cols).unwrap());
+        let got = to_cpu(
+            &backend
+                .swiglu_rows(&a, &b, rows, cols, &scale, &signs, had, eps)
+                .expect("swiglu_rows"),
+        );
+        assert_eq!(got.len(), want.len());
+        for i in 0..rows * cols {
+            assert_eq!(
+                got[i].to_bits(),
+                want[i].to_bits(),
+                "had={had} element {i}: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+
+        // A unit scale must reproduce the plain SwiGLU exactly as well.
+        let ones = Tensor::from_f32(&vec![1.0f32; rows], &[rows])
+            .to(dev)
+            .unwrap();
+        let unit = to_cpu(
+            &backend
+                .swiglu_rows(&a, &b, rows, cols, &ones, &signs, had, eps)
+                .expect("swiglu_rows unit scale"),
+        );
+        let plain = to_cpu(&act);
+        for i in 0..rows * cols {
+            assert_eq!(unit[i].to_bits(), plain[i].to_bits(), "unit scale {i}");
+        }
+    }
+}
+
+/// The fused row sum plus bias must be bit-identical to `sum_rows` followed by
+/// `add`, and the no-bias form must be bit-identical to `sum_rows` alone.
+#[test]
+fn test_vulkan_sum_rows_add_matches_add() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+    let (rows, n) = (8usize, 2048usize);
+    let phase = |i: usize| (i as f32 * 0.013).cos();
+    let x: Vec<f32> = (0..rows * n).map(|i| phase(i) * 1.25).collect();
+    let bias: Vec<f32> = (0..n).map(|i| phase(i + 17) * 0.5).collect();
+    let x = Tensor::from_f32(&x, &[rows, n]).to(dev).unwrap();
+    let bias = Tensor::from_f32(&bias, &[n]).to(dev).unwrap();
+    let to_cpu = |t: &Tensor| {
+        t.to(kore_core::Device::Cpu)
+            .unwrap()
+            .as_f32_slice()
+            .unwrap()
+            .to_vec()
+    };
+
+    let plain = to_cpu(&backend.sum_rows(&x, rows, n).unwrap());
+    let plain_again = to_cpu(&backend.sum_rows(&x, rows, n).unwrap());
+    assert_eq!(plain, plain_again, "sum_rows is not deterministic");
+
+    let want = to_cpu(&backend.add(&backend.sum_rows(&x, rows, n).unwrap(), &bias).unwrap());
+    let got = to_cpu(&backend.sum_rows_add(&x, rows, n, &bias).unwrap());
+    for i in 0..n {
+        assert_eq!(
+            got[i].to_bits(),
+            want[i].to_bits(),
+            "element {i}: got {} want {}",
+            got[i],
+            want[i]
+        );
+    }
+}
+
 /// `hadamard_signed` on an `[rows, cols]` input must be *bit-identical* to `rows`
 /// single-row calls: the transform and its sign pattern are per-row, and `signs`
 /// is one row wide. The multi-column forward batches the DeltaNet output through
