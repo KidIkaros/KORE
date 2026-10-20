@@ -516,6 +516,13 @@ final 18.6 ms baseline:
 | `elem_compute_pass` | 0.54 | |
 | `gdn_conv_pass` / `flash_decode_gqa_q8` / `qknorm_rope` | ~0.2 / ~0.2 / ~0 | |
 
+Second pass on the current tree, `KORE_SKIP_OPS` deltas at ~56 tok/s: `gemv_q8_0`
+3.0 ms, `gemv_q2_k` 2.9, `gdn_step` 2.2, `gemv_q4_k` 2.1, `moe_topk` 2.0,
+`had_pre` 1.9, `router_matvec` 1.3, `flash_decode_gqa_q8` 0.85, `gemv_q6_k`
+(the 248k-wide vocabulary head) 0.35, `quantize_q8_rows` 0.34, `gdn_conv`
+0.02. Nothing anonymous is left: the step is those seven kernels plus the
+~4.9 ms of dispatch floor that 823 dispatches imply.
+
 Caveat: skipping a **normalisation** (`elem_mul_rows`, `quantize_q8_rows`) lets
 garbage and denormals into the next GEMV and made those runs *slower*
 (173 ms and 71 ms). Those rows are unusable; the ones above are the ones that
@@ -567,6 +574,8 @@ no longer launch-bound; it is spread across GDN, attention and the MoE matvecs.
 | **Single-lane k-selection in `moe_topk`** | Much worse: 58.9 → 45.9 tok/s. 2048 dependent shared-memory loads (one lane, 8 rounds × 256) cost more than the 64 workgroup barriers the parallel rounds pay. Reverted. |
 | **Hoist the softmax `exp` into a shared `probs` array** | Neutral (53.6 vs 53.4 tok/s): the 8× redundant `exp` per round is not what the kernel spends its time on. Reverted rather than kept unmeasured. |
 | **`vec4` router matvec** | Neutral (53.5 vs 53.6 tok/s, ablation delta unchanged): the 2 MB row read is latency-bound, not issue-bound. Reverted so the logits keep their current rounding. |
+| **One warp for `moe_topk`** (`workgroup_size(32)`) | Slower (56.3 → 54.8 tok/s): 8 × 5 barrier steps on one warp lose to 1 expert per lane with an 8-step tree. The 256-lane form is at its floor. |
+| **Device-side embedding handoff** | Would buy nothing. `KORE_STEP_PROFILE=1` shows the host is idle **11.3 ms of a 16.1 ms step**: the per-token round trip is fully hidden behind the GPU. Not built. |
 | **Pre-batch snapshot + replay instead of per-column snapshots** | Not worth it. `copy_buffer` now records a real buffer copy, so the per-column snapshots cost 1.15 ms per fired step, and the 6 cut steps in 192 tokens rewind in 0.19 ms each. |
 
 ### Dense at the current state
@@ -590,16 +599,25 @@ policy: on the repetitive stream the fully-accepted cost per token falls to
 
 ### Next, in order
 
-1. **`gdn_gates` (1.8 ms) and what is left of `gdn_step` (~2.9 ms).** The
+1. **Speculative decoding for the MoE.** This is the only lever left that is
+   worth more than a few percent: the dense path measures 1.7×, and the device
+   routed MoE is much closer to supporting `m > 1` than the note below assumed.
+   The expert-strided GEMVs already take a per-position activation row
+   (`x_stride`), so `gate/up` and `down` work over `m*n_used` rows unchanged;
+   what is missing is per-column routing (one router matvec + top-k per column,
+   `idx` laid out as `column*n_used + e`), a per-column SwiGLU scale vector, and
+   the `moe_ffn_gpu_host` `rows != 1` rejection. `forward_batch` and the
+   snapshot/rewind machinery already handle columns for the dense model.
+2. **`gdn_gates` (1.8 ms) and what is left of `gdn_step` (~2.9 ms).** The
    i-major state made `gdn_step` coalesce; its three 128-step sweeps are still
    one workgroup per head (16 workgroups), so it occupies half the CUs. Splitting
    the sweeps across two thread groups per head would reassociate the sums, which
    needs a tolerance argument rather than byte-identity.
-2. ~~Fuse SwiGLU with the routing scale, and `sum_rows` with the shared-expert
+3. ~~Fuse SwiGLU with the routing scale, and `sum_rows` with the shared-expert
    add~~ Done: `swiglu_rows` (mode-2 `row_scale`) and `sum_rows_add` (bias
    binding), 120 dispatches and +1.7 %. The host lane reads the same kernels but
    is bandwidth-bound, so its tok/s did not move (15.7 vs 15.7, `n=64`).
-3. **Fuse routed gate+up into one dispatch.** Worked out, not built: put both
+4. **Fuse routed gate+up into one dispatch.** Worked out, not built: put both
    projections in one buffer as `[all experts' gate | all experts' up]`, dispatch
    `n = 2*n_used*F` rows with `rows_per_expert = F` and two extra uniforms
    (`n_pos = n_used`, `w2_off = n_experts*expert_words`) so the upper half reads
@@ -609,10 +627,10 @@ policy: on the repetitive stream the fully-accepted cost per token falls to
    the staging copy (`upload_u8` allocates twice) does not fit comfortably next
    to the mmapped GGUF. It needs a chunked upload (`alloc_u8` + `write_u8_at`)
    so the host peak is one chunk. 40 dispatches, ~0.7 ms.
-4. **Per-expert routing counters** for hot-set pinning on 8 GB cards
+5. **Per-expert routing counters** for hot-set pinning on 8 GB cards
    (`KORE_MOE_RESIDENT=N` currently pins the first N, not the hottest N). See
    `docs/deepinfer-scaled-down.md` §3.
-5. **Device routing stays opt-in.** Peak VRAM is ~16.1 of 17.1 GB, so enabling
+6. **Device routing stays opt-in.** Peak VRAM is ~16.1 of 17.1 GB, so enabling
    it without a free-memory check would fail on a busy desktop.
 
 DeepInfer mapping and verdicts: `docs/deepinfer-scaled-down.md`.
