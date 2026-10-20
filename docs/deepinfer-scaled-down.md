@@ -15,7 +15,7 @@ The box: RX 9060 XT, 16 GB, Vulkan/radv, wgpu. Dense baseline
 | DeepInfer mechanism | KORE equivalent | Verdict |
 |---|---|---|
 | Batch-invariant kernels | Q2_0 / Q3_K GEMVs are bit-identical for any `m` | **Already present**; keep as a test invariant |
-| Confidence-scheduled verification (DSpark) | n-gram drafter + `DraftPolicy` payoff guard | **Covered**; adaptive `k` has no headroom at `k=3`, `MAX_BATCH_COLS=4` |
+| Confidence-scheduled verification (DSpark) | n-gram drafter + `DraftPolicy` payoff guard | **Covered**; default is `k=6, min_match=6` at `MAX_BATCH_COLS=8` |
 | Expert hot-set pinning (EPLB) | `KORE_MOE_RESIDENT=N` (first *N* experts) | **Worth building for 8 GB**; no gain on 16 GB |
 | Zero-overhead / async scheduling | 48-op batches, one queue per step | **No cheap win**; the step is a serial dependency chain |
 | Megakernel / persistent kernel | none | **Out of reach in wgpu**; this is the remaining MoE wall |
@@ -47,17 +47,25 @@ existing `DraftPolicy` already has the equivalent guard: it fires only when a
 match of at least `min_match` exists, and the payoff guard skips steps whose
 recent acceptance would not repay the wider verify pass.
 
-Measured on the dense 2B (`k=3, min_match=4`, 64 tokens, 5-token prompt):
+Measured on the dense 2B (`k=6, min_match=6`, 200 tokens, 2 rounds
+interleaved with greedy on the same prompt):
 
-- fires 71.4 % of steps, 45/45 drafts accepted (100 %), all at `j=3`;
-- **189 tok/s vs 118 tok/s greedy = 1.60×** in the current (lower-clock) state;
+- repetitive text: **173 tok/s vs 109.5 tok/s greedy = 1.58×** (the old
+  `k=3, min_match=4` point reads 167 tok/s, 1.53×);
+- prose: 147.5 vs 106.7 tok/s = **1.38×** (old point: 145.8, 1.36×);
 - the no-fire floor on prose is ~0.975–0.989× (§4 of the handoff), i.e. the
   guard costs 1–2.5 % when there is nothing to draft.
 
-**Verdict:** covered. Adaptive `k` would need `k` to exceed the current
-`MAX_BATCH_COLS - 1 = 3` and a confidence estimate finer than match length.
-Both are properties of the drafter, not of scheduling. The real version of this
-idea is a small draft model, which is a different project.
+`MAX_BATCH_COLS` is now 8, so `k` can reach 7; `gemv_q2_0`'s second row group
+made an 8-column verify pass bit-identical. `draft_headroom` sweeps the whole
+grid (`m=1..8`, `k=1..7`) and picks the operating point: the fully-accepted cost
+per token falls from 3.88 ms at `m=4` to 3.51 ms at `m=7`, and the measured
+optimum is `k=6`. `k=7` loses because the eighth draft almost never lands.
+
+**Verdict:** covered. The remaining gap is a confidence estimate finer than
+match length — the `P(j)` histogram already in `SpecStats` is the natural
+signal. The real version of this idea is a small draft model, which is a
+different project.
 
 ## 3. Expert hot-set pinning (EPLB)
 
@@ -99,33 +107,42 @@ has its own section.
 
 ## 5. Megakernel / persistent kernel
 
-DeepInfer fuses an entire layer (or several) into one persistent kernel. This is
-what the remaining MoE gap requires. The current device path is **1143
-dispatches/step, 54.5 ms** (no-sync census), against llama.cpp's **80.25 tok/s**
-(12.5 ms/step) on the same file and card. Cutting 280 launches (fused `down`)
-bought only ~2 ms, i.e. ~6.5 µs per removed dispatch: the step is **latency-bound
-on small dependent ops**, not launch-count-bound.
+DeepInfer fuses an entire layer (or several) into one persistent kernel. The
+current device path is **1023 dispatches/step, 17.0 ms** (no-sync census) and
+**51–53 tok/s** in the real loop, against llama.cpp's **80.25 tok/s**
+(12.5 ms/step) on the same file and card.
 
-Getting from 17 to 80 tok/s means collapsing each MoE layer into one or two
-dispatches: route → gate/up → SwiGLU → down → weighted sum, with the expert
-matvecs reading the resident bank in place (`MUL_MAT_ID`-style, no gather). That
-is a real kernel project. It is not portable from DeepInfer's CUDA/SM100 code,
-but the design is: one workgroup per selected expert, weights addressed by
-`idx`, no host and no intermediate stage buffers.
+The ablation changed the diagnosis. Dispatch count is not the wall: the step
+was ~75 % two kernels, `moe_topk` (a single-lane softmax + selection, 21.8 ms)
+and the transposed F32 router matvec (~15 ms). Parallelising the first and
+reading the router in its native row-major layout moved the device lane from
+1.44× to **3.8×** the host without fusing a single layer. The remaining 17 ms is
+spread thin: `gdn_step` 4.9, attention 6.1 (Q4_K + Q8_0), MoE Q2_K 3.4,
+`had_pre` 2.9, `sum_rows` 1.6.
 
-**Verdict:** out of reach as a port; the correct next milestone if the MoE gap
-is the goal.
+That leaves the megakernel as a *second* milestone, not the first. Collapsing
+route → gate/up → SwiGLU → down → weighted sum into one or two dispatches is
+still the way past llama.cpp, and the in-place `idx` read is the foundation it
+needs, but the GDN and attention shaders are now the larger single items.
+
+**Verdict:** the in-place design was adopted; the full layer fusion is the next
+kernel project, behind the GDN shader work.
 
 ## What was actually adopted
 
-- **Device-side routing** (`KORE_MOE_DEVICE_ROUTE=1`): router matvec, softmax,
-  top-k, and gather all on device; one round trip per layer removed. 1.44×.
-- **Expert-strided `down` GEMV** (`gemv_q{2,3}_k_id`): all eight experts in one
-  dispatch, reading the gathered bank by expert stride, then one `sum_rows`.
-  1423 → 1143 dispatches/step.
+- **Device-side routing** (`KORE_MOE_DEVICE_ROUTE=1`): routing, softmax, top-k
+  and the router matvec all on device. 1.44× before the kernel fixes below,
+  3.8× after.
+- **Parallel top-k** (`moe_topk.wgsl`): 256 lanes, tree-reduced max and argmax
+  rounds, normaliser kept on one lane for host-order summation. 21.8 ms off.
+- **Row-major router** (`router_matvec.wgsl`): one workgroup per expert over the
+  GGUF's native `[experts, hidden]` rows. ~15 ms off.
+- **In-place expert read** (`idx` + `x_stride` in `gemv_q{2,3}_k_id`): the three
+  per-layer gathers and the down staging buffer are gone; 1143 → 1023
+  dispatches, ~165 MB less traffic per token.
 - **`flush_uploads`** for the bulk expert upload: GTT peak fell from ~16 GB to
   ~1.5 GB by submitting the staging belt instead of letting it pile up.
 
 The batch-invariance rule is retained as the acceptance gate: every MoE
-correctness check compares `max|d|` against the host path (2.2e-8 on this box)
-and the token ids against the oracle, per batch shape.
+correctness check compares `max|d|` against the host path (5.6e-8 after the
+router change) and the token ids against the oracle, per batch shape.

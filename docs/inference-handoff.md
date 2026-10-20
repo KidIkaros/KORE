@@ -58,7 +58,7 @@ change it.
 |---|---|---|
 | GGUF load (K-quants, Q2_0…Q8_0, F32/F16 first-class) | `kore-nn/src/qwen35.rs`, `kore-kernels/` | done |
 | Dense decode (CPU + GPU lanes) | `qwen35.rs` | done |
-| Batched decode, up to 4 columns | `forward_batch`, `MAX_BATCH_COLS = 4` (`qwen35.rs:131`) | done, capped |
+| Batched decode, up to 8 columns | `forward_batch`, `MAX_BATCH_COLS = 8` (`qwen35.rs:132`) | done, two row groups; `verify_m` bit-identical |
 | Chunked prefill | `prefill` (`qwen35.rs:3006`) | done |
 | Split-KV long-context decode attention | `kore-vulkan/src/backend.rs` | done |
 | Q2_0 / Q4_K / Q5_K / Q6_K / Q8_0 GPU GEMV | `backend.rs` | done |
@@ -115,6 +115,10 @@ before timing (§9). Every row asserted its tokens byte-identical to greedy.
 | Bonsai-2B Q2_0 | 5 tok | 64 | 9.142 ms / **109.4 tok/s** | 6.325 ms / 158.1 / **1.445×** / fire 71.4 % | 6.972 ms / 143.4 / 1.311× / fire 40.0 % |
 | Ornith-9B Q4_K_M | 5 tok | 64 | 46.983 ms / **21.3 tok/s** | 29.496 ms / 33.9 / **1.593×** / fire 71.4 % | 33.242 ms / 30.1 / 1.413× / fire 40.0 % |
 | Ornith-9B Q4_K_M | `def fibonacci(n):` | 64 | 48.838 ms / **20.5 tok/s** | 50.074 ms / 20.0 / **0.975×** / fire 1.6 % | 49.378 ms / 20.3 / 0.989× / fire 0.0 % |
+
+The table above is the cooled-die campaign and is kept for comparability. The
+current dense operating point is `k=6, min_match=6` at 1.58× (repetitive) /
+1.38× (prose); see §13 for the interleaved numbers and the wider verify pass.
 
 **Read these four ways:**
 
@@ -252,9 +256,9 @@ deferred in the plan. Order is by (value ÷ risk).
    against this.
 2. **Resolve the ~2.4 GiB VRAM accounting** (§6). It is the difference between
    running the model and not.
-3. **Re-tune `k` and `min_match` on the warmed harness.** The plan's optimum
-   (`k=3, min_match=4`) was chosen against a ratio the warm-up fix later showed was
-   inflated by 1.41×. `kore-cli/examples/draft_headroom.rs` is the sweep tool.
+3. ~~**Re-tune `k` and `min_match` on the warmed harness.**~~ Done: `k=6,
+   min_match=6` at `MAX_BATCH_COLS=8`; `draft_headroom` now sweeps the full grid.
+   See §13.
 4. **Raise the MoE slot pool to 64** and re-measure. `KORE_MOE_SLOTS=64`; +8 %
    measured, VRAM was the only blocker.
 5. **Device-side top-k with one batched readback.** The routed step spends 39–48 %
@@ -380,9 +384,11 @@ Not blockers, but unresolved and worth an hour each before they surprise someone
 - **`gdn_step` is 10–17 % off** at large widths; it is P9/K and needs a tolerance
   argument. The shader also hard-codes 128-wide staging, so the tiny fixture
   (`d_k = d_v = 32`) cannot exercise it.
-- **`m > 4` needs the `gemv_q2_0` weight-axis redesign**, not a config change.
-  Measured model: `GEMV(m) ≈ ceil(m/4)·A + c·m` with `A ≈ 3.04 ms`, `c ≈ 2.2 ms` —
-  so `m ≤ 4` is an honest cap.
+- ~~**`m > 4` needs the `gemv_q2_0` weight-axis redesign.**~~ Resolved: the
+  kernel already launched `grid.y = ceil(m/4)`; it simply read column 0..3 again
+  in the second group. Indexing `x` by `m_base` and raising the check to 8 gives
+  a bit-identical pass (measured 28.3 ms at `m=8` vs 15.5 ms at `m=4`, so the
+  per-token cost still falls).
 - **`generate_spec` only works on a dense arch** (`moe_ffn_gpu` errors when
   `rows != 1`). If spec decode is wanted on MoE, that boundary is the work.
 - **Qwen2.5-0.5B first-token mismatch** — parked by decision, cause unknown.
@@ -413,81 +419,173 @@ retracted in §14.33.
 
 ---
 
-## 13. MoE on the 16 GB AMD box: device routing, fused down, and the wall
+## 13. MoE on the 16 GB AMD box: device routing, in-place experts, and the two kernels that dominated
 
-Measured 2026-08-13 on the RX 9060 XT, `Qwen_Qwen3.6-35B-A3B-Q2_K_L.gguf`,
-Vulkan, `-ngl` equivalent (every layer resident), 5-token prompt, `n=64`,
-`max_ctx=128`, arms interleaved 3 rounds with a 6 s gap. Correctness gate:
-`max|d|` against the host path and token ids against the oracle.
+Measured 2026-08-13 → 2026-08-20 on the RX 9060 XT,
+`Qwen_Qwen3.6-35B-A3B-Q2_K_L.gguf`, Vulkan, every layer resident, 5-token
+prompt (`KORE_IDS="11751,13,198,760,6511"`), `max_ctx` 96, arms interleaved in
+one time window. Correctness gate: token ids against the host lane and `max|d|`
+on the routed FFN.
 
-### What moved
+### Final numbers (2026-08-20, `n=64`, 3 rounds)
 
-| arm | tok/s (3 rounds) | ratio |
+| arm | tok/s | ratio |
 |---|---|---|
-| host-routed expert stream (`default`) | 11.77 / 11.82 / 11.81 | 1.00× |
-| device-routed (`KORE_MOE_DEVICE_ROUTE=1`) | 17.11 / 17.22 / 16.99 | **1.44×** |
+| host-routed expert stream (`default`) | 13.77 / 13.59 / 13.49 | 1.00× |
+| device-routed (`KORE_MOE_DEVICE_ROUTE=1`) | 52.95 / 51.36 / 52.30 | **3.8×** |
 
-The llama.cpp reference on the same file and card is **80.25 tok/s**, so the
-remaining gap is 4.7×. A warmed run after the dense benchmark reached 20.80
-tok/s: the die was at sclk 1184 MHz of 2620 during the interleaved rounds, so
-absolute numbers move with the power state. The 1.44× is interleaved and is the
-number to quote.
+The die sat at **sclk 2012 MHz of 2620**, edge 51 °C, during these rounds. The
+earlier 1.44× was measured at 1184 MHz with the old top-k and router kernels, so
+the ratio moved for two reasons: the code got faster *and* the device lane is
+GPU-bound while the host lane is not, so a higher clock lifts the device arm
+more. The ablation below is the clock-independent evidence for the code cut.
 
-Correctness: routed `down` output `max|d| = 2.2351742e-8` vs host, token ids
-exact (`11751 13 198 760 6511 314 9338 369`), repeated 8 times for `n=64`.
+llama.cpp on the same file and card measured **80.25 tok/s**. The gap is now
+~1.5× in the current state; it was 4.7× when this section was first written.
 
-### What was built
+A sustained run (`n=400`, `max_ctx=512`, one arm) held **59.8 tok/s** over
+6.69 s; peak VRAM was **15.63 GiB** of the ~16.7 GiB usable, so the margin for
+the next allocation is ~1 GiB. That is the number to quote for long generations:
+attention grows with context but the clock also ramps, and the two roughly
+cancel over the first 400 tokens.
 
-- `moe_topk.wgsl` / `moe_gather.wgsl`: routing, softmax, top-k, and expert
-  gather on device. The host never sees the token's expert list.
-- One gather per projection instead of one per expert; the selected expert
-  matrices land in `gate_stage` / `up_stage` / `down_stage` in selection order.
-- `gemv_q2_k_at` / `gemv_q3_k_at` and their `_into` forms: a matvec against a
-  matrix at a word offset inside a stacked bank.
-- `gemv_q{2,3}_k_id`: one expert-strided dispatch for all eight routed `down`
-  projections, then one `sum_rows`. This is the `MUL_MAT_ID` shape, minus the
-  in-place bank read.
-- `flush_uploads`: bulk expert uploads now submit the staging belt. GTT peak
-  fell from ~16 GB to **1.5 GB**; without it the "resident" tier spilled.
-- Q2_0 gained a weight offset and the dense FFN now stores gate and up as one
-  packed matrix (rows `0..gate_n` gate, the rest up), read by one GEMV.
+### What moved, in order
+
+| change | effect |
+|---|---|
+| **Parallel router top-k** (`moe_topk.wgsl`) | 49.4 → 29.8 ms/step; real loop 17.6 → 28.2 tok/s (`n=48`) |
+| **Row-major router matvec** (`router_matvec.wgsl`) | 29.8 → 17.0 ms/step; real loop 28.2 → 47.5–50.2 tok/s (`n=48`) |
+| **In-place expert read** (`idx` + `x_stride` in `gemv_q{2,3}_k`) | 1143 → 1023 dispatches, no gathers, no `down_stage`; ~+3 % |
+| device routing, fused `down`, `flush_uploads` (previous session) | 11.8 → 17.1 tok/s (1.44×) |
+
+The two kernels were not "small dependent ops". They were the two halves of the
+routing decision:
+
+- `moe_topk` was a **single workgroup of one lane**: a max-subtracted softmax
+  over 256 experts, then an O(k·n) selection that re-ran the exclusion scan
+  inside it, with `exp` on the hot path. ~0.55 ms per layer, **21.8 ms per
+  step** of a 49.4 ms step.
+- The router matvec went through the generic GEMV, which wants
+  `[hidden, experts]`; the engine transposed the GGUF router at load to match.
+  Every weight read then touched one 4-byte word per cache line. ~0.18 ms per
+  layer for the routed router, plus the shared-expert router, **~15 ms/step**.
+
+`moe_topk` now uses 256 lanes (one expert each): the max and each argmax round
+are tree reductions, ties go to the lower expert id exactly as the host scan
+does, and only the softmax normaliser stays on one lane so its summation order
+stays the host's. `router_matvec` reads the GGUF's native `[experts, hidden]`
+rows contiguously, one workgroup of 128 lanes per expert.
+
+The in-place read removed the three per-layer gathers (gate, up, down) and the
+down staging buffer: `gemv_q{2,3}_k_id` now takes the routing ids and an
+activation row stride, reads expert `idx[position]` straight out of the resident
+bank, and gate/up share one activation row (`x_stride = 0`). 120 fewer
+dispatches and ~165 MB less traffic per token.
+
+### The ablation that found them
+
+`KORE_SKIP_OPS=<label>` drops a dispatch before it is recorded, leaving shapes
+and dependencies intact, so the wall-time delta is that label's cost. At the
+final 18.6 ms baseline:
+
+| label | ms/step | note |
+|---|---|---|
+| `gdn_step_pass` | 4.93 | largest single kernel now |
+| `gemv_q4_k_compute_pass` | 3.49 | attention projections, 100 dispatches |
+| `gemv_q2_k_compute_pass` | 3.39 | 152 dispatches (MoE gate/up, shared expert) |
+| `had_pre_pass` | 2.87 | 171 dispatches (norms, SwiGLU) |
+| `gemv_q8_0_compute_pass` | 2.65 | 95 dispatches |
+| `gdn_gates_pass` | 1.75 | |
+| `sum_rows_pass` | 1.59 | 40 dispatches |
+| `gemv_pass` | 1.52 | residual F32 matvecs |
+| `elem_compute_pass` | 0.54 | |
+| `gdn_conv_pass` / `flash_decode_gqa_q8` / `qknorm_rope` | ~0.2 / ~0.2 / ~0 | |
+
+Caveat: skipping a **normalisation** (`elem_mul_rows`, `quantize_q8_rows`) lets
+garbage and denormals into the next GEMV and made those runs *slower*
+(173 ms and 71 ms). Those rows are unusable; the ones above are the ones that
+removed work without poisoning the inputs.
 
 ### Census (ctx 6, 4 steps, no sync)
 
 | arm | dispatches/step | wall | tok/s |
 |---|---|---|---|
 | host-routed | 1383 | 75.5 ms | 13.2 |
-| device-routed | **1143** | 54.5 ms | 18.4 |
+| device-routed, after fused down | 1143 | 54.5 ms | 18.4 |
+| device-routed, final | **1023** | **17.0 ms** | **59.0** |
 
-The 280-dispatch cut (fused `down`) bought ~2 ms, i.e. **~6.5 µs per removed
-dispatch**. The step is latency-bound on small dependent ops, not launch-count
-bound: the remaining 54 ms is 40 layers of ~28 dependent dispatches, each doing a
-small matvec. That is why the gap to llama.cpp is a kernel-fusion gap, not a
-plumbing gap.
+The real loop is ~20 ms/token (48–53 tok/s): the difference is the per-token
+argmax readback and the submission wait, not more dispatch overhead. The step is
+no longer launch-bound; it is spread across GDN, attention and the MoE matvecs.
+
+### Correctness
+
+- Token ids exact against the host lane, repeated after both kernel rewrites:
+  `[314, 9338, 11, 11751]` for the gate run, `[11751, 13, 198, 760, 6511, 314,
+  9338, 369]` for the oracle prompt.
+- Host and device picks are identical (`112 181 238 200 254 208 207 81`).
+- Routing weights differ in the last ~1e-7 (WGSL `exp` vs host libm), and the
+  routed FFN output `max|d| = 5.59e-8` (it was 2.24e-8 before the router change,
+  on a different layer). That is a numerical lane, not a bug: the host lane
+  remains the byte-identity oracle for anything that needs it.
+- Dense `m=8` verify: `verify_m` reports 37 positions bit-identical to
+  sequential decode, 15 rewind keep-points over widths `[8,7]`, and prefill
+  agreement.
 
 ### Closed this session (do not rebuild)
 
 | Lever | Verdict |
 |---|---|
 | **Full residency vs streaming** | Worthless on 16 GB: warm 16.56 (resident 128) vs 16.51 (streaming) tok/s. Keep `KORE_MOE_RESIDENT=all`; the win was the GTT fix, not the tier. |
-| **Accumulate `down` in place** | Slower: 15.75–17.33 vs 20.89 tok/s. The read-after-write on the 8 KB output serializes the GEMVs; `sum_rows` after independent writes is better. |
-| **Dense gate+up fusion** | Neutral: 321 vs 345 dispatches, 118 vs 118 tok/s in a 4-round A/B. Keep it (fewer launches, one upload) but it is not a speed lever. `KORE_DENSE_SPLIT_GATE_UP=1` restores the split path. |
+| **Accumulate `down` in place** | Slower: the read-after-write on the 8 KB output serialises the GEMVs. `sum_rows` after independent writes wins. |
+| **Dense gate+up fusion** | Neutral in tok/s; kept for the dispatch count. `KORE_DENSE_SPLIT_GATE_UP=1` restores the split. |
+| **Gathers → in-place expert read** | Built, matches token ids, worth ~3 %. The gathers were cheap; the ids were not the problem. |
+| **`m > 4` "needs a weight-axis redesign"** | Wrong. `gemv_q2_0` already had `grid.y = ceil(m/4)`; it only ignored `m_base` when indexing `x`. Fixing that and lifting the check to 8 gives a bit-identical 8-column pass. |
+| **Pre-batch snapshot + replay instead of per-column snapshots** | Not worth it. `copy_buffer` now records a real buffer copy, so the per-column snapshots cost 1.15 ms per fired step, and the 6 cut steps in 192 tokens rewind in 0.19 ms each. |
 
-Dense at the current clock state: 118 tok/s greedy (`n=200`), 189 tok/s with
-spec `k=3, min_match=4` (100 % acceptance, 1.60×). The earlier 142/232 readings
-were taken with the die at a higher sclk; the ratio is the stable number.
+### Dense at the current state
+
+`n=200`, same prompt as the §13 MoE work (repetitive), 2 rounds interleaved:
+
+| arm | tok/s | ratio |
+|---|---|---|
+| greedy | 109.63 / 109.43 | 1.00× |
+| spec default (`k=6, min_match=6`) | 172.98 / 173.51 | **1.58×** |
+| spec `k=3, min_match=4` | 166.29 / 167.49 | 1.53× |
+
+On a prose prompt the same two arms read 147.5 vs 145.8 tok/s (greedy 107):
+1.38× vs 1.36×. Lowering `min_match` to 1 buys 1.62× on repetitive text but only
+1.18× on prose — it is not the default.
+
+`draft_headroom` now sweeps `m=1..8`/`k=1..7` and is the tool to re-pick the
+policy: on the repetitive stream the fully-accepted cost per token falls to
+3.51 ms at `m=7` (from 3.88 ms at `m=4`), and the projected optimum moved from
+`k=3` to `k=6`; `k=7` loses because the eighth draft almost never lands.
 
 ### Next, in order
 
-1. **One MoE layer, one dispatch (or two).** Route → gate/up → SwiGLU → down →
-   weighted sum, with the expert matvecs reading the **resident bank in place**
-   by `idx` (no gather, no stage buffers). The `gemv_q{2,3}_k_id` stride logic is
-   the prototype; it needs an `idx` binding and an `x_stride` of zero for
-   gate/up. This is the only path from 17 to the llama.cpp 80.
-2. **Per-expert routing counters** for hot-set pinning on 8 GB cards
+1. **`gdn_step` (4.9 ms) and `gdn_gates` (1.8 ms).** The largest kernels left,
+   and shader-bound. The handoff already notes `gdn_step` is 10–17 % off at
+   large widths and hard-codes 128-wide staging.
+2. **Fuse SwiGLU with the routing scale, and `sum_rows` with the shared-expert
+   add** (80 + 40 dispatches). `had_pre` mode 2 could take the per-expert weight;
+   `sum_rows` could take a bias. Small individually, but they are on the critical
+   chain.
+3. **Fuse routed gate+up into one dispatch** by uploading one packed bank
+   (`gate_per + up_per` per expert) and reading it with `had_pre_at`, as the
+   dense FFN already does. 40 dispatches, one less dependency.
+4. **Per-expert routing counters** for hot-set pinning on 8 GB cards
    (`KORE_MOE_RESIDENT=N` currently pins the first N, not the hottest N). See
    `docs/deepinfer-scaled-down.md` §3.
-3. **Dense:** stop at the fused gate/up. The next dense lever is not another
-   dispatch merge; it is occupancy in the Q2_0 GEMV at `m=1`.
+5. **Device routing stays opt-in.** Peak VRAM is ~16.1 of 17.1 GB, so enabling
+   it without a free-memory check would fail on a busy desktop.
 
 DeepInfer mapping and verdicts: `docs/deepinfer-scaled-down.md`.
+
+### Known failures at this commit
+
+- `kore-vulkan` integration test
+  `test_vulkan_quantize_q8_rows_matches_reference` fails on the committed tree
+  too (`q[0,13]: got 191, want 192`). It is a pre-existing tie-rounding
+  disagreement between the test's expectation and the shader, not a regression
+  from this work.
