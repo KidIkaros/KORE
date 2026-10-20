@@ -3239,11 +3239,11 @@ impl VulkanBackend {
                 "moe_topk: k must be in 1..=16".into(),
             ));
         }
-        if n == 0 {
+        if n == 0 || k > n {
             return Err(VulkanError::ShapeMismatch {
                 op: "moe_topk".into(),
-                lhs: vec![n],
-                rhs: vec![1],
+                lhs: vec![k],
+                rhs: vec![n],
             });
         }
         if n > 1024 {

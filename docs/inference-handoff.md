@@ -564,6 +564,9 @@ no longer launch-bound; it is spread across GDN, attention and the MoE matvecs.
 | **Dense gate+up fusion** | Neutral in tok/s; kept for the dispatch count. `KORE_DENSE_SPLIT_GATE_UP=1` restores the split. |
 | **Gathers → in-place expert read** | Built, matches token ids, worth ~3 %. The gathers were cheap; the ids were not the problem. |
 | **`m > 4` "needs a weight-axis redesign"** | Wrong. `gemv_q2_0` already had `grid.y = ceil(m/4)`; it only ignored `m_base` when indexing `x`. Fixing that and lifting the check to 8 gives a bit-identical 8-column pass. |
+| **Single-lane k-selection in `moe_topk`** | Much worse: 58.9 → 45.9 tok/s. 2048 dependent shared-memory loads (one lane, 8 rounds × 256) cost more than the 64 workgroup barriers the parallel rounds pay. Reverted. |
+| **Hoist the softmax `exp` into a shared `probs` array** | Neutral (53.6 vs 53.4 tok/s): the 8× redundant `exp` per round is not what the kernel spends its time on. Reverted rather than kept unmeasured. |
+| **`vec4` router matvec** | Neutral (53.5 vs 53.6 tok/s, ablation delta unchanged): the 2 MB row read is latency-bound, not issue-bound. Reverted so the logits keep their current rounding. |
 | **Pre-batch snapshot + replay instead of per-column snapshots** | Not worth it. `copy_buffer` now records a real buffer copy, so the per-column snapshots cost 1.15 ms per fired step, and the 6 cut steps in 192 tokens rewind in 0.19 ms each. |
 
 ### Dense at the current state
