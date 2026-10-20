@@ -599,9 +599,16 @@ policy: on the repetitive stream the fully-accepted cost per token falls to
    add~~ Done: `swiglu_rows` (mode-2 `row_scale`) and `sum_rows_add` (bias
    binding), 120 dispatches and +1.7 %. The host lane reads the same kernels but
    is bandwidth-bound, so its tok/s did not move (15.7 vs 15.7, `n=64`).
-3. **Fuse routed gate+up into one dispatch** by uploading one packed bank
-   (`gate_per + up_per` per expert) and reading it with `had_pre_at`, as the
-   dense FFN already does. 40 dispatches, one less dependency.
+3. **Fuse routed gate+up into one dispatch.** Worked out, not built: put both
+   projections in one buffer as `[all experts' gate | all experts' up]`, dispatch
+   `n = 2*n_used*F` rows with `rows_per_expert = F` and two extra uniforms
+   (`n_pos = n_used`, `w2_off = n_experts*expert_words`) so the upper half reads
+   the `up` region with the same `idx`, then SwiGLU with
+   `had_pre_at(a_stride = cols, b_off = n_used*F*cols)` -- no new kernel, no
+   packed-row interleave. The blocker is the load: one 6.8 GiB host `Vec` plus
+   the staging copy (`upload_u8` allocates twice) does not fit comfortably next
+   to the mmapped GGUF. It needs a chunked upload (`alloc_u8` + `write_u8_at`)
+   so the host peak is one chunk. 40 dispatches, ~0.7 ms.
 4. **Per-expert routing counters** for hot-set pinning on 8 GB cards
    (`KORE_MOE_RESIDENT=N` currently pins the first N, not the hottest N). See
    `docs/deepinfer-scaled-down.md` §3.
