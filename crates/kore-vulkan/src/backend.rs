@@ -216,6 +216,15 @@ struct MoeTopkUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct RouterUniforms {
+    n: u32,
+    k: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct MoeGatherUniforms {
     per_words: u32,
     k: u32,
@@ -665,6 +674,7 @@ pub struct VulkanBackend {
     rope_pipeline: Arc<wgpu::ComputePipeline>,
     argmax_pipeline: Arc<wgpu::ComputePipeline>,
     moe_topk_pipeline: Arc<wgpu::ComputePipeline>,
+    router_matvec_pipeline: Arc<wgpu::ComputePipeline>,
     moe_gather_pipeline: Arc<wgpu::ComputePipeline>,
     sum_rows_pipeline: Arc<wgpu::ComputePipeline>,
     gemv_q4_k_split3_pipeline: Arc<wgpu::ComputePipeline>,
@@ -982,6 +992,21 @@ impl VulkanBackend {
                 label: Some("kore_moe_topk_pipeline"),
                 layout: None,
                 module: &moe_topk_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
+        let router_matvec_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_router_matvec_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/router_matvec.wgsl").into()),
+        });
+        let router_matvec_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_router_matvec_pipeline"),
+                layout: None,
+                module: &router_matvec_shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
@@ -1370,6 +1395,7 @@ impl VulkanBackend {
             rope_pipeline,
             argmax_pipeline,
             moe_topk_pipeline,
+            router_matvec_pipeline,
             moe_gather_pipeline,
             sum_rows_pipeline,
             gemv_q4_k_split3_pipeline,
@@ -3128,6 +3154,47 @@ impl VulkanBackend {
     ///
     /// The ids stay in device memory for [`Self::moe_gather`]; nothing about the
     /// routing decision round-trips to the host.
+    /// One F32 router matvec: `y[n] = W[n, k] @ x[k]`.
+    ///
+    /// `W` is row-major `[n, k]`, the router tensor's native GGUF layout, and
+    /// the activation is a single row (routing is decided per decoded token).
+    pub fn router_matvec(&self, x: &Tensor, w_raw: &Tensor, n: usize) -> Result<Tensor> {
+        let k = x.numel();
+        if k == 0 || n == 0 || w_raw.numel() != n * k {
+            return Err(VulkanError::ShapeMismatch {
+                op: "router_matvec".into(),
+                lhs: vec![w_raw.numel()],
+                rhs: vec![n * k],
+            });
+        }
+        let x_buf =
+            KoreVulkanBuffer::from_storage(x.storage_ref(), x.shape().dims(), &self.device, &self.queue)?;
+        let w_buf = KoreVulkanBuffer::from_storage(
+            w_raw.storage_ref(),
+            w_raw.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let out_bytes = (n * std::mem::size_of::<f32>()).max(4);
+        let y_buffer =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_router_matvec_out");
+        let uniforms = RouterUniforms {
+            n: n as u32,
+            k: k as u32,
+            _pad0: 0,
+            _pad1: 0,
+        };
+        self.record_dispatch(
+            &self.router_matvec_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
+            (n as u32, 1, 1),
+            "router_matvec_pass",
+        );
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![1, n]);
+        Ok(self.make_tensor(y_kore_buf, &[1, n]))
+    }
+
     pub fn moe_topk(&self, logits: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
         let n = logits.numel();
         if k == 0 || k > 16 {
@@ -3141,6 +3208,11 @@ impl VulkanBackend {
                 lhs: vec![n],
                 rhs: vec![1],
             });
+        }
+        if n > 1024 {
+            return Err(VulkanError::UnsupportedOperation(
+                "moe_topk: at most 1024 experts".into(),
+            ));
         }
         let logits_buf = KoreVulkanBuffer::from_storage(
             logits.storage_ref(),
@@ -5426,6 +5498,16 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
 
     fn argmax_last_dim(&self, logits: &Tensor) -> kore_core::Result<Vec<u32>> {
         self.argmax_last_dim(logits)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn router_matvec(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        n: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.router_matvec(x, w, n)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 

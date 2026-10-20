@@ -824,13 +824,13 @@ fn top_k_experts(probs: &[f32], k: usize) -> Vec<(usize, f32)> {
     order[..k].iter().map(|&e| (e, probs[e] * inv)).collect()
 }
 
-/// The router weight in the `[hidden, n_experts]` row-major layout the device
-/// `matmul` expects.
+/// The router weights in their native `[n, k]` row-major layout.
 ///
-/// GGUF stores `[hidden, n_experts]` with the hidden axis contiguous, which is
-/// the transpose of a row-major matrix. `n_experts == 1` (the shared-expert
-/// gate) is its own transpose, so the same helper covers both.
-fn router_transposed(w: &QW) -> Result<Vec<f32>> {
+/// The GGUF router is already `[n_experts, hidden]` with each expert's row
+/// contiguous; that is exactly what [`DeviceBackend::router_matvec`] wants.
+/// Transposing it (as the generic GEMV requires) made every weight read stride
+/// a whole expert row and cost more than the rest of the layer.
+fn router_rows(w: &QW) -> Result<Vec<f32>> {
     if !matches!(w.kind, QKind::F32) {
         return Err(err(&format!(
             "device routing needs an F32 router, got {:?} ('{}')",
@@ -846,12 +846,16 @@ fn router_transposed(w: &QW) -> Result<Vec<f32>> {
             bytes.len()
         )));
     }
-    let mut out = vec![0.0f32; m * n];
+    let mut out = Vec::with_capacity(m * n);
     for i in 0..n {
         for k in 0..m {
             let off = (i * m + k) * 4;
-            out[k * n + i] =
-                f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+            out.push(f32::from_le_bytes([
+                bytes[off],
+                bytes[off + 1],
+                bytes[off + 2],
+                bytes[off + 3],
+            ]));
         }
     }
     Ok(out)
@@ -1901,10 +1905,10 @@ struct ResidentMoe {
     gate_kind: QKind,
     up_kind: QKind,
     down_kind: QKind,
-    /// `[hidden, n_experts]` F32, transposed from the GGUF layout.
-    router_t: Tensor,
-    /// `[hidden, 1]` F32 -- its own transpose.
-    shexp_router_t: Tensor,
+    /// `[n_experts, hidden]` F32, the GGUF row-major layout.
+    router_w: Tensor,
+    /// `[1, hidden]` F32.
+    shexp_router_w: Tensor,
     /// A one-element tensor of ones, so `sigmoid_mul` reads as `sigmoid`.
     ones: Tensor,
 }
@@ -2454,13 +2458,13 @@ impl Qwen35Gpu {
                         let (up, up_per) = upload_bank(&m.up, m.n_experts, &*backend, device)?;
                         let (down, down_per) =
                             upload_bank(&m.down, m.n_experts, &*backend, device)?;
-                        let router = router_transposed(&m.router)?;
-                        let router_t = Tensor::from_f32(&router, &[m.router.m, m.router.n])
+                        let router = router_rows(&m.router)?;
+                        let router_w = Tensor::from_f32(&router, &[m.router.n, m.router.m])
                             .to(device)
                             .map_err(|e| err(&format!("router upload: {e}")))?;
-                        let shexp = router_transposed(&m.shexp_router)?;
-                        let shexp_router_t =
-                            Tensor::from_f32(&shexp, &[m.shexp_router.m, m.shexp_router.n])
+                        let shexp = router_rows(&m.shexp_router)?;
+                        let shexp_router_w =
+                            Tensor::from_f32(&shexp, &[m.shexp_router.n, m.shexp_router.m])
                                 .to(device)
                                 .map_err(|e| err(&format!("shared router upload: {e}")))?;
                         let ones = Tensor::from_f32(&[1.0], &[1])
@@ -2476,8 +2480,8 @@ impl Qwen35Gpu {
                             gate_kind: m.gate.kind,
                             up_kind: m.up.kind,
                             down_kind: m.down.kind,
-                            router_t,
-                            shexp_router_t,
+                            router_w,
+                            shexp_router_w,
                             ones,
                         })
                     } else {
@@ -3121,7 +3125,7 @@ impl Qwen35Gpu {
         let cfg = &self.cfg;
         let n_used = m.n_used;
 
-        let logits = b.matmul(ht, &r.router_t)?;
+        let logits = b.router_matvec(ht, &r.router_w, m.n_experts)?;
         let (idx, weights) = b.moe_topk(&logits, n_used)?;
 
         if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
@@ -3197,7 +3201,7 @@ impl Qwen35Gpu {
         )?;
         let down_sum = b.sum_rows(&down_all, n_used, m.ffn_cols)?;
 
-        let sg = b.matmul(ht, &r.shexp_router_t)?;
+        let sg = b.router_matvec(ht, &r.shexp_router_w, 1)?;
         // `sigmoid_mul(a, b)` is `a * sigmoid(b)`, so the ones tensor is the
         // multiplier and the router logit is the gate.
         let gs = b.sigmoid_mul(&r.ones, &sg)?;

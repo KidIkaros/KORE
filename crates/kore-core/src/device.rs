@@ -878,6 +878,22 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// F32 router matvec over a row-major `[n, k]` matrix: `y = W @ x`.
+    ///
+    /// This is the native router layout; [`Self::matmul`] wants it transposed,
+    /// which turns every weight read into a cache-line-per-float stream.
+    fn router_matvec(
+        &self,
+        _x: &crate::Tensor,
+        _w: &crate::Tensor,
+        _n: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "router_matvec not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Device-side router top-k: `logits[n]` -> (`idx[k]` as f32, `w[k]`), no readback.
     fn moe_topk(
         &self,
