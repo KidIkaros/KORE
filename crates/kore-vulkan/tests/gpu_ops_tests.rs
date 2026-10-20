@@ -2231,6 +2231,55 @@ fn test_vulkan_gdn_step_groups_key_heads_by_tiling() {
     assert!(any_nonzero(sg.as_f32_slice().unwrap()));
 }
 
+/// `moe_topk_gate` must pick the same experts and weights as `moe_topk` on the
+/// routed logits, and its gate must be the same value the `sigmoid_mul` pass
+/// produced from the appended router row.
+#[test]
+fn test_vulkan_moe_topk_gate_matches_topk_plus_sigmoid() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let dev = kore_core::Device::Vulkan(0);
+    let n = 24usize;
+    let k = 5usize;
+    // A clear ordering with distinct gaps, plus the shared-expert logit last.
+    let mut logits: Vec<f32> = (0..n).map(|i| ((i * 37) % n) as f32 * 0.25 - 3.0).collect();
+    let gate_logit = 0.731f32;
+    logits.push(gate_logit);
+
+    let routed = Tensor::from_f32(&logits[..n], &[n]).to(dev).unwrap();
+    let with_gate = Tensor::from_f32(&logits, &[n + 1]).to(dev).unwrap();
+    let (idx_ref, w_ref) = backend.moe_topk(&routed, k).expect("moe_topk");
+    let (idx, w, gs) = backend
+        .moe_topk_gate(&with_gate, n, k, n)
+        .expect("moe_topk_gate");
+
+    let to_cpu = |t: &Tensor| {
+        t.to(kore_core::Device::Cpu)
+            .unwrap()
+            .as_f32_slice()
+            .unwrap()
+            .to_vec()
+    };
+    assert_eq!(to_cpu(&idx), to_cpu(&idx_ref), "picks differ");
+    assert_eq!(to_cpu(&w), to_cpu(&w_ref), "weights differ");
+
+    // The gate is the same dispatch the elementwise pass used to run.
+    let one = Tensor::from_f32(&[gate_logit], &[1]).to(dev).unwrap();
+    let ones = Tensor::from_f32(&[1.0f32], &[1]).to(dev).unwrap();
+    let want = to_cpu(&backend.sigmoid_mul(&ones, &one).unwrap());
+    let got = to_cpu(&gs);
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        got[0].to_bits(),
+        want[0].to_bits(),
+        "gate: got {} want {}",
+        got[0],
+        want[0]
+    );
+}
+
 /// True when at least one entry is finite and non-zero -- so a comparison of
 /// two "all zeros because the kernel never ran" results cannot pass silently.
 fn any_nonzero(x: &[f32]) -> bool {

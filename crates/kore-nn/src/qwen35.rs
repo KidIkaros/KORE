@@ -1905,12 +1905,10 @@ struct ResidentMoe {
     gate_kind: QKind,
     up_kind: QKind,
     down_kind: QKind,
-    /// `[n_experts, hidden]` F32, the GGUF row-major layout.
+    /// Routed router rows followed by the shared expert's row, so one matvec
+    /// feeds both the top-k and the shared gate.
     router_w: Tensor,
-    /// `[1, hidden]` F32.
-    shexp_router_w: Tensor,
-    /// A one-element tensor of ones, so `sigmoid_mul` reads as `sigmoid`.
-    ones: Tensor,
+    n_routed: usize,
 }
 
 /// The routed FFN on the device.
@@ -2458,18 +2456,20 @@ impl Qwen35Gpu {
                         let (up, up_per) = upload_bank(&m.up, m.n_experts, &*backend, device)?;
                         let (down, down_per) =
                             upload_bank(&m.down, m.n_experts, &*backend, device)?;
-                        let router = router_rows(&m.router)?;
-                        let router_w = Tensor::from_f32(&router, &[m.router.n, m.router.m])
-                            .to(device)
-                            .map_err(|e| err(&format!("router upload: {e}")))?;
-                        let shexp = router_rows(&m.shexp_router)?;
-                        let shexp_router_w =
-                            Tensor::from_f32(&shexp, &[m.shexp_router.n, m.shexp_router.m])
+                        let mut router = router_rows(&m.router)?;
+                        let n_routed = m.router.n;
+                        if m.shexp_router.m != m.router.m {
+                            return Err(err("shared router width differs from the routed router"));
+                        }
+                        // Append the shared expert's router row: `moe_topk_gate`
+                        // reads the top-k from the first `n_routed` and its gate
+                        // from the row after them, so the layer's two router
+                        // matvecs become one.
+                        router.extend(router_rows(&m.shexp_router)?);
+                        let router_w =
+                            Tensor::from_f32(&router, &[n_routed + m.shexp_router.n, m.router.m])
                                 .to(device)
-                                .map_err(|e| err(&format!("shared router upload: {e}")))?;
-                        let ones = Tensor::from_f32(&[1.0], &[1])
-                            .to(device)
-                            .map_err(|e| err(&format!("ones upload: {e}")))?;
+                                .map_err(|e| err(&format!("router upload: {e}")))?;
                         Some(ResidentMoe {
                             gate,
                             up,
@@ -2481,8 +2481,7 @@ impl Qwen35Gpu {
                             up_kind: m.up.kind,
                             down_kind: m.down.kind,
                             router_w,
-                            shexp_router_w,
-                            ones,
+                            n_routed,
                         })
                     } else {
                         None
@@ -3133,8 +3132,8 @@ impl Qwen35Gpu {
         let cfg = &self.cfg;
         let n_used = m.n_used;
 
-        let logits = b.router_matvec(ht, &r.router_w, m.n_experts)?;
-        let (idx, weights) = b.moe_topk(&logits, n_used)?;
+        let logits = b.router_matvec(ht, &r.router_w, r.n_routed + 1)?;
+        let (idx, weights, gs) = b.moe_topk_gate(&logits, r.n_routed, n_used, r.n_routed)?;
 
         if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
             use std::sync::Once;
@@ -3221,10 +3220,6 @@ impl Qwen35Gpu {
         // Shared expert: always evaluated, gated by `sigmoid` of its own row.
         // It does not depend on the routed experts, so it is computed first and
         // its output folded into the `down` reduction below.
-        let sg = b.router_matvec(ht, &r.shexp_router_w, 1)?;
-        // `sigmoid_mul(a, b)` is `a * sigmoid(b)`, so the ones tensor is the
-        // multiplier and the router logit is the gate.
-        let gs = b.sigmoid_mul(&r.ones, &sg)?;
         let sgate = self.wgemv(&m.shexp_gate, ht)?;
         let sup = self.wgemv(&m.shexp_up, ht)?;
         let ssigns = self.signs_or_placeholder(cfg.shexp_ffn)?;

@@ -210,8 +210,8 @@ struct ArgmaxUniforms {
 struct MoeTopkUniforms {
     n: u32,
     k: u32,
-    _pad0: u32,
-    _pad1: u32,
+    gate_row: u32,
+    has_gate: u32,
 }
 
 #[repr(C)]
@@ -3200,7 +3200,40 @@ impl VulkanBackend {
     }
 
     pub fn moe_topk(&self, logits: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
-        let n = logits.numel();
+        let (idx, w, _gate) = self.moe_topk_impl(logits, logits.numel(), k, None)?;
+        Ok((idx, w))
+    }
+
+    /// Top-k plus the shared expert's gate, in one dispatch.
+    ///
+    /// `logits` holds `n` routed logits followed by the shared expert's router
+    /// row (the caller appends it to the router matrix). The gate is the same
+    /// `1/(1+exp(-x))` the `sigmoid_mul` pass computed, so the shared expert's
+    /// input is unchanged while a matvec and an elementwise pass disappear.
+    pub fn moe_topk_gate(
+        &self,
+        logits: &Tensor,
+        n: usize,
+        k: usize,
+        gate_row: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        if gate_row >= logits.numel() {
+            return Err(VulkanError::ShapeMismatch {
+                op: "moe_topk_gate gate row".into(),
+                lhs: vec![gate_row],
+                rhs: vec![logits.numel()],
+            });
+        }
+        self.moe_topk_impl(logits, n, k, Some(gate_row))
+    }
+
+    fn moe_topk_impl(
+        &self,
+        logits: &Tensor,
+        n: usize,
+        k: usize,
+        gate_row: Option<usize>,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         if k == 0 || k > 16 {
             return Err(VulkanError::UnsupportedOperation(
                 "moe_topk: k must be in 1..=16".into(),
@@ -3218,6 +3251,13 @@ impl VulkanBackend {
                 "moe_topk: at most 1024 experts".into(),
             ));
         }
+        if logits.numel() < n {
+            return Err(VulkanError::ShapeMismatch {
+                op: "moe_topk logits".into(),
+                lhs: vec![logits.numel()],
+                rhs: vec![n],
+            });
+        }
         let logits_buf = KoreVulkanBuffer::from_storage(
             logits.storage_ref(),
             logits.shape().dims(),
@@ -3227,17 +3267,18 @@ impl VulkanBackend {
         let out_bytes = (k * std::mem::size_of::<f32>()).max(4);
         let idx_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_moe_topk_idx");
         let w_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_moe_topk_w");
+        let gate_buf = crate::buffer::alloc_storage_buffer(&self.device, 4, "kore_moe_topk_gate");
 
         let uniforms = MoeTopkUniforms {
             n: n as u32,
             k: k as u32,
-            _pad0: 0,
-            _pad1: 0,
+            gate_row: gate_row.unwrap_or(0) as u32,
+            has_gate: u32::from(gate_row.is_some()),
         };
         self.record_dispatch(
             &self.moe_topk_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[logits_buf.arc_buffer(), &idx_buf, &w_buf],
+            &[logits_buf.arc_buffer(), &idx_buf, &w_buf, &gate_buf],
             (1, 1, 1),
             "moe_topk_pass",
         );
@@ -3247,7 +3288,11 @@ impl VulkanBackend {
             &[k],
         );
         let w = self.make_tensor(KoreVulkanBuffer::new(w_buf, DType::F32, vec![k]), &[k]);
-        Ok((idx, w))
+        let gate = self.make_tensor(
+            KoreVulkanBuffer::new(gate_buf, DType::F32, vec![1]),
+            &[1],
+        );
+        Ok((idx, w, gate))
     }
 
     /// Device-side expert gather: `dst[s*per..] = bank[idx[idx_off+s]*per..]`.
@@ -5659,6 +5704,17 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         k: usize,
     ) -> kore_core::Result<(Tensor, Tensor)> {
         self.moe_topk(logits, k)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn moe_topk_gate(
+        &self,
+        logits: &Tensor,
+        n: usize,
+        k: usize,
+        gate_row: usize,
+    ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
+        self.moe_topk_gate(logits, n, k, gate_row)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 

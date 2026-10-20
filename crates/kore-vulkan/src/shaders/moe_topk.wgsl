@@ -15,14 +15,17 @@
 struct TopkUniforms {
     n: u32,
     k: u32,
-    _pad0: u32,
-    _pad1: u32,
+    /// Row of `logits` holding the shared expert's router logit.
+    gate_row: u32,
+    /// 1 = also emit `sigmoid(logits[gate_row])` into `gate_out`.
+    has_gate: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: TopkUniforms;
 @group(0) @binding(1) var<storage, read> logits: array<f32>;
 @group(0) @binding(2) var<storage, read_write> idx: array<f32>;
 @group(0) @binding(3) var<storage, read_write> w: array<f32>;
+@group(0) @binding(4) var<storage, read_write> gate_out: array<f32>;
 
 const NEG_INF: f32 = -3.402823466e38;
 const WG: u32 = 256u;
@@ -141,5 +144,12 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         let pr = exp(logits[e] - mx) * inv_total;
         idx[t] = f32(e);
         w[t] = pr * kept_v;
+    }
+
+    // The shared expert's gate rides in the same dispatch: its router row is
+    // appended to the routed router matrix, so one matvec feeds both the top-k
+    // and this sigmoid. Same expression the `sigmoid_mul` elementwise pass used.
+    if (p.has_gate != 0u && t == 0u) {
+        gate_out[0] = 1.0 / (1.0 + exp(-logits[p.gate_row]));
     }
 }

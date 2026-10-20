@@ -926,6 +926,25 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Top-k routing together with the shared expert's gate.
+    ///
+    /// `logits` holds `n` routed logits followed by the shared expert's router
+    /// row at `gate_row`; the gate is `sigmoid(logits[gate_row])`. Backends
+    /// that cannot fuse it still return the same three results.
+    fn moe_topk_gate(
+        &self,
+        logits: &crate::Tensor,
+        _n: usize,
+        k: usize,
+        gate_row: usize,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor, crate::Tensor)> {
+        let (idx, w) = self.moe_topk(logits, k)?;
+        let all = logits.to(crate::Device::Cpu)?;
+        let v = all.as_f32_slice().unwrap_or(&[])[gate_row];
+        let gs = crate::Tensor::from_f32(&[1.0 / (1.0 + (-v).exp())], &[1]);
+        Ok((idx, w, gs.to(logits.device())?))
+    }
+
     /// Device-side gather of `k` experts (`per` bytes each) out of a resident bank.
     fn moe_gather(
         &self,
