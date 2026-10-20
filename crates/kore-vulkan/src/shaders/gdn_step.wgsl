@@ -13,7 +13,10 @@ struct GdnStepUniforms {
 // Value head `hv` reads key head `hv % n_k` -- the key heads are *tiled* up to
 // the value head count, matching llama.cpp's `ggml_gated_delta_net`
 // (`iq1 = iv1 % neq1`).
-// state layout per head: s[j*d_v + i] = S[i][j]  (row j holds S[:, j])
+// State layout per head: s[i*d_v + j] = S[i][j]. Lane `j` walks i, so every
+// step of the three state sweeps reads/writes `i*d_v + j` -- consecutive lanes
+// touch consecutive words. The old transposed layout (`j*d_v + i`, one head row
+// per lane) strided lanes by 512 B and fetched a full sector per 4 B used.
 @group(0) @binding(0) var<uniform> params: GdnStepUniforms;
 @group(0) @binding(1) var<storage, read> qkv: array<f32>;        // conv+silu output
 @group(0) @binding(2) var<storage, read> z: array<f32>;          // [n_v*d_v] gate
@@ -77,26 +80,26 @@ fn main(
     let decay = exp(gate[hv]);
     let b = beta[hv];
 
-    // delta[j] = (v[j] - decay * (row_j . k)) * beta   (row_j = S[:, j] decayed)
+    // delta[j] = (v[j] - decay * (S[:, j] . k)) * beta, S decayed
     let j = tid;
     var dot = 0.0;
     for (var i = 0u; i < dv; i = i + 1u) {
-        dot += state[s_base + j * dv + i] * kq[i];
+        dot += state[s_base + i * dv + j] * kq[i];
     }
     kq[384u + j] = (kq[256u + j] - decay * dot) * b;
     workgroupBarrier();
 
-    // S[i][j] = decay * S[i][j] + k[i] * delta[j]; row j update
+    // S[i][j] = decay * S[i][j] + k[i] * delta[j]
     let dlt = kq[384u + j];
     for (var i = 0u; i < dv; i = i + 1u) {
-        let idx = s_base + j * dv + i;
+        let idx = s_base + i * dv + j;
         state[idx] = decay * state[idx] + kq[i] * dlt;
     }
 
     // out[j] = (S_new . q)[j] / sqrt(d_v)
     var acc = 0.0;
     for (var i = 0u; i < dv; i = i + 1u) {
-        acc += state[s_base + j * dv + i] * kq[128u + i];
+        acc += state[s_base + i * dv + j] * kq[128u + i];
     }
     let o = acc * inverseSqrt(f32(dv));
     workgroupBarrier();
