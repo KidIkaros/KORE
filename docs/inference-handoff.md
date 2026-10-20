@@ -440,6 +440,18 @@ the ratio moved for two reasons: the code got faster *and* the device lane is
 GPU-bound while the host lane is not, so a higher clock lifts the device arm
 more. The ablation below is the clock-independent evidence for the code cut.
 
+Current state, same protocol, `n=128`, `max_ctx` 160, three interleaved rounds
+at **sclk 1.64–1.83 GHz**, edge 52–57 °C:
+
+| arm | tok/s | ratio |
+|---|---|---|
+| host-routed | 14.02 / 14.19 / 14.00 | 1.00× |
+| device-routed | 55.90 / 55.77 / 56.82 | **3.99×** |
+
+Sustained (`n=400`, `max_ctx=512`): **58.19 / 58.61 tok/s** over 6.9 s at
+1.34 / 2.21 GHz. Peak VRAM is unchanged at ~15.6 GiB, because none of these
+changes touch residency.
+
 llama.cpp on the same file and card measured **80.25 tok/s**. The gap is now
 ~1.5× in the current state; it was 4.7× when this section was first written.
 
