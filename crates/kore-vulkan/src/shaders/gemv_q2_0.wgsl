@@ -185,40 +185,40 @@ fn main(
         let d33 = byte_deltas(ww3, 3u);
 
         // Column 0.
-        let xa0 = x[xi];
-        let xb0 = x[xi + 1u];
-        let xc0 = x[xi + 2u];
-        let xd0 = x[xi + 3u];
+        let xa0 = x[(m_base + 0u) * kv + xi];
+        let xb0 = x[(m_base + 0u) * kv + xi + 1u];
+        let xc0 = x[(m_base + 0u) * kv + xi + 2u];
+        let xd0 = x[(m_base + 0u) * kv + xi + 3u];
         if (row0 < n_len) { acc0.x += dd0 * dot_wide(d00, d01, d02, d03, xa0, xb0, xc0, xd0); }
         if (row1 < n_len) { acc1.x += dd1 * dot_wide(d10, d11, d12, d13, xa0, xb0, xc0, xd0); }
         if (row2 < n_len) { acc2.x += dd2 * dot_wide(d20, d21, d22, d23, xa0, xb0, xc0, xd0); }
         if (row3 < n_len) { acc3.x += dd3 * dot_wide(d30, d31, d32, d33, xa0, xb0, xc0, xd0); }
 
         if (m_rem > 1u) {
-            let xa1 = x[xi + kv];
-            let xb1 = x[xi + kv + 1u];
-            let xc1 = x[xi + kv + 2u];
-            let xd1 = x[xi + kv + 3u];
+            let xa1 = x[(m_base + 1u) * kv + xi];
+            let xb1 = x[(m_base + 1u) * kv + xi + 1u];
+            let xc1 = x[(m_base + 1u) * kv + xi + 2u];
+            let xd1 = x[(m_base + 1u) * kv + xi + 3u];
             if (row0 < n_len) { acc0.y += dd0 * dot_wide(d00, d01, d02, d03, xa1, xb1, xc1, xd1); }
             if (row1 < n_len) { acc1.y += dd1 * dot_wide(d10, d11, d12, d13, xa1, xb1, xc1, xd1); }
             if (row2 < n_len) { acc2.y += dd2 * dot_wide(d20, d21, d22, d23, xa1, xb1, xc1, xd1); }
             if (row3 < n_len) { acc3.y += dd3 * dot_wide(d30, d31, d32, d33, xa1, xb1, xc1, xd1); }
         }
         if (m_rem > 2u) {
-            let xa2 = x[xi + 2u * kv];
-            let xb2 = x[xi + 2u * kv + 1u];
-            let xc2 = x[xi + 2u * kv + 2u];
-            let xd2 = x[xi + 2u * kv + 3u];
+            let xa2 = x[(m_base + 2u) * kv + xi];
+            let xb2 = x[(m_base + 2u) * kv + xi + 1u];
+            let xc2 = x[(m_base + 2u) * kv + xi + 2u];
+            let xd2 = x[(m_base + 2u) * kv + xi + 3u];
             if (row0 < n_len) { acc0.z += dd0 * dot_wide(d00, d01, d02, d03, xa2, xb2, xc2, xd2); }
             if (row1 < n_len) { acc1.z += dd1 * dot_wide(d10, d11, d12, d13, xa2, xb2, xc2, xd2); }
             if (row2 < n_len) { acc2.z += dd2 * dot_wide(d20, d21, d22, d23, xa2, xb2, xc2, xd2); }
             if (row3 < n_len) { acc3.z += dd3 * dot_wide(d30, d31, d32, d33, xa2, xb2, xc2, xd2); }
         }
         if (m_rem > 3u) {
-            let xa3 = x[xi + 3u * kv];
-            let xb3 = x[xi + 3u * kv + 1u];
-            let xc3 = x[xi + 3u * kv + 2u];
-            let xd3 = x[xi + 3u * kv + 3u];
+            let xa3 = x[(m_base + 3u) * kv + xi];
+            let xb3 = x[(m_base + 3u) * kv + xi + 1u];
+            let xc3 = x[(m_base + 3u) * kv + xi + 2u];
+            let xd3 = x[(m_base + 3u) * kv + xi + 3u];
             if (row0 < n_len) { acc0.w += dd0 * dot_wide(d00, d01, d02, d03, xa3, xb3, xc3, xd3); }
             if (row1 < n_len) { acc1.w += dd1 * dot_wide(d10, d11, d12, d13, xa3, xb3, xc3, xd3); }
             if (row2 < n_len) { acc2.w += dd2 * dot_wide(d20, d21, d22, d23, xa3, xb3, xc3, xd3); }

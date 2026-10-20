@@ -126,11 +126,12 @@ enum Head {
     Every,
 }
 
-/// The widest batch any pass can feed the ternary GEMV: its accumulator keeps
-/// four columns live per workgroup (`grid.y = ceil(m / 4)`).
-pub const MAX_BATCH_COLS: usize = 4;
+/// The widest batch any pass can feed the ternary GEMV. A workgroup's
+/// accumulator keeps four columns live (`grid.y = ceil(m / 4)`), and the
+/// backend accepts up to two such row groups.
+pub const MAX_BATCH_COLS: usize = 8;
 
-/// Prefill chunk width: the ternary GEMV's four-column accumulator.
+/// Prefill chunk width: the ternary GEMV's column width.
 const PREFILL_CHUNK: usize = MAX_BATCH_COLS;
 
 #[derive(Debug, Clone)]

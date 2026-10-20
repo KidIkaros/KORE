@@ -2189,10 +2189,14 @@ impl VulkanBackend {
 
     /// Copy every element of `src` into `dst`, in place, on the GPU.
     ///
-    /// A full-tensor memcpy -- the same elementwise `copy_offset` dispatch
-    /// [`Self::scatter_row`] uses, with both offsets at zero. It exists because a
-    /// recurrent state (`gdn_step`) is updated **in place**, so a caller that
-    /// needs to keep the value it had before a batch has to take a real copy.
+    /// A full-tensor memcpy. It exists because a recurrent state (`gdn_step`)
+    /// is updated **in place**, so a caller that needs to keep the value it had
+    /// before a batch has to take a real copy.
+    ///
+    /// This is recorded as a buffer-to-buffer copy, not an elementwise
+    /// dispatch. A verify pass snapshots the state once per layer per column --
+    /// ~240 copies on a fired step -- and as dispatches that cost ~30 us each,
+    /// putting ~7 ms into every speculative step.
     pub fn copy_buffer(&self, dst: &Tensor, src: &Tensor) -> Result<()> {
         let numel = dst.numel();
         if src.numel() != numel {
@@ -2205,10 +2209,13 @@ impl VulkanBackend {
         if numel == 0 {
             return Ok(());
         }
-        if numel > u32::MAX as usize {
-            return Err(VulkanError::UnsupportedOperation(
-                "copy_buffer: numel exceeds the u32 index space".into(),
-            ));
+        let bytes = dst.dtype().storage_bytes(numel);
+        if src.dtype().storage_bytes(numel) != bytes {
+            return Err(VulkanError::ShapeMismatch {
+                op: "copy_buffer dtype".into(),
+                lhs: vec![bytes],
+                rhs: vec![src.dtype().storage_bytes(numel)],
+            });
         }
         let dst_buf = KoreVulkanBuffer::from_storage(
             dst.storage_ref(),
@@ -2222,28 +2229,12 @@ impl VulkanBackend {
             &self.device,
             &self.queue,
         )?;
-
-        let uniforms = ElementwiseUniforms {
-            numel: numel as u32,
-            op_type: 8,
-            scalar: 0.0,
-            a_numel: numel as u32,
-            b_numel: numel as u32,
-            _pad0: 0,
-            _pad1: 0,
-            _pad2: 0,
-        };
-        let workgroups = (numel as u32).div_ceil(256);
-        self.record_dispatch(
-            &self.elementwise_pipeline,
-            bytemuck::bytes_of(&uniforms),
-            &[
-                src_buf.arc_buffer(),
-                src_buf.arc_buffer(),
-                dst_buf.arc_buffer(),
-            ],
-            (workgroups, 1, 1),
-            "copy_buffer_pass",
+        self.record_copy(
+            src_buf.arc_buffer(),
+            0,
+            dst_buf.arc_buffer(),
+            0,
+            bytes as u64,
         );
         Ok(())
     }
@@ -4555,9 +4546,9 @@ impl VulkanBackend {
                 rhs: vec![w_off_bytes + need],
             });
         }
-        if m > 4 {
+        if m > 8 {
             return Err(VulkanError::UnsupportedOperation(
-                "gemv_q2_0 supports up to 4 rows".into(),
+                "gemv_q2_0 supports up to 8 rows".into(),
             ));
         }
 

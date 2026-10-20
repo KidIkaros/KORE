@@ -54,13 +54,19 @@ struct Trigger {
 }
 
 /// One walk of the recorded stream under one trigger.
+/// Widest verify pass the ternary GEMV accepts (two four-column groups).
+const MAX_M: usize = 8;
+/// `hist` index for a step that did not fire.
+const MISS: usize = MAX_M;
+
 struct Walk {
     steps: usize,
     fires: usize,
     drafts: usize,
     accepted: usize,
     emitted: usize,
-    hist: [usize; 5], // index 0..=3 by accepted-prefix length, 4 = missed
+    /// Indexed by accepted-prefix length; `MISS` counts non-firing steps.
+    hist: [usize; MAX_M + 1],
     ms: f64,
 }
 
@@ -70,7 +76,7 @@ fn walk(
     k: usize,
     max_len: usize,
     t: &Trigger,
-    step_ms: &[f64; 5],
+    step_ms: &[f64; MAX_M + 1],
 ) -> Walk {
     let mut w = Walk {
         steps: 0,
@@ -78,7 +84,7 @@ fn walk(
         drafts: 0,
         accepted: 0,
         emitted: 0,
-        hist: [0; 5],
+        hist: [0; MAX_M + 1],
         ms: 0.0,
     };
     let mut p = start;
@@ -103,7 +109,7 @@ fn walk(
             w.emitted += 1 + j;
             p += 1 + j;
         } else {
-            w.hist[4] += 1;
+            w.hist[MISS] += 1;
             w.ms += step_ms[1];
             w.emitted += 1;
             p += 1;
@@ -184,12 +190,12 @@ fn main() {
     let ctx0 = 256usize;
     let n_calls = 32usize;
     let mut timing: Vec<u32> = Vec::new();
-    while timing.len() < ctx0 + n_calls * 4 + 8 {
+    while timing.len() < ctx0 + n_calls * MAX_M + 8 {
         timing.extend_from_slice(&all);
     }
-    let mut step_ms = [0.0f64; 5];
+    let mut step_ms = [0.0f64; MAX_M + 1];
     {
-        let widths = [1usize, 2, 3, 4];
+        let widths: Vec<usize> = (1..=MAX_M).collect();
         let mut samples: Vec<Vec<f64>> = vec![Vec::new(); widths.len()];
         let run = |m: usize, st: &mut Vec<GpuState>, pos: &mut usize| -> f64 {
             let t = Instant::now();
@@ -277,12 +283,20 @@ fn main() {
         "=== drafter replay over {} recorded positions (max_len={max_len}) ===",
         all.len().saturating_sub(n_prefill)
     );
+    let hist_header = {
+        let mut h = String::from("P(j)=");
+        for j in 0..MAX_M {
+            h.push_str(&format!("{j}/"));
+        }
+        h.push_str("miss");
+        h
+    };
     println!(
-        "  {:>2} {:<6} {:>6} {:>6} {:>6}  {:<20} {:>9} {:>8}",
-        "k", "trig", "fire%", "acc%", "P(j>=2)", "P(j)=0/1/2/3/miss", "ms/token", "vs base"
+        "  {:>2} {:<6} {:>6} {:>6} {:>6}  {:<24} {:>9} {:>8}",
+        "k", "trig", "fire%", "acc%", "P(j>=2)", hist_header, "ms/token", "vs base"
     );
     let mut best = (0.0f64, 0usize, String::new());
-    for k in [1usize, 2, 3] {
+    for k in 1..=MAX_M - 1 {
         for t in &triggers {
             if t.min_drafts > k {
                 continue;
@@ -294,18 +308,15 @@ fn main() {
             if ratio > best.0 {
                 best = (ratio, k, t.name.to_string());
             }
+            let hist: Vec<String> = agg.hist.iter().map(|v| v.to_string()).collect();
             println!(
-                "  {:>2} {:<6} {:>5.1}% {:>5.1}% {:>5.0}%  {}/{}/{}/{}/{}          {:>8.3} {:>7.2}x",
+                "  {:>2} {:<6} {:>5.1}% {:>5.1}% {:>5.0}%  {:<24} {:>8.3} {:>7.2}x",
                 k,
                 t.name,
                 100.0 * agg.fires as f64 / agg.steps.max(1) as f64,
                 100.0 * agg.accepted as f64 / agg.drafts.max(1) as f64,
                 100.0 * (p(2) + p(3)),
-                agg.hist[0],
-                agg.hist[1],
-                agg.hist[2],
-                agg.hist[3],
-                agg.hist[4],
+                hist.join("/"),
                 ms_tok,
                 ratio,
             );

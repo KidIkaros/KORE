@@ -62,13 +62,19 @@ pub struct DraftPolicy {
 }
 
 impl Default for DraftPolicy {
-    /// `k = 3`, `min_match = 4`: the best measured operating point on this box
-    /// (1.31x on a coherent story continuation, 94% of drafts accepted, 29% of
-    /// steps fired). `k` alone is capped below.
+    /// `k = 6`, `min_match = 6`: the best measured operating point on this box.
+    ///
+    /// With the GEMV widened to eight columns, the useful draft depth is set by
+    /// how far a match usually runs, not by the kernel. Measured on Bonsai-2B
+    /// (192 tokens, interleaved rounds): on repetitive text `6:6` reads 1.57x
+    /// greedy against 1.54x for the old `3:4`, and on prose 1.37x against 1.35x.
+    /// Lowering `min_match` to 1 buys more on repetition (1.62x) but loses on
+    /// prose (1.18x), so the conservative trigger is the shipped default. `k`
+    /// is capped below.
     fn default() -> Self {
         Self {
-            k: MAX_BATCH_COLS - 1,
-            min_match: 4,
+            k: 6,
+            min_match: 6,
             max_match: 16,
             search_back: 16384,
             guard: true,
@@ -323,6 +329,12 @@ impl Qwen35Gpu {
         let mut out: Vec<u32> = Vec::with_capacity(n_new);
         let mut hist: Vec<u32> = tokens.to_vec();
         let mut pos = tokens.len();
+        // Split the fired-step cost into the pass and the truncation copy, so a
+        // profiling run can say which one the loop is paying for.
+        let profile = std::env::var_os("KORE_SPEC_PROFILE").is_some();
+        let mut verify_ms = 0.0f64;
+        let mut rewind_ms = 0.0f64;
+        let mut rewinds = 0usize;
         let mut next = if tokens.is_empty() {
             0
         } else {
@@ -358,6 +370,9 @@ impl Qwen35Gpu {
             batch.extend_from_slice(&drafts);
             let t = Instant::now();
             let outs = self.forward_verify(cpu, &batch, pos, &mut states, &mut arena)?;
+            if profile {
+                verify_ms += t.elapsed().as_secs_f64() * 1e3;
+            }
 
             // Longest prefix of drafts the model reproduced.
             let j = drafts
@@ -366,7 +381,12 @@ impl Qwen35Gpu {
                 .take_while(|(d, o)| *d == *o)
                 .count();
             if j < drafts.len() {
+                let tr = Instant::now();
                 self.rewind(&mut states, &arena, 1 + j)?;
+                if profile {
+                    rewind_ms += tr.elapsed().as_secs_f64() * 1e3;
+                    rewinds += 1;
+                }
             }
             // Timed through the rewind: a fire that gets cut short really does
             // spend that copy, and the guard must see it.
@@ -392,6 +412,17 @@ impl Qwen35Gpu {
             }
             next = outs[j];
             pos += 1 + j;
+        }
+        if profile {
+            eprintln!(
+                "spec profile: verify {:.1} ms over {} fires ({:.2} ms/fire), rewind {:.1} ms over {} cuts ({:.2} ms/cut)",
+                verify_ms,
+                stats.fired,
+                verify_ms / stats.fired.max(1) as f64,
+                rewind_ms,
+                rewinds,
+                rewind_ms / rewinds.max(1) as f64,
+            );
         }
         out.truncate(n_new);
         Ok((out, stats))
@@ -489,6 +520,15 @@ mod tests {
         };
         assert_eq!(fire(5), vec![6, 1, 2], "a 5-gram match fires");
         assert_eq!(fire(6), Vec::<u32>::new(), "a 6-gram match does not exist");
+    }
+
+    #[test]
+    fn the_default_policy_already_fits_the_widest_pass() {
+        let p = DraftPolicy::default();
+        let c = p.clamped();
+        assert_eq!(c.k, p.k, "default k must fit the verify width");
+        assert_eq!(c.min_match, p.min_match);
+        assert!(p.k + 1 <= MAX_BATCH_COLS);
     }
 
     #[test]
