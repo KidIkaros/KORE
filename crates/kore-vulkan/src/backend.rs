@@ -561,7 +561,29 @@ struct QkNormRopeUniforms {
 /// 280 ms -> 69 ms per 8 tokens but the queue drain (`download`) rises by the
 /// same 210 ms, because that time is the GPU's work surfacing earlier, not time
 /// the host was wasting. The sum is flat to within the run-to-run spread.
+///
+/// Lowering it does not help either (`KORE_BATCH_OPS`, `KORE_STEP_PROFILE`,
+/// 64 greedy tokens): 8 -> 14.78 ms/step, 16 -> 14.41, 24 -> 14.31,
+/// 48 -> 14.24, 96 -> 14.31. Finer chunks do start the GPU earlier -- the queue
+/// drain falls from 9.05 to 6.33 ms at 8 -- but the host encode rises by more
+/// (5.07 -> 8.40 ms), because each extra submit costs ~0.4 ms of driver work.
+/// 48 is the measured optimum, not a guess.
 const BATCH_OPS: usize = 48;
+
+/// `BATCH_OPS`, overridable for measurement. Each submit lets the GPU start on
+/// what is already recorded while the host keeps encoding, so the threshold
+/// trades submit overhead against serial host time; 48 was picked by hand before
+/// this knob existed.
+fn batch_ops() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("KORE_BATCH_OPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(BATCH_OPS)
+    })
+}
 
 struct QueuedDispatch {
     pipeline: Arc<wgpu::ComputePipeline>,
@@ -1449,7 +1471,7 @@ impl VulkanBackend {
             return;
         }
         let mut batch = self.batch.lock();
-        if batch.ops.len() >= BATCH_OPS {
+        if batch.ops.len() >= batch_ops() {
             if let Some(enc) = batch.take_encoder(&self.device) {
                 crate::buffer::submit_with_reclaim(&self.queue, enc);
             }
@@ -1534,7 +1556,7 @@ impl VulkanBackend {
         size: u64,
     ) {
         let mut batch = self.batch.lock();
-        if batch.ops.len() >= BATCH_OPS {
+        if batch.ops.len() >= batch_ops() {
             if let Some(enc) = batch.take_encoder(&self.device) {
                 crate::buffer::submit_with_reclaim(&self.queue, enc);
             }
