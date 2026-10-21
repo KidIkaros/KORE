@@ -580,6 +580,7 @@ no longer launch-bound; it is spread across GDN, attention and the MoE matvecs.
 | **Sparse attention (DSA / CSA / CSA2)** | Not applicable, and not worth it here even if it were free. All three are pretraining changes a frozen GGUF cannot adopt; attention costs at most ~0.9 ms in a ~16 ms step, and the step is only 0.6 ms slower at 8K tokens than at 96, because only 10 of 40 layers attend and they keep 2 KV heads (~11 KB/token). Mechanisms and the spec-decode interaction: `docs/research-sparse-attention.md`. |
 | **Pre-batch snapshot + replay instead of per-column snapshots** | Not worth it. `copy_buffer` now records a real buffer copy, so the per-column snapshots cost 1.15 ms per fired step, and the 6 cut steps in 192 tokens rewind in 0.19 ms each. |
 | **Two heads per `gdn_step` workgroup** (256 lanes, 8 warps) | Slower: loop greedy 60.8/61.3 → 59.9/60.1, spec 101.7/101.9 → 99.7/99.5 (−2.1 %), prose −0.9 %. Bit-exact (device ids unchanged). This was the wrong shape: 16 workgroups of 256 left half the CUs idle, so it never tested the chain. Splitting each sweep's *rows* across two groups keeps 32 workgroups and halves the chain -- that is the win recorded above (+7.6 % greedy, +12.4 % loop spec). |
+| **Routed gate+up fusion** (one dispatch over one `[gate \| up]` bank) | Built, bit-correct, **rejected**: greedy 59.2 → 25.4 tok/s (14.2 → 35.9 ms/step). It did save exactly the 40 dispatches it promised (823 → 783) and 64 device tokens stayed identical to the host lane, so the split uniforms and the `idx` mapping are right. The cause is the **168 MiB contiguous bank**, not the kernel: two 4096-row dispatches over the pair buffer are as slow (36.1 ms) as one 8192-row dispatch (36.3 ms), while the same two over separate 84 MiB buffers are fast (14.6 ms); zeroing `w2_off` and swapping the chunked upload for a single `upload_u8` change nothing. The 21.5 ms delta against 220 MB of weight reads per step is ~10 GB/s — the large allocation is read out of host-visible memory instead of VRAM. The dispatch-shape A/B also shows a merged 8192-row dispatch costs the *same* GPU time as two pipelined 4096-row ones, so the fusion could only ever have saved the launches (~0.24 ms host, ~0.12 ms GPU, ~1.6 %). Patch kept at `/tmp/opencode/gate_up_fusion_rejected.patch`; a two-binding variant (separate `gate`/`up` bindings chosen by `half`, no large allocation) is the only way this comes back. |
 | **Payoff-guard re-probe backoff** (16 → 32 → 64 plain steps) | Slower on the arm it was meant to fix: technical prose 66.5 → 64.8 tok/s. The fires it suppressed were winners -- `6:6:0` fires 24 times for 66.62 tok/s, the shipped guard 18 for 66.46, the backoff 12 for 64.77 -- because ~4.3 tokens per 52.5 ms pass beats ~14.7 ms per plain token. The 0.95× reading was the clock, not the guard (see the note under the regime table). Reverted. |
 
 ### Dense at the current state
@@ -819,25 +820,21 @@ stays the default and `7:6` is a loop-only choice.
    add~~ Done: `swiglu_rows` (mode-2 `row_scale`) and `sum_rows_add` (bias
    binding), 120 dispatches and +1.7 %. The host lane reads the same kernels but
    is bandwidth-bound, so its tok/s did not move (15.7 vs 15.7, `n=64`).
-4. **Fuse routed gate+up into one dispatch.** The census above is the argument:
-40 layers x 1 saved dispatch is ~0.25 ms of host encode and ~0.12 ms of GPU
-launch on its own, before the saved bank read. Worked out, not built: put both
-   projections in one buffer as `[all experts' gate | all experts' up]`, dispatch
-   `n = 2*n_used*F` rows with `rows_per_expert = F` and two extra uniforms
-   (`n_pos = n_used`, `w2_off = n_experts*expert_words`) so the upper half reads
-   the `up` region with the same `idx`, then SwiGLU with
-   `had_pre_at(a_stride = cols, b_off = n_used*F*cols)` -- no new kernel, no
-   packed-row interleave. The blocker is the load: one 6.8 GiB host `Vec` plus
-   the staging copy (`upload_u8` allocates twice) does not fit comfortably next
-   to the mmapped GGUF. It needs a chunked upload (`alloc_u8` + `write_u8_at`)
-   so the host peak is one chunk. 40 dispatches, ~0.7 ms.
+4. ~~**Fuse routed gate+up into one dispatch.**~~ **Measured and rejected.** The
+   census argument was right -- 40 dispatches, ~0.25 ms of host encode plus
+   ~0.12 ms of GPU launch -- but the layout it needs (one 168 MiB `[gate | up]`
+   bank, so the upper half can read the `up` slab with the same `idx`) is read
+   out of host-visible memory on this card and costs 21.5 ms/step, three times
+   the whole step. Details and the isolating A/Bs are in the rejected table
+   above. Do not rebuild the single-bank form; only a two-binding kernel (no
+   large allocation) could pay, and the shape test caps its upside at ~1.6 %.
 5. **Dispatch count is the binding cost on both sides** (823/step, 6.2 µs host
-   + ~13 µs GPU each). After the gate+up fusion the next candidates, in
-   decreasing size, are `had_pre` (171, but sequential -- fold it into the
-   neighbouring normalize/GEMV rather than trying to batch it), the
-   `router_matvec` + `moe_topk` pair (40 + 40, would need the router to run in
-   one workgroup so the top-k can stay in shared memory) and the three
-   `kv_append` dispatches per attended layer (30).
+   + ~13 µs GPU each). The remaining candidates, in decreasing size, are
+   `had_pre` (171, but sequential -- fold it into the neighbouring
+   normalize/GEMV rather than trying to batch it), the `router_matvec` +
+   `moe_topk` pair (40 + 40, would need the router to run in one workgroup so
+   the top-k can stay in shared memory) and the three `kv_append` dispatches per
+   attended layer (30).
 6. **Per-expert routing counters** for hot-set pinning on 8 GB cards
    (`KORE_MOE_RESIDENT=N` currently pins the first N, not the hottest N). See
    `docs/deepinfer-scaled-down.md` §3.
