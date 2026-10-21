@@ -285,6 +285,101 @@ fn test_vulkan_router_matvec_cols_matches_single_column() {
     }
 }
 
+/// A verify batch picks experts for every column in one dispatch. The column
+/// is `workgroup_id.y` and each column keeps its own sequential normaliser, so
+/// ids, weights and the shared gate must match one call per column exactly.
+#[test]
+fn test_vulkan_moe_topk_gate_cols_matches_single_column() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let cols = 4usize;
+    let n = 64usize;
+    let k = 8usize;
+    let stride = n + 1;
+    let logits: Vec<f32> = (0..cols * stride)
+        .map(|i| ((i * 37 % 101) as f32 - 50.0) / 13.0)
+        .collect();
+    let t = Tensor::from_f32(&logits, &[cols, stride]);
+
+    let (idx, w, g) = backend
+        .moe_topk_gate_cols(&t, n, k, n, cols, stride)
+        .expect("batched topk");
+    let idx = idx.to(kore_core::Device::Cpu).unwrap();
+    let w = w.to(kore_core::Device::Cpu).unwrap();
+    let g = g.to(kore_core::Device::Cpu).unwrap();
+    let (iv, wv, gv) = (
+        idx.as_f32_slice().unwrap(),
+        w.as_f32_slice().unwrap(),
+        g.as_f32_slice().unwrap(),
+    );
+    assert_eq!((iv.len(), wv.len(), gv.len()), (cols * k, cols * k, cols));
+
+    for c in 0..cols {
+        let row = Tensor::from_f32(&logits[c * stride..(c + 1) * stride], &[1, stride]);
+        let (i1, w1, g1) = backend.moe_topk_gate(&row, n, k, n).expect("single topk");
+        let i1 = i1.to(kore_core::Device::Cpu).unwrap();
+        let w1 = w1.to(kore_core::Device::Cpu).unwrap();
+        let g1 = g1.to(kore_core::Device::Cpu).unwrap();
+        assert_eq!(
+            &iv[c * k..(c + 1) * k],
+            i1.as_f32_slice().unwrap(),
+            "column {c} ids"
+        );
+        assert_eq!(
+            &wv[c * k..(c + 1) * k],
+            w1.as_f32_slice().unwrap(),
+            "column {c} weights"
+        );
+        assert_eq!(&gv[c..c + 1], g1.as_f32_slice().unwrap(), "column {c} gate");
+    }
+}
+
+/// Group `g` of the batch reduction must equal a single-group reduction over
+/// the same rows: the loop and the add are unchanged, only the base offset is.
+#[test]
+fn test_vulkan_sum_rows_add_groups_matches_single_group() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let groups = 3usize;
+    let rows = 4usize;
+    let n = 70usize;
+    let x: Vec<f32> = (0..groups * rows * n)
+        .map(|i| ((i * 13 % 97) as f32 - 48.0) / 7.0)
+        .collect();
+    let bias: Vec<f32> = (0..groups * n)
+        .map(|i| ((i * 5 % 31) as f32 - 15.0) / 9.0)
+        .collect();
+    let xt = Tensor::from_f32(&x, &[groups * rows, n]);
+    let bt = Tensor::from_f32(&bias, &[groups, n]);
+
+    let y = backend
+        .sum_rows_add_groups(&xt, rows, n, &bt, groups)
+        .expect("grouped sum")
+        .to(kore_core::Device::Cpu)
+        .unwrap();
+    let got = y.as_f32_slice().unwrap();
+    assert_eq!(got.len(), groups * n);
+
+    for g in 0..groups {
+        let xg = Tensor::from_f32(&x[g * rows * n..(g + 1) * rows * n], &[rows, n]);
+        let bg = Tensor::from_f32(&bias[g * n..(g + 1) * n], &[1, n]);
+        let yg = backend
+            .sum_rows_add(&xg, rows, n, &bg)
+            .expect("single sum")
+            .to(kore_core::Device::Cpu)
+            .unwrap();
+        assert_eq!(
+            &got[g * n..(g + 1) * n],
+            yg.as_f32_slice().unwrap(),
+            "group {g} must match the single-group reduction bit for bit"
+        );
+    }
+}
+
 #[test]
 fn test_vulkan_flash_decode_and_argmax() {
     let backend = match VulkanBackend::new() {

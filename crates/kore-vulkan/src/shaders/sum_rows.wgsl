@@ -9,7 +9,9 @@ struct SumRowsUniforms {
     /// When set, `bias[i]` is added to the collapsed row. The routed `down`
     /// sum and the shared expert's output used to be two dispatches.
     has_bias: u32,
-    _pad1: u32,
+    /// Independent output rows: group `g` collapses rows `g*rows..(g+1)*rows`
+    /// into `y[g*n..]` and adds `bias[g*n..]`. 1 for the single-token path.
+    groups: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: SumRowsUniforms;
@@ -20,16 +22,18 @@ struct SumRowsUniforms {
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
-    if (i >= params.n) {
+    let g = gid.y;
+    if (i >= params.n || g >= params.groups) {
         return;
     }
     var acc = 0.0;
     for (var r = 0u; r < params.rows; r = r + 1u) {
-        acc = acc + x[r * params.n + i];
+        acc = acc + x[(g * params.rows + r) * params.n + i];
     }
+    let o = g * params.n + i;
     if (params.has_bias != 0u) {
-        y[i] = acc + bias[i];
+        y[o] = acc + bias[o];
     } else {
-        y[i] = acc;
+        y[o] = acc;
     }
 }

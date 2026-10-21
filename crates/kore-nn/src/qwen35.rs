@@ -2988,10 +2988,34 @@ impl Qwen35Gpu {
         let dims = ht.shape().dims();
         let rows = if dims.len() == 2 { dims[0] } else { 1 };
         if rows != 1 {
-            return Err(err(
-                "qwen35moe: the routed FFN runs one column at a time (each column \
-                 picks its own experts); prefill chunks on this arch are one token wide",
-            ));
+            // Each column routes independently, so the host lane runs the
+            // single-column path once per column and stacks the rows. This is
+            // the correctness oracle for the batched device lane, not a fast
+            // path: it re-downloads and re-uploads per column.
+            let hidden = if dims.len() == 2 { dims[1] } else { dims[0] };
+            let h = ht
+                .to(Device::Cpu)
+                .map_err(|e| err(&format!("routed FFN batch download: {e}")))?;
+            let data = h
+                .as_f32_slice()
+                .ok_or_else(|| err("routed FFN batch download did not come back as f32"))?;
+            let mut out = Vec::with_capacity(rows * hidden);
+            for c in 0..rows {
+                let row = Tensor::from_f32(&data[c * hidden..(c + 1) * hidden], &[1, hidden])
+                    .to(self.device)
+                    .map_err(|e| err(&format!("routed FFN row upload: {e}")))?;
+                let o = self.moe_ffn_gpu_host(&row, m)?;
+                let oc = o
+                    .to(Device::Cpu)
+                    .map_err(|e| err(&format!("routed FFN row download: {e}")))?;
+                out.extend_from_slice(
+                    oc.as_f32_slice()
+                        .ok_or_else(|| err("routed FFN row output did not come back as f32"))?,
+                );
+            }
+            return Tensor::from_f32(&out, &[rows, hidden])
+                .to(self.device)
+                .map_err(|e| err(&format!("routed FFN batch upload: {e}")));
         }
 
         let t_route = Instant::now();
@@ -3178,8 +3202,27 @@ impl Qwen35Gpu {
         let cfg = &self.cfg;
         let n_used = m.n_used;
 
-        let logits = b.router_matvec(ht, &r.router_w, r.n_routed + 1)?;
-        let (idx, weights, gs) = b.moe_topk_gate(&logits, r.n_routed, n_used, r.n_routed)?;
+        // A verify pass carries one row per draft column. Routing is
+        // per-column, but the expert projections are not: the columns read the
+        // same expert rows, so gate/up and down run once over `cols*n_used`
+        // positions and `pos_div` makes each column's experts share its own
+        // activation row.
+        let dims = ht.shape().dims();
+        let cols = if dims.len() == 2 { dims[0] } else { 1 };
+        if cols == 0 {
+            return Err(err("routed FFN: zero columns"));
+        }
+
+        let logits = if cols == 1 {
+            b.router_matvec(ht, &r.router_w, r.n_routed + 1)?
+        } else {
+            b.router_matvec_cols(ht, &r.router_w, r.n_routed + 1, cols)?
+        };
+        let (idx, weights, gs) = if cols == 1 {
+            b.moe_topk_gate(&logits, r.n_routed, n_used, r.n_routed)?
+        } else {
+            b.moe_topk_gate_cols(&logits, r.n_routed, n_used, r.n_routed, cols, r.n_routed + 1)?
+        };
 
         if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
             use std::sync::Once;
@@ -3206,7 +3249,14 @@ impl Qwen35Gpu {
         // The resident bank holds every expert, so the expert-strided GEMV
         // reads the selected experts in place through `idx`: no gather, and
         // the ids never leave the device.
-        let rows = n_used * m.ffn_rows;
+        let rows = cols * n_used * m.ffn_rows;
+        // One activation row per column: `n_used` consecutive positions share
+        // it. Kept at 0/1 for a single token so that path is untouched.
+        let (gx, gpd) = if cols == 1 {
+            (0, 1)
+        } else {
+            (m.ffn_cols / 4, n_used)
+        };
         let gv = self.wgemv_id(
             r.gate_kind,
             &r.gate,
@@ -3217,8 +3267,8 @@ impl Qwen35Gpu {
             m.ffn_rows,
             &idx,
             0,
-            0,
-            1,
+            gx,
+            gpd,
         )?;
         let uv = self.wgemv_id(
             r.up_kind,
@@ -3230,11 +3280,13 @@ impl Qwen35Gpu {
             m.ffn_rows,
             &idx,
             0,
-            0,
-            1,
+            gx,
+            gpd,
         )?;
-        let gv = gv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
-        let uv = uv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
+        let positions = cols * n_used;
+        let gv = gv.reshape(&[positions as isize, m.ffn_rows as isize])?;
+        let uv = uv.reshape(&[positions as isize, m.ffn_rows as isize])?;
+        let weights = weights.reshape(&[positions as isize])?;
         let signs = self.signs_or_placeholder(cfg.moe_ffn)?;
         // SwiGLU and the router weight in one dispatch; the weight multiplies
         // the whole 2048-wide row block, and `down` is linear, so scaling the
@@ -3242,7 +3294,7 @@ impl Qwen35Gpu {
         let act = b.swiglu_rows(
             &gv,
             &uv,
-            n_used,
+            positions,
             m.ffn_rows,
             &weights,
             signs,
@@ -3256,7 +3308,7 @@ impl Qwen35Gpu {
         let down_all = self.wgemv_id(
             r.down_kind,
             &r.down,
-            n_used * m.ffn_cols,
+            positions * m.ffn_cols,
             m.ffn_rows,
             &act,
             r.down_per / 4,
@@ -3275,7 +3327,7 @@ impl Qwen35Gpu {
         let sact = b.swiglu_rows(
             &sgate,
             &sup,
-            1,
+            cols,
             cfg.shexp_ffn,
             &gs,
             ssigns,
@@ -3283,7 +3335,11 @@ impl Qwen35Gpu {
             cfg.eps,
         )?;
         let sd = self.wgemv(&m.shexp_down, &sact)?;
-        let out = b.sum_rows_add(&down_all, n_used, m.ffn_cols, &sd)?;
+        let out = if cols == 1 {
+            b.sum_rows_add(&down_all, n_used, m.ffn_cols, &sd)?
+        } else {
+            b.sum_rows_add_groups(&down_all, n_used, m.ffn_cols, &sd, cols)?
+        };
         if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static DONE: AtomicBool = AtomicBool::new(false);

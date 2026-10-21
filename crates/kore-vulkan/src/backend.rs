@@ -212,6 +212,7 @@ struct MoeTopkUniforms {
     k: u32,
     gate_row: u32,
     has_gate: u32,
+    col_stride: u32,
 }
 
 #[repr(C)]
@@ -241,7 +242,8 @@ struct SumRowsUniforms {
     n: u32,
     /// 1 = add `bias[i]` to the collapsed output.
     has_bias: u32,
-    _pad1: u32,
+    /// Independent output rows (columns of a verify batch); 1 for one token.
+    groups: u32,
 }
 
 #[repr(C)]
@@ -3227,7 +3229,7 @@ impl VulkanBackend {
     }
 
     pub fn moe_topk(&self, logits: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {
-        let (idx, w, _gate) = self.moe_topk_impl(logits, logits.numel(), k, None)?;
+        let (idx, w, _gate) = self.moe_topk_impl(logits, logits.numel(), k, None, 1, 0)?;
         Ok((idx, w))
     }
 
@@ -3251,7 +3253,38 @@ impl VulkanBackend {
                 rhs: vec![logits.numel()],
             });
         }
-        self.moe_topk_impl(logits, n, k, Some(gate_row))
+        self.moe_topk_impl(logits, n, k, Some(gate_row), 1, 0)
+    }
+
+    /// [`Self::moe_topk_gate`] over `cols` logit rows at once.
+    ///
+    /// Column `c` reads `logits[c*col_stride ..]` and writes its ids and
+    /// weights at `c*k ..`, so the caller gets the expert order a single
+    /// gate/up dispatch consumes. Each column runs its own sequential
+    /// normaliser, so the weights are bit-identical to one call per column.
+    pub fn moe_topk_gate_cols(
+        &self,
+        logits: &Tensor,
+        n: usize,
+        k: usize,
+        gate_row: usize,
+        cols: usize,
+        col_stride: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        if cols == 0 {
+            return Err(VulkanError::UnsupportedOperation(
+                "moe_topk_gate_cols: cols must be non-zero".into(),
+            ));
+        }
+        let need = (cols - 1) * col_stride + n.max(gate_row + 1);
+        if logits.numel() < need {
+            return Err(VulkanError::ShapeMismatch {
+                op: "moe_topk_gate_cols logits".into(),
+                lhs: vec![logits.numel()],
+                rhs: vec![need],
+            });
+        }
+        self.moe_topk_impl(logits, n, k, Some(gate_row), cols, col_stride)
     }
 
     fn moe_topk_impl(
@@ -3260,6 +3293,8 @@ impl VulkanBackend {
         n: usize,
         k: usize,
         gate_row: Option<usize>,
+        cols: usize,
+        col_stride: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         if k == 0 || k > 16 {
             return Err(VulkanError::UnsupportedOperation(
@@ -3291,33 +3326,44 @@ impl VulkanBackend {
             &self.device,
             &self.queue,
         )?;
-        let out_bytes = (k * std::mem::size_of::<f32>()).max(4);
+        let out_bytes = (cols * k * std::mem::size_of::<f32>()).max(4);
         let idx_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_moe_topk_idx");
         let w_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_moe_topk_w");
-        let gate_buf = crate::buffer::alloc_storage_buffer(&self.device, 4, "kore_moe_topk_gate");
+        let gate_buf = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (cols * 4).max(4),
+            "kore_moe_topk_gate",
+        );
 
         let uniforms = MoeTopkUniforms {
             n: n as u32,
             k: k as u32,
             gate_row: gate_row.unwrap_or(0) as u32,
             has_gate: u32::from(gate_row.is_some()),
+            col_stride: col_stride as u32,
         };
         self.record_dispatch(
             &self.moe_topk_pipeline,
             bytemuck::bytes_of(&uniforms),
             &[logits_buf.arc_buffer(), &idx_buf, &w_buf, &gate_buf],
-            (1, 1, 1),
+            (1, cols as u32, 1),
             "moe_topk_pass",
         );
 
+        // Single-column callers keep the original `[k]` shape; a batch is
+        // `[cols, k]` so the FFN can index it as `col*n_used + e`.
+        let shape: &[usize] = if cols == 1 { &[k] } else { &[cols, k] };
         let idx = self.make_tensor(
-            KoreVulkanBuffer::new(idx_buf, DType::F32, vec![k]),
-            &[k],
+            KoreVulkanBuffer::new(idx_buf, DType::F32, vec![cols * k]),
+            shape,
         );
-        let w = self.make_tensor(KoreVulkanBuffer::new(w_buf, DType::F32, vec![k]), &[k]);
+        let w = self.make_tensor(
+            KoreVulkanBuffer::new(w_buf, DType::F32, vec![cols * k]),
+            shape,
+        );
         let gate = self.make_tensor(
-            KoreVulkanBuffer::new(gate_buf, DType::F32, vec![1]),
-            &[1],
+            KoreVulkanBuffer::new(gate_buf, DType::F32, vec![cols]),
+            &[cols],
         );
         Ok((idx, w, gate))
     }
@@ -3411,7 +3457,7 @@ impl VulkanBackend {
     /// The routed `down` projection writes one row per selected expert; this
     /// collapses them with one dispatch instead of one add per expert.
     pub fn sum_rows(&self, x: &Tensor, rows: usize, n: usize) -> Result<Tensor> {
-        self.sum_rows_impl(x, rows, n, None)
+        self.sum_rows_impl(x, rows, n, None, 1)
     }
 
     /// Collapse `rows` rows and add `bias` in the same dispatch.
@@ -3426,7 +3472,29 @@ impl VulkanBackend {
         n: usize,
         bias: &Tensor,
     ) -> Result<Tensor> {
-        self.sum_rows_impl(x, rows, n, Some(bias))
+        self.sum_rows_impl(x, rows, n, Some(bias), 1)
+    }
+
+    /// Collapse `groups` independent row blocks and add a per-group bias.
+    ///
+    /// `x` is `[groups*rows, n]`, `bias` is `[groups, n]`, output is
+    /// `[groups, n]`: group `g` sums its own `rows` and adds its own bias row.
+    /// This is the verify-batch form of [`Self::sum_rows_add`] -- one dispatch
+    /// for every column instead of one per column.
+    pub fn sum_rows_add_groups(
+        &self,
+        x: &Tensor,
+        rows: usize,
+        n: usize,
+        bias: &Tensor,
+        groups: usize,
+    ) -> Result<Tensor> {
+        if groups == 0 {
+            return Err(VulkanError::UnsupportedOperation(
+                "sum_rows_add_groups: groups must be non-zero".into(),
+            ));
+        }
+        self.sum_rows_impl(x, rows, n, Some(bias), groups)
     }
 
     fn sum_rows_impl(
@@ -3435,25 +3503,26 @@ impl VulkanBackend {
         rows: usize,
         n: usize,
         bias: Option<&Tensor>,
+        groups: usize,
     ) -> Result<Tensor> {
         if rows == 0 || n == 0 {
             return Err(VulkanError::UnsupportedOperation(
                 "sum_rows: rows and n must be non-zero".into(),
             ));
         }
-        if x.numel() < rows * n {
+        if groups == 0 || x.numel() < groups * rows * n {
             return Err(VulkanError::ShapeMismatch {
                 op: "sum_rows".into(),
                 lhs: vec![x.numel()],
-                rhs: vec![rows * n],
+                rhs: vec![groups * rows * n],
             });
         }
         if let Some(b) = bias {
-            if b.numel() < n {
+            if b.numel() < groups * n {
                 return Err(VulkanError::ShapeMismatch {
                     op: "sum_rows_add bias".into(),
                     lhs: vec![b.numel()],
-                    rhs: vec![n],
+                    rhs: vec![groups * n],
                 });
             }
         }
@@ -3476,7 +3545,7 @@ impl VulkanBackend {
             )?,
         };
 
-        let out_bytes = (n * std::mem::size_of::<f32>()).max(4);
+        let out_bytes = (groups * n * std::mem::size_of::<f32>()).max(4);
         let y_buffer =
             crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_sum_rows_out");
 
@@ -3484,7 +3553,7 @@ impl VulkanBackend {
             rows: rows as u32,
             n: n as u32,
             has_bias: u32::from(bias.is_some()),
-            _pad1: 0,
+            groups: groups as u32,
         };
         let workgroups = (n as u32).div_ceil(256).max(1);
         self.record_dispatch(
@@ -3495,12 +3564,13 @@ impl VulkanBackend {
                 &y_buffer,
                 bias_buf.arc_buffer(),
             ],
-            (workgroups, 1, 1),
+            (workgroups, groups as u32, 1),
             "sum_rows_pass",
         );
 
-        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![n]);
-        Ok(self.make_tensor(y_kore_buf, &[n]))
+        let out_shape: &[usize] = if groups == 1 { &[n] } else { &[groups, n] };
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![groups * n]);
+        Ok(self.make_tensor(y_kore_buf, out_shape))
     }
 
     /// Quantized Q4_K matrix-vector multiplication: y = x @ W^T
@@ -5746,6 +5816,17 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    fn router_matvec_cols(
+        &self,
+        x: &Tensor,
+        w: &Tensor,
+        n: usize,
+        cols: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.router_matvec_cols(x, w, n, cols)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
     fn moe_topk(
         &self,
         logits: &Tensor,
@@ -5763,6 +5844,19 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         gate_row: usize,
     ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
         self.moe_topk_gate(logits, n, k, gate_row)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn moe_topk_gate_cols(
+        &self,
+        logits: &Tensor,
+        n: usize,
+        k: usize,
+        gate_row: usize,
+        cols: usize,
+        col_stride: usize,
+    ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
+        self.moe_topk_gate_cols(logits, n, k, gate_row, cols, col_stride)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
@@ -5792,6 +5886,18 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         bias: &Tensor,
     ) -> kore_core::Result<Tensor> {
         self.sum_rows_add(x, rows, n, bias)
+            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn sum_rows_add_groups(
+        &self,
+        x: &Tensor,
+        rows: usize,
+        n: usize,
+        bias: &Tensor,
+        groups: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.sum_rows_add_groups(x, rows, n, bias, groups)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 

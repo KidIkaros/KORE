@@ -19,6 +19,10 @@ struct TopkUniforms {
     gate_row: u32,
     /// 1 = also emit `sigmoid(logits[gate_row])` into `gate_out`.
     has_gate: u32,
+    /// Floats between one column's logits and the next. A verify batch
+    /// dispatches `cols` columns at once; each runs the same sequential
+    /// normaliser, so the weights are unchanged column by column.
+    col_stride: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: TopkUniforms;
@@ -75,8 +79,13 @@ fn tree_argmax(t: u32) {
 }
 
 @compute @workgroup_size(256)
-fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wg: vec3<u32>,
+) {
     let t = lid.x;
+    let col = wg.y;
+    let base = col * p.col_stride;
     let n = min(p.n, MAX_EXPERTS);
     let k = min(p.k, 16u);
 
@@ -88,7 +97,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     // Softmax max, in parallel.
     var mx_t = NEG_INF;
     for (var i = t; i < n; i = i + WG) {
-        mx_t = max(mx_t, logits[i]);
+        mx_t = max(mx_t, logits[base + i]);
     }
     red_v[t] = mx_t;
     workgroupBarrier();
@@ -100,7 +109,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     if (t == 0u) {
         var total = 0.0;
         for (var i = 0u; i < n; i = i + 1u) {
-            total = total + exp(logits[i] - mx);
+            total = total + exp(logits[base + i] - mx);
         }
         red_v[0] = select(0.0, 1.0 / total, total > 0.0);
     }
@@ -113,7 +122,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
         var bi = 0xFFFFFFFFu;
         for (var i = t; i < n; i = i + WG) {
             if (taken[i] == 0u) {
-                let pr = exp(logits[i] - mx) * inv_total;
+                let pr = exp(logits[base + i] - mx) * inv_total;
                 if (pr > best || (pr == best && i < bi)) {
                     best = pr;
                     bi = i;
@@ -134,22 +143,22 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
     if (t == 0u) {
         var kept = 0.0;
         for (var s = 0u; s < k; s = s + 1u) {
-            kept = kept + exp(logits[picked[s]] - mx) * inv_total;
+            kept = kept + exp(logits[base + picked[s]] - mx) * inv_total;
         }
         kept_v = select(0.0, 1.0 / kept, kept > 0.0);
     }
     workgroupBarrier();
     if (t < k) {
         let e = picked[t];
-        let pr = exp(logits[e] - mx) * inv_total;
-        idx[t] = f32(e);
-        w[t] = pr * kept_v;
+        let pr = exp(logits[base + e] - mx) * inv_total;
+        idx[col * k + t] = f32(e);
+        w[col * k + t] = pr * kept_v;
     }
 
     // The shared expert's gate rides in the same dispatch: its router row is
     // appended to the routed router matrix, so one matvec feeds both the top-k
     // and this sigmoid. Same expression the `sigmoid_mul` elementwise pass used.
     if (p.has_gate != 0u && t == 0u) {
-        gate_out[0] = 1.0 / (1.0 + exp(-logits[p.gate_row]));
+        gate_out[col] = 1.0 / (1.0 + exp(-logits[base + p.gate_row]));
     }
 }

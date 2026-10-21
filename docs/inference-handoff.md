@@ -626,14 +626,49 @@ pass amortises its expert reads the same way it lands in that band, where
 repetitive is ~2.3× and prose ~1.26×. The first batch measurement replaces the
 sweep — and it is the only number that can still cancel the milestone.
 
+### MoE speculative decoding: built and measured
+
+The batch path is in: `router_matvec_cols`, `moe_topk_gate_cols`,
+`sum_rows_add_groups`, `pos_div` in the expert-strided GEMVs, and
+`moe_ffn_gpu_resident` over `cols` rows. The host lane loops the single-column
+path per column as the correctness oracle. Gates:
+
+- `verify_m` on the MoE: `m=4` and `m=8` (device lane) and `m=2` (host lane) —
+  21 positions bit-identical to sequential decode, state probe agrees, prefill
+  agrees, rewind legs bit-identical.
+- 64-token greedy ids identical between the device and host lanes.
+- GPU suite 32/33 (only the pre-existing `quantize_q8_rows` failure).
+
+Measured hot (same session, arms interleaved; device routing; `max_ctx=512`):
+
+| prompt | n | greedy | spec `6:6` | ratio |
+|---|---|---|---|---|
+| repeated sentence | 128 | 48.7 / 49.1 | 66.3 / 66.0 | **1.35×** |
+| narrative prose | 400 | 54.5 | 61.2 | **1.12×** |
+| narrative prose | 128 | 46.7 / 47.5 | 44.96 (0 fires) | 0.96× |
+
+The last row is the honest floor: on 128 tokens this prompt has no 6-gram
+match, so the 4 % is the trigger and loop overhead, not drafting.
+
+The verify pass costs **71.1 ms at `m=7`** against a ~17 ms plain step, i.e.
+`alpha = 0.53` -- above the 0.33 the dense 2B measures, which is why the fox arm
+lands at 1.35× and not the 1.7-3× the offline replay projected at `alpha <= 0.5`.
+The marginal column is not expert traffic (that is amortised: gate/up and down
+read the bank once); it is compute in the dense per-column parts -- attention
+projections, the shared expert and the GDN sweeps -- which stop being
+bandwidth-bound once `m` columns share one weight read. Prefill is single-column
+and is included in both rows.
+
+`k` on the fox arm: `4:6` 65.0, `6:6` 66.2, `6:8` 66.8 tok/s, so `6` stays.
+
 ### Next, in order
 
-1. **Speculative decoding for the MoE.** Decision: **build it**, with the
-   workload caveat above. This is the only lever left worth more than a few
-   percent (kernel work is into single digits), and on the two regimes where
-   users actually feel the difference — long narrative and loops — it is 1.2×
-   to 3×. It is also free on technical prose, because the guard only fires when
-   a fire beats a plain step.
+
+1. ~~**Speculative decoding for the MoE.**~~ Done: 1.35× on a loop, 1.12× on
+   narrative prose, 0.96× when nothing fires. The remaining leverage is
+   `alpha = 0.53`: the marginal verify column is compute in the per-column
+   dense parts, so the next attempt should measure a 7-column pass with the
+   GDN/attention legs removed before touching anything else.
    The expert-strided GEMVs already take a per-position activation row
    (`x_stride`), so `down` works over `m*n_used` rows unchanged; `gate/up` do
    not, because their activation row is shared by all `n_used` experts of a

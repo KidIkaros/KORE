@@ -917,6 +917,22 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// [`Self::router_matvec`] over `cols` activation rows at once. Column `c`
+    /// reads `x[c*k..]` and writes `y[c*n..]`, bit-identically to one call per
+    /// column, so a verify batch routes every draft in one dispatch.
+    fn router_matvec_cols(
+        &self,
+        _x: &crate::Tensor,
+        _w: &crate::Tensor,
+        _n: usize,
+        _cols: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "router_matvec_cols not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Device-side router top-k: `logits[n]` -> (`idx[k]` as f32, `w[k]`), no readback.
     fn moe_topk(
         &self,
@@ -946,6 +962,26 @@ pub trait DeviceBackend: Send + Sync {
         let v = all.as_f32_slice().unwrap_or(&[])[gate_row];
         let gs = crate::Tensor::from_f32(&[1.0 / (1.0 + (-v).exp())], &[1]);
         Ok((idx, w, gs.to(logits.device())?))
+    }
+
+    /// Top-k plus the shared-expert gate over `cols` logit rows at once.
+    ///
+    /// Column `c` reads `logits[c*col_stride ..]` and writes `idx`/`weights` at
+    /// `c*k ..` plus `gate[c]`, so the result is the concatenated order a
+    /// single batched gate/up dispatch consumes.
+    fn moe_topk_gate_cols(
+        &self,
+        _logits: &crate::Tensor,
+        _n: usize,
+        _k: usize,
+        _gate_row: usize,
+        _cols: usize,
+        _col_stride: usize,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor, crate::Tensor)> {
+        Err(crate::KoreError::StorageError(format!(
+            "moe_topk_gate_cols not implemented for backend '{}'",
+            self.device_name()
+        )))
     }
 
     /// Device-side gather of `k` experts (`per` bytes each) out of a resident bank.
@@ -988,6 +1024,22 @@ pub trait DeviceBackend: Send + Sync {
     ) -> crate::Result<crate::Tensor> {
         let sum = self.sum_rows(x, rows, n)?;
         self.add(&sum, bias)
+    }
+
+    /// Collapse `groups` independent row blocks and add a per-group bias:
+    /// `y[g*n..] = sum(x[g*rows..][..rows]) + bias[g*n..]`.
+    fn sum_rows_add_groups(
+        &self,
+        _x: &crate::Tensor,
+        _rows: usize,
+        _n: usize,
+        _bias: &crate::Tensor,
+        _groups: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "sum_rows_add_groups not implemented for backend '{}'",
+            self.device_name()
+        )))
     }
 
     /// Elementwise SiLU activation: C = silu(A) = A / (1 + exp(-A))
