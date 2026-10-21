@@ -55,10 +55,15 @@ fn parse_policy(s: &str) -> DraftPolicy {
         Some(g) => g != "0" && g != "off",
         None => true,
     };
+    // Optional fourth field: `max_match`. The cap is the ceiling on the
+    // confidence signal as well as on the search, so a schedule experiment has
+    // to be able to raise it.
+    let max_match = it.next().and_then(|x| x.parse().ok()).unwrap_or(16);
     DraftPolicy {
         k,
         min_match,
         guard,
+        max_match,
         ..Default::default()
     }
     .clamped()

@@ -99,11 +99,20 @@ impl DraftPolicy {
 
     /// What to feed the verify pass, or an empty vector to take a plain step.
     pub fn drafts(&self, hist: &[u32], t_next: u32) -> Vec<u32> {
+        self.drafts_with_len(hist, t_next).1
+    }
+
+    /// [`DraftPolicy::drafts`], also returning the match length it was decided
+    /// on. The length is the only confidence signal this drafter has -- the
+    /// continuation itself is copied, not predicted -- so it is what a verify
+    /// schedule can key on. `KORE_SPEC_PROFILE` prints acceptance conditioned
+    /// on it.
+    pub fn drafts_with_len(&self, hist: &[u32], t_next: u32) -> (usize, Vec<u32>) {
         let (len, drafts) = longest_match(hist, t_next, self.k, self.max_match, self.search_back);
         if len >= self.min_match {
-            drafts
+            (len, drafts)
         } else {
-            Vec::new()
+            (len, Vec::new())
         }
     }
 }
@@ -301,6 +310,60 @@ fn push_windowed(w: &mut VecDeque<(f64, f64)>, cap: usize, emitted: usize, cost_
     w.push_back((emitted as f64, cost_ms));
 }
 
+/// `KORE_SPEC_PROFILE` acceptance, keyed by the match length that produced the
+/// draft. This is the table a verify schedule has to be built from: drafting
+/// `k` tokens is only worth it while the *next* slot still lands more often
+/// than the pass costs.
+struct MatchBreakdown {
+    /// Indexed by `min(len, max_match)`, then by draft slot (0-based).
+    proposed: Vec<[u32; MAX_BATCH_COLS]>,
+    accepted: Vec<[u32; MAX_BATCH_COLS]>,
+    fires: Vec<u32>,
+}
+
+impl MatchBreakdown {
+    fn new(max_match: usize) -> Self {
+        Self {
+            proposed: vec![[0; MAX_BATCH_COLS]; max_match + 1],
+            accepted: vec![[0; MAX_BATCH_COLS]; max_match + 1],
+            fires: vec![0; max_match + 1],
+        }
+    }
+
+    fn note(&mut self, len: usize, drafts: &[u32], accepted: usize) {
+        let b = len.min(self.fires.len() - 1);
+        self.fires[b] += 1;
+        for (i, _) in drafts.iter().enumerate().take(MAX_BATCH_COLS - 1) {
+            self.proposed[b][i] += 1;
+            if i < accepted {
+                self.accepted[b][i] += 1;
+            }
+        }
+    }
+
+    fn print(&self, min_match: usize) {
+        eprintln!("spec match-length breakdown (slot i = draft i+1, accepted/proposed):");
+        eprintln!(" len  fires   slots");
+        for b in min_match..self.fires.len() {
+            if self.fires[b] == 0 {
+                continue;
+            }
+            let mut row = String::new();
+            for i in 0..MAX_BATCH_COLS - 1 {
+                if self.proposed[b][i] == 0 {
+                    break;
+                }
+                let pct = 100.0 * self.accepted[b][i] as f64 / self.proposed[b][i] as f64;
+                row.push_str(&format!(
+                    " {:.0}% ({}/{})",
+                    pct, self.accepted[b][i], self.proposed[b][i]
+                ));
+            }
+            eprintln!("{:4} {:6}  {}", b, self.fires[b], row);
+        }
+    }
+}
+
 impl Qwen35Gpu {
     /// Greedy decode with prompt-lookup drafting.
     ///
@@ -335,6 +398,7 @@ impl Qwen35Gpu {
         let mut verify_ms = 0.0f64;
         let mut rewind_ms = 0.0f64;
         let mut rewinds = 0usize;
+        let mut breakdown = MatchBreakdown::new(policy.max_match);
         let mut next = if tokens.is_empty() {
             0
         } else {
@@ -345,10 +409,10 @@ impl Qwen35Gpu {
             if next == eos {
                 break;
             }
-            let drafts = if policy.guard && !guard.may_fire() {
-                Vec::new()
+            let (match_len, drafts) = if policy.guard && !guard.may_fire() {
+                (0, Vec::new())
             } else {
-                policy.drafts(&hist, next)
+                policy.drafts_with_len(&hist, next)
             };
             let m = 1 + drafts.len();
             if drafts.is_empty() || pos + m > max_ctx {
@@ -395,6 +459,9 @@ impl Qwen35Gpu {
             stats.drafts += drafts.len();
             stats.accepted += j;
             stats.hist[j] += 1;
+            if profile {
+                breakdown.note(match_len, &drafts, j);
+            }
 
             let committed = &batch[..1 + j];
             match committed.iter().position(|&t| t == eos) {
@@ -414,6 +481,7 @@ impl Qwen35Gpu {
             pos += 1 + j;
         }
         if profile {
+            breakdown.print(policy.min_match);
             eprintln!(
                 "spec profile: verify {:.1} ms over {} fires ({:.2} ms/fire), rewind {:.1} ms over {} cuts ({:.2} ms/cut)",
                 verify_ms,
@@ -444,6 +512,38 @@ mod tests {
         let (len, drafts) = longest_match(&hist, 5, 3, 16, usize::MAX);
         assert_eq!(len, 5);
         assert_eq!(drafts, vec![6, 1, 2]);
+    }
+
+    /// The match length the schedule experiment keys on is the same one the
+    /// trigger uses, and `drafts()` still agrees with it.
+    #[test]
+    fn drafts_with_len_reports_the_length_and_matches_drafts() {
+        let hist = vec![1, 2, 3, 4, 5, 6, 1, 2, 3, 4];
+        let p = DraftPolicy {
+            k: 3,
+            min_match: 4,
+            ..Default::default()
+        };
+        let (len, drafts) = p.drafts_with_len(&hist, 5);
+        assert_eq!(len, 5);
+        assert_eq!(drafts, p.drafts(&hist, 5));
+        assert_eq!(drafts, vec![6, 1, 2]);
+    }
+
+    /// A match below the trigger still reports its length but drafts nothing.
+    #[test]
+    fn a_match_below_min_match_reports_its_length_and_no_drafts() {
+        // The tail `1 2` plus `t_next = 3` last occurred at the start, so the
+        // match is three tokens long -- below the six-token trigger.
+        let hist = vec![1, 2, 3, 4, 5, 1, 2];
+        let p = DraftPolicy {
+            k: 3,
+            min_match: 6,
+            ..Default::default()
+        };
+        let (len, drafts) = p.drafts_with_len(&hist, 3);
+        assert_eq!(len, 3);
+        assert!(drafts.is_empty());
     }
 
     #[test]

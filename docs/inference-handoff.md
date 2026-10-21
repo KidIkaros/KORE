@@ -610,12 +610,13 @@ policy: on the repetitive stream the fully-accepted cost per token falls to
    `idx` laid out as `column*n_used + e`), a per-column SwiGLU scale vector, and
    the `moe_ffn_gpu_host` `rows != 1` rejection. `forward_batch` and the
    snapshot/rewind machinery already handle columns for the dense model.
-   First experiment inside the milestone, independent of the batch plumbing:
-   **confidence-scheduled verify length** (DSpark, arXiv 2607.05147, shipped in
-   DeepSeek-V4.1). The lookup drafter already computes the match length in
-   `longest_match` and then ignores its magnitude -- any match `>= min_match`
-   drafts the same continuation (capped at `k`). Scaling `k` with the match length is free, cannot change
-   the output, and `draft_headroom` already sweeps `m`/`k`.
+   First experiment inside the milestone came back **negative** (see
+   `docs/research-sparse-attention.md` §4): match-length-scheduled `k` has no
+   signal to key on. `KORE_SPEC_PROFILE` now prints acceptance per match length,
+   and on the dense 2B the length is either saturated (looping output, 96-100 %
+   acceptance) or just above `min_match` (fibonacci: 50 % falling to 25 %, the
+   whole fire loses at 0.995x, which the payoff guard already handles). The
+   instrumentation stays; the schedule is closed.
 2. **`gdn_gates` (1.8 ms) and what is left of `gdn_step` (~2.9 ms).** The
    i-major state made `gdn_step` coalesce; its three 128-step sweeps are still
    one workgroup per head (16 workgroups), so it occupies half the CUs. Splitting

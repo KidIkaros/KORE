@@ -74,12 +74,16 @@ attention reduces *bytes per pass at long context*. Here the first is worth
 ## 4. What to take instead
 
 - **DSpark's confidence-scheduled verification** (arXiv 2607.05147, shipped in
-  V4.1): the verify length is chosen per step from the estimated prefix survival
-  probability instead of being fixed. KORE's lookup drafter already computes the
-  match length in `longest_match` and then discards the magnitude: any match
-  `≥ min_match` drafts the same continuation, capped at `k`. Scheduling `k` by match length is a
-  few lines, cannot change the output, and `draft_headroom` measures it. This is
-  the one transferable idea in the 2026 DeepSeek stack.
+  V4.1) — **tried and closed**. The lookup drafter's only confidence signal is
+  the match length, so `KORE_SPEC_PROFILE` now prints acceptance conditioned on
+  it. On the dense 2B, with the cap at 16 and again at 64, the length is bimodal:
+  either it saturates at the cap (looping output: 96–100 % acceptance, 1.64×) or
+  it sits just above `min_match` (fibonacci prompt: 50–75 % on slot 1 decaying
+  to 25–50 % by slot 6, 0.995× overall). Truncating `k` in the first regime
+  throws away good drafts; in the second the whole fire loses, which the payoff
+  guard already detects with the objective signal (tokens/ms), not a proxy. A
+  useful schedule needs the *per-token* probabilities of a trained drafter,
+  which this one does not have. Instrumentation kept, schedule not built.
 - **Semi-autoregressive / block drafting** (DSpark, DFlash): releases drafters
   for Qwen3-4B/8B/14B and Gemma-4-12B — not for this target — and training one
   is a separate project. Parked.
@@ -93,4 +97,5 @@ attention reduces *bytes per pass at long context*. Here the first is worth
 Do not build sparse attention for KORE. Revisit if (a) the target checkpoint
 ships with an indexer, or (b) ≥64K contexts become routine, where the measured
 baseline is ~5 ms/token of KV read. Until then the MoE speculative-decoding
-milestone stands, with confidence-scheduled `k` as its first experiment.
+milestone stands; the confidence schedule it started with came back negative
+(§4), so the milestone is now only the batch path.
