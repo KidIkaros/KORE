@@ -617,6 +617,14 @@ policy: on the repetitive stream the fully-accepted cost per token falls to
    acceptance) or just above `min_match` (fibonacci: 50 % falling to 25 %, the
    whole fire loses at 0.995x, which the payoff guard already handles). The
    instrumentation stays; the schedule is closed.
+   The batch path now has its first primitive: `router_matvec_cols` (column is
+   `workgroup_id.y`) is bit-identical to one dispatch per column, test
+   `test_vulkan_router_matvec_cols_matches_single_column`. Next blocker is the
+   expert-strided GEMV: it maps `pos = row / rows_per_expert` straight to the
+   activation row, which is only right when the rows are one column's experts.
+   A verify batch lays `idx` and the activation rows out as `col*n_used + e`,
+   so the shaders need `pos /= n_used` before the `x_stride` multiply -- the
+   same `n_pos` uniform the gate/up fusion design already calls for.
 2. **`gdn_gates` (1.8 ms) and what is left of `gdn_step` (~2.9 ms).** The
    i-major state made `gdn_step` coalesce; its three 128-step sweeps are still
    one workgroup per head (16 workgroups), so it occupies half the CUs. Splitting

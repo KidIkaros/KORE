@@ -219,8 +219,8 @@ struct MoeTopkUniforms {
 struct RouterUniforms {
     n: u32,
     k: u32,
-    _pad0: u32,
-    _pad1: u32,
+    cols: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -3163,8 +3163,31 @@ impl VulkanBackend {
     /// `W` is row-major `[n, k]`, the router tensor's native GGUF layout, and
     /// the activation is a single row (routing is decided per decoded token).
     pub fn router_matvec(&self, x: &Tensor, w_raw: &Tensor, n: usize) -> Result<Tensor> {
-        let k = x.numel();
-        if k == 0 || n == 0 || w_raw.numel() != n * k {
+        self.router_matvec_cols(x, w_raw, n, 1)
+    }
+
+    /// [`Self::router_matvec`] over `cols` activation rows at once.
+    ///
+    /// The column is `workgroup_id.y`, so each column runs the same loop with
+    /// the same reduction order it would have run alone: the output rows are
+    /// bit-identical to `cols` separate calls. `x` is `[cols, k]`, `y` is
+    /// `[cols, n]`.
+    pub fn router_matvec_cols(
+        &self,
+        x: &Tensor,
+        w_raw: &Tensor,
+        n: usize,
+        cols: usize,
+    ) -> Result<Tensor> {
+        if cols == 0 || n == 0 || x.numel() % cols != 0 {
+            return Err(VulkanError::ShapeMismatch {
+                op: "router_matvec_cols".into(),
+                lhs: vec![x.numel()],
+                rhs: vec![cols],
+            });
+        }
+        let k = x.numel() / cols;
+        if k == 0 || w_raw.numel() != n * k {
             return Err(VulkanError::ShapeMismatch {
                 op: "router_matvec".into(),
                 lhs: vec![w_raw.numel()],
@@ -3179,24 +3202,24 @@ impl VulkanBackend {
             &self.device,
             &self.queue,
         )?;
-        let out_bytes = (n * std::mem::size_of::<f32>()).max(4);
+        let out_bytes = (cols * n * std::mem::size_of::<f32>()).max(4);
         let y_buffer =
             crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_router_matvec_out");
         let uniforms = RouterUniforms {
             n: n as u32,
             k: k as u32,
-            _pad0: 0,
-            _pad1: 0,
+            cols: cols as u32,
+            _pad: 0,
         };
         self.record_dispatch(
             &self.router_matvec_pipeline,
             bytemuck::bytes_of(&uniforms),
             &[x_buf.arc_buffer(), w_buf.arc_buffer(), &y_buffer],
-            (n as u32, 1, 1),
+            (n as u32, cols as u32, 1),
             "router_matvec_pass",
         );
-        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![1, n]);
-        Ok(self.make_tensor(y_kore_buf, &[1, n]))
+        let y_kore_buf = KoreVulkanBuffer::new(y_buffer, DType::F32, vec![cols, n]);
+        Ok(self.make_tensor(y_kore_buf, &[cols, n]))
     }
 
     pub fn moe_topk(&self, logits: &Tensor, k: usize) -> Result<(Tensor, Tensor)> {

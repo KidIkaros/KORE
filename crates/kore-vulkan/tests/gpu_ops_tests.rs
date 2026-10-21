@@ -240,6 +240,51 @@ fn test_vulkan_small_batch_gemv_batch_invariance() {
     assert_eq!(&c3.as_f32_slice().unwrap()[..n], c1.as_f32_slice().unwrap());
 }
 
+/// A verify batch routes every column through the same weight rows. Batching
+/// moves the column to `workgroup_id.y` and leaves the loop untouched, so the
+/// result must be bit-identical to one dispatch per column -- not merely within
+/// a tolerance.
+#[test]
+fn test_vulkan_router_matvec_cols_matches_single_column() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let cols = 5usize;
+    let k = 70usize;
+    let n = 258usize;
+    let x_data: Vec<f32> = (0..cols * k)
+        .map(|i| ((i * 7 % 29) as f32 - 14.0) / 7.0)
+        .collect();
+    let w_data: Vec<f32> = (0..n * k)
+        .map(|i| ((i * 11 % 31) as f32 - 15.0) / 9.0)
+        .collect();
+    let x = Tensor::from_f32(&x_data, &[cols, k]);
+    let w = Tensor::from_f32(&w_data, &[n, k]);
+
+    let batched = backend
+        .router_matvec_cols(&x, &w, n, cols)
+        .expect("batched router")
+        .to(kore_core::Device::Cpu)
+        .unwrap();
+    let got = batched.as_f32_slice().unwrap();
+    assert_eq!(got.len(), cols * n, "output shape is [cols, n]");
+
+    for c in 0..cols {
+        let row = Tensor::from_f32(&x_data[c * k..(c + 1) * k], &[1, k]);
+        let one = backend
+            .router_matvec(&row, &w, n)
+            .expect("single router")
+            .to(kore_core::Device::Cpu)
+            .unwrap();
+        assert_eq!(
+            &got[c * n..(c + 1) * n],
+            one.as_f32_slice().unwrap(),
+            "column {c} must match the single-column dispatch bit for bit"
+        );
+    }
+}
+
 #[test]
 fn test_vulkan_flash_decode_and_argmax() {
     let backend = match VulkanBackend::new() {

@@ -18,8 +18,12 @@
 struct RouterUniforms {
     n: u32,
     k: u32,
-    _pad0: u32,
-    _pad1: u32,
+    // Activation rows. A verify batch routes every column through the same
+    // weight rows, so `wg.y` selects the column and the reduction order per
+    // column is untouched -- a batched pass is bit-identical to one call per
+    // column.
+    cols: u32,
+    _pad: u32,
 }
 
 @group(0) @binding(0) var<uniform> p: RouterUniforms;
@@ -35,12 +39,14 @@ fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
     let row = wg.x;
+    let col = wg.y;
     let t = lid.x;
     let base = row * p.k;
+    let xb = col * p.k;
 
     var acc = 0.0;
     for (var i = t; i < p.k; i = i + 128u) {
-        acc = acc + w[base + i] * x[i];
+        acc = acc + w[base + i] * x[xb + i];
     }
     red[t] = acc;
     workgroupBarrier();
@@ -58,6 +64,6 @@ fn main(
     }
 
     if (t == 0u) {
-        y[row] = red[0];
+        y[col * p.n + row] = red[0];
     }
 }
