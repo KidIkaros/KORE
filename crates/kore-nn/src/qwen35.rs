@@ -2839,6 +2839,7 @@ impl Qwen35Gpu {
         idx: &Tensor,
         idx_off: usize,
         x_stride: usize,
+        pos_div: usize,
     ) -> Result<Tensor> {
         match kind {
             QKind::Q2K => self.backend.gemv_q2_k_id(
@@ -2851,6 +2852,7 @@ impl Qwen35Gpu {
                 idx,
                 idx_off,
                 x_stride,
+                pos_div,
             ),
             QKind::Q3K => self.backend.gemv_q3_k_id(
                 x,
@@ -2862,6 +2864,7 @@ impl Qwen35Gpu {
                 idx,
                 idx_off,
                 x_stride,
+                pos_div,
             ),
             _ => Err(err(&format!(
                 "expert-strided dispatch is only wired for the Q2_K/Q3_K down projection; got {kind:?}"
@@ -3215,6 +3218,7 @@ impl Qwen35Gpu {
             &idx,
             0,
             0,
+            1,
         )?;
         let uv = self.wgemv_id(
             r.up_kind,
@@ -3227,6 +3231,7 @@ impl Qwen35Gpu {
             &idx,
             0,
             0,
+            1,
         )?;
         let gv = gv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
         let uv = uv.reshape(&[n_used as isize, m.ffn_rows as isize])?;
@@ -3259,6 +3264,7 @@ impl Qwen35Gpu {
             &idx,
             0,
             m.ffn_rows / 4,
+            1,
         )?;
         // Shared expert: always evaluated, gated by `sigmoid` of its own row.
         // It does not depend on the routed experts, so it is computed first and

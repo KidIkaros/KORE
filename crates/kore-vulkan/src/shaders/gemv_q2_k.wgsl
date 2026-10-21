@@ -23,7 +23,9 @@ struct Q2KUniforms {
     // same input row, as gate/up do).
     idx_off: u32,
     x_stride: u32,
-    _pad2: u32,
+    // Number of consecutive routing positions that share one activation row:
+    // `n_used` for a verify batch, 1 for a single token.
+    pos_div: u32,
     _pad3: u32,
 }
 
@@ -92,7 +94,7 @@ fn main(
             let expert = u32(idx[params.idx_off + pos]);
             let local = row - pos * params.rows_per_expert;
             row_off = expert * params.expert_words + local * params.blocks_per_row * 21u;
-            x_base = pos * params.x_stride;
+            x_base = (pos / params.pos_div) * params.x_stride;
         } else {
             row_off = params.w_off + row * params.blocks_per_row * 21u;
             x_base = 0u;

@@ -616,7 +616,8 @@ pub trait DeviceBackend: Send + Sync {
     /// whose expert id comes from `idx[idx_off + position]`. That expert's
     /// weights start `expert_words` u32 words into `w`, and its activation
     /// row starts at `position * x_stride` vec4 units in `x` (`x_stride == 0`
-    /// means every position shares one row).
+    /// means every position shares one row). `pos_div` routing positions share
+    /// that row: `n_used` for a verify batch, 1 for a single token.
     fn gemv_q2_k_id(
         &self,
         _x: &crate::Tensor,
@@ -628,6 +629,7 @@ pub trait DeviceBackend: Send + Sync {
         _idx: &crate::Tensor,
         _idx_off: usize,
         _x_stride: usize,
+        _pos_div: usize,
     ) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
             "gemv_q2_k_id not implemented for backend '{}'",
@@ -648,6 +650,7 @@ pub trait DeviceBackend: Send + Sync {
         _idx: &crate::Tensor,
         _idx_off: usize,
         _x_stride: usize,
+        _pos_div: usize,
     ) -> crate::Result<crate::Tensor> {
         Err(crate::KoreError::StorageError(format!(
             "gemv_q3_k_id not implemented for backend '{}'",

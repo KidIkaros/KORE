@@ -269,7 +269,9 @@ struct Q2KUniforms {
     idx_off: u32,
     /// Activation row stride in vec4 units; 0 means every position shares one row.
     x_stride: u32,
-    _pad2: u32,
+    /// Consecutive routing positions that share one activation row (`n_used`
+    /// for a verify batch, 1 for a single token); never zero.
+    pos_div: u32,
     _pad3: u32,
 }
 
@@ -298,7 +300,9 @@ struct Q3KUniforms {
     idx_off: u32,
     /// Activation row stride in vec4 units; 0 means every position shares one row.
     x_stride: u32,
-    _pad2: u32,
+    /// Consecutive routing positions that share one activation row (`n_used`
+    /// for a verify batch, 1 for a single token); never zero.
+    pos_div: u32,
     _pad3: u32,
 }
 
@@ -3619,7 +3623,7 @@ impl VulkanBackend {
             expert_words: 0,
             idx_off: 0,
             x_stride: 0,
-            _pad2: 0,
+            pos_div: 1,
             _pad3: 0,
         };
 
@@ -3778,7 +3782,7 @@ impl VulkanBackend {
             expert_words: 0,
             idx_off: 0,
             x_stride: 0,
-            _pad2: 0,
+            pos_div: 1,
             _pad3: 0,
         };
 
@@ -3833,6 +3837,7 @@ impl VulkanBackend {
         idx: &Tensor,
         idx_off: usize,
         x_stride: usize,
+        pos_div: usize,
     ) -> Result<Tensor> {
         if rows_per_expert == 0 || !n.is_multiple_of(rows_per_expert) {
             return Err(VulkanError::ShapeMismatch {
@@ -3849,10 +3854,20 @@ impl VulkanBackend {
             });
         }
         let experts = n / rows_per_expert;
+        if pos_div == 0 || !experts.is_multiple_of(pos_div) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q_k_id pos_div".into(),
+                lhs: vec![experts],
+                rhs: vec![pos_div],
+            });
+        }
         // `x_stride` is in vec4 units. Zero means every position reads the
-        // same activation row (gate/up); otherwise each position gets its own
-        // row, `x_stride * 4 >= k` floats apart.
-        let x_need = if x_stride == 0 { k } else { experts * x_stride * 4 };
+        // same activation row (gate/up); otherwise position `p` reads row
+        // `p / pos_div`, `x_stride * 4 >= k` floats apart. `pos_div` is the
+        // number of routing positions that share one row -- `n_used` for a
+        // verify batch, 1 for a single token.
+        let rows = experts.div_ceil(pos_div);
+        let x_need = if x_stride == 0 { k } else { rows * x_stride * 4 };
         if x.numel() < x_need {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q2_k_id x".into(),
@@ -3912,7 +3927,7 @@ impl VulkanBackend {
             expert_words: expert_words as u32,
             idx_off: idx_off as u32,
             x_stride: x_stride as u32,
-            _pad2: 0,
+            pos_div: pos_div as u32,
             _pad3: 0,
         };
         self.record_dispatch(
@@ -3944,6 +3959,7 @@ impl VulkanBackend {
         idx: &Tensor,
         idx_off: usize,
         x_stride: usize,
+        pos_div: usize,
     ) -> Result<Tensor> {
         if rows_per_expert == 0 || !n.is_multiple_of(rows_per_expert) {
             return Err(VulkanError::ShapeMismatch {
@@ -3960,7 +3976,16 @@ impl VulkanBackend {
             });
         }
         let experts = n / rows_per_expert;
-        let x_need = if x_stride == 0 { k } else { experts * x_stride * 4 };
+        if pos_div == 0 || !experts.is_multiple_of(pos_div) {
+            return Err(VulkanError::ShapeMismatch {
+                op: "gemv_q3_k_id pos_div".into(),
+                lhs: vec![experts],
+                rhs: vec![pos_div],
+            });
+        }
+        // Position `p` reads activation row `p / pos_div` (see `gemv_q2_k_id`).
+        let rows = experts.div_ceil(pos_div);
+        let x_need = if x_stride == 0 { k } else { rows * x_stride * 4 };
         if x.numel() < x_need {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q3_k_id x".into(),
@@ -4020,7 +4045,7 @@ impl VulkanBackend {
             expert_words: expert_words as u32,
             idx_off: idx_off as u32,
             x_stride: x_stride as u32,
-            _pad2: 0,
+            pos_div: pos_div as u32,
             _pad3: 0,
         };
         self.record_dispatch(
@@ -5876,6 +5901,7 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         idx: &Tensor,
         idx_off: usize,
         x_stride: usize,
+        pos_div: usize,
     ) -> kore_core::Result<Tensor> {
         self.gemv_q2_k_id(
             x,
@@ -5887,6 +5913,7 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             idx,
             idx_off,
             x_stride,
+            pos_div,
         )
         .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
@@ -5902,6 +5929,7 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         idx: &Tensor,
         idx_off: usize,
         x_stride: usize,
+        pos_div: usize,
     ) -> kore_core::Result<Tensor> {
         self.gemv_q3_k_id(
             x,
@@ -5913,6 +5941,7 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             idx,
             idx_off,
             x_stride,
+            pos_div,
         )
         .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }

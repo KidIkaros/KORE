@@ -650,14 +650,15 @@ sweep — and it is the only number that can still cancel the milestone.
    acceptance) or just above `min_match` (fibonacci: 50 % falling to 25 %, the
    whole fire loses at 0.995x, which the payoff guard already handles). The
    instrumentation stays; the schedule is closed.
-   The batch path now has its first primitive: `router_matvec_cols` (column is
-   `workgroup_id.y`) is bit-identical to one dispatch per column, test
-   `test_vulkan_router_matvec_cols_matches_single_column`. Next blocker is the
-   expert-strided GEMV: it maps `pos = row / rows_per_expert` straight to the
-   activation row, which is only right when the rows are one column's experts.
-   A verify batch lays `idx` and the activation rows out as `col*n_used + e`,
-   so the shaders need `pos /= n_used` before the `x_stride` multiply -- the
-   same `n_pos` uniform the gate/up fusion design already calls for.
+   The batch path now has two primitives. `router_matvec_cols` (column is
+   `workgroup_id.y`) is bit-identical to one dispatch per column
+   (`test_vulkan_router_matvec_cols_matches_single_column`). The expert-strided
+   Q2_K/Q3_K GEMVs take a `pos_div` uniform: position `p` reads activation row
+   `p / pos_div`, where `pos_div` is `n_used` for a verify batch and 1 for a
+   single token. Every existing call passes 1, and the device lane still emits
+   the host lane's 64-token ids exactly. The `pos_div > 1` path has no caller
+   yet; its gate is the batch FFN's `verify_m` (bit-identity at `m=1..8`), so it
+   must be checked there rather than assumed.
 2. **`gdn_gates` (1.8 ms) and what is left of `gdn_step` (~2.9 ms).** The
    i-major state made `gdn_step` coalesce; its three 128-step sweeps are still
    one workgroup per head (16 workgroups), so it occupies half the CUs. Splitting
