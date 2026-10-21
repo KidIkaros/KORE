@@ -674,8 +674,14 @@ the floor, and it is why the win is 1.8x and not 5x.
 Gates: `verify_m` prefill leg at `m=4` and `m=8` (57 positions bit-identical to
 sequential decode), and the 64-token device-vs-host id check still exact. The
 table above predates this change (it adds ~2-3 % at `n=400` and ~9 % at
-`n=128`), and spec arms carry a few percent of guard-timing variance between
-batches, so read the ratios within a row.
+`n=128`).
+
+Absolute tok/s tracks the card's clock -- greedy reads 57-64 across batches --
+but the loop ratio does not: 1.64 at 57 tok/s greedy and 1.65 at 64. One
+outlier batch read 69.6 tok/s on the loop arm and was chased as a cold-start
+payoff-guard effect; it was **cleared**: three runs after 60 s idle read 94.4
+(guard on), 94.6 (guard off), 94.1 (guard on), so the guard is not the variable
+and no seeding change is warranted.
 
 On a 128-token prose run with no 6-gram match the ratio is 0.96×: the whole
 difference is trigger and loop overhead, so drafting is free when it does not
