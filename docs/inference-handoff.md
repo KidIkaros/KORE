@@ -639,36 +639,45 @@ path per column as the correctness oracle. Gates:
 - 64-token greedy ids identical between the device and host lanes.
 - GPU suite 32/33 (only the pre-existing `quantize_q8_rows` failure).
 
-Measured hot (same session, arms interleaved; device routing; `max_ctx=512`):
+Measured hot, arms interleaved and order reversed per round (device routing,
+`max_ctx=512`). Two clock states, so each block is self-consistent:
 
-| prompt | n | greedy | spec `6:6` | ratio |
+| prompt | n | greedy | spec `6:6` | spec `7:6` |
 |---|---|---|---|---|
-| repeated sentence | 128 | 48.7 / 49.1 | 66.3 / 66.0 | **1.35×** |
-| narrative prose | 400 | 54.5 | 61.2 | **1.12×** |
-| narrative prose | 128 | 46.7 / 47.5 | 44.96 (0 fires) | 0.96× |
+| repeated sentence | 128 | 51.9 / 48.8 | 74.6 / 66.6 → **1.40×** | 77.3 / 73.1 → **1.49×** |
+| narrative prose | 400 | 54.28 / 54.23 | 60.60 / 60.06 → **1.11×** | 59.46 / 59.69 → 1.10× |
 
-The last row is the honest floor: on 128 tokens this prompt has no 6-gram
-match, so the 4 % is the trigger and loop overhead, not drafting.
+On a 128-token prose run with no 6-gram match the ratio is 0.96×: the whole
+difference is trigger and loop overhead, so drafting is free when it does not
+fire, but not literally free.
 
-The verify pass costs **71.1 ms at `m=7`** against a ~17 ms plain step, i.e.
-`alpha = 0.53` -- above the 0.33 the dense 2B measures, which is why the fox arm
-lands at 1.35× and not the 1.7-3× the offline replay projected at `alpha <= 0.5`.
-The marginal column is not expert traffic (that is amortised: gate/up and down
-read the bank once); it is compute in the dense per-column parts -- attention
-projections, the shared expert and the GDN sweeps -- which stop being
-bandwidth-bound once `m` columns share one weight read. Prefill is single-column
-and is included in both rows.
+**Cost of a verify pass**, read from `KORE_SPEC_PROFILE` on the loop prompt
+(100 % acceptance, so every run is fired passes):
 
-`k` on the fox arm: `4:6` 65.0, `6:6` 66.2, `6:8` 66.8 tok/s, so `6` stays.
+| m | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|
+| ms/pass | 30.7 | 38.0 | 48.9 | 55.0 | 63.5 | 70.5 |
+
+That is linear with no knee: `C(m) ≈ 15 + 8·(m−1)` against a ~15 ms plain step,
+so `alpha = 0.53` and a batch column costs about **half** a sequential token.
+The 8 ms is not expert traffic -- gate/up and down read the bank once -- it is
+per-column work that cannot amortise: `gdn_step` (~2.2 ms per column, it sweeps
+the state for every column), the attention loop (10 attended layers, one
+dispatch per column) and GEMV arithmetic that stops being bandwidth-bound once
+`m` columns share a weight read.
+
+Because `C(m)` is linear and acceptance is 100 %, `k=7` wins on a loop (1.49×)
+and is neutral on prose (1.10 vs 1.11), so the shipped default stays `6:6` and
+`7:6` is a loop-only choice.
 
 ### Next, in order
 
 
-1. ~~**Speculative decoding for the MoE.**~~ Done: 1.35× on a loop, 1.12× on
-   narrative prose, 0.96× when nothing fires. The remaining leverage is
-   `alpha = 0.53`: the marginal verify column is compute in the per-column
-   dense parts, so the next attempt should measure a 7-column pass with the
-   GDN/attention legs removed before touching anything else.
+1. ~~**Speculative decoding for the MoE.**~~ Done: ~1.4-1.5× on a loop, 1.11×
+   on narrative prose, 0.96× when nothing fires. The remaining leverage is the
+   **8 ms marginal column**. `gdn_step` is the largest identified piece (~2.2 ms
+   per column), and the "split the sweeps across two thread groups" item below
+   just became 7× more valuable: 0.5-1 ms at `m=1` is 3-6 ms per `m=7` pass.
    The expert-strided GEMVs already take a per-position activation row
    (`x_stride`), so `down` works over `m*n_used` rows unchanged; `gate/up` do
    not, because their activation row is shared by all `n_used` experts of a
