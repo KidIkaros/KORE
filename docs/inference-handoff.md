@@ -644,17 +644,22 @@ Measured hot, `max_ctx=512`, device routing, `n=400` per arm so prefill is
 amortised the same way a user's run would be. The prompt is the same in both
 arms (each arm pays it once), so these are end-to-end tok/s:
 
-| regime | greedy | spec `6:6` | ratio | spec `6:8` |
+| regime | greedy | spec `6:6` | ratio | `7:6` |
 |---|---|---|---|---|
-| repeated sentence (loop) | 60.9 | 101.8 | **1.67×** | 101.8 |
-| repetitive code | 58.0 | 85.6 | **1.48×** | 67.2 |
-| narrative prose | 59.9 | 69.3 | **1.16×** | 69.9 |
-| technical prose | 60.3 | 59.1 | 0.98× | 62.4 |
+| repeated sentence (loop) | 66.8 | 117.9 | **1.76×** | 122.2 |
+| repetitive code | 68.6 | 101.5 | **1.48×** | — |
+| narrative prose | 69.2 | 76.9 | **1.11×** | — |
+| technical prose | 68.8 | 65.6 | 0.95× | — |
+
+Interleave the arms and reverse the order within one batch. A batch that runs
+`gpu` then `spec` for each prompt gives the spec arm the settled (slower) clock
+every time and reads 10-30 % low -- the code arm measured 71.4 tok/s that way
+and 101.5 in a proper `gpu, spec, spec, gpu` A/B. The table above is the latter.
 
 Repetitive code is the second-biggest win, not a wash: the replay's code stream
 happened not to repeat, but real code reuses the same call shape and the 6-gram
-trigger catches it. `min_match=8` removes the 2 % technical loss but costs 22 %
-on code (those wins are 6- and 7-gram repeats), so `6:6` stays.
+trigger catches it. `min_match=8` removes the technical loss but costs 22 % on
+code (those wins are 6- and 7-gram repeats), so `6:6` stays.
 
 **MoE prefill batches again.** `prefill` used to force width 1 whenever
 `n_experts > 0`, which was only true because the routed FFN rejected
@@ -692,10 +697,10 @@ fire, but not literally free.
 
 | m | 3 | 4 | 5 | 6 | 7 | 8 |
 |---|---|---|---|---|---|---|
-| ms/pass | 28.5 | 35.3 | 45.8 | 52.6 | 59.6 | 66.2 |
+| ms/pass | 25.8 | 31.7 | 40.9 | 46.8 | 52.9 | 58.9 |
 
-Linear with no knee, `C(m) ≈ 13.5 + 7.5·(m−1)`. Against a ~17 ms plain step a
-marginal column is **~7.5 ms, about 45 % of one token** (`alpha ≈ 0.45`). It is
+Linear with no knee, `C(m) ≈ 13.8 + 6.0·(m−1)`. Against a ~15 ms plain step a
+marginal column is **~6.0 ms, about 40 % of one token** (`alpha ≈ 0.40`). It is
 not expert traffic -- gate/up and down read the bank once -- it is per-column
 work that cannot amortise: `gdn_step` (the state sweep runs per column), the
 attention loop (10 attended layers, one dispatch per column) and GEMV arithmetic
@@ -709,17 +714,42 @@ and `verify_m` is still green -- and one 64 KB re-read per head disappeared.
 Same-clock old/new pairs: loop arm 77.6/78.0 → 80.2/80.2 tok/s (+3.0 %), prose
 67.7 → 69.4 (+2.4 %), `m=7` pass 63.5 → 59.6 ms.
 
-Because `C(m)` is linear and acceptance is 100 %, `k=7` beats `k=6` on a loop
-(83.2 vs 79.6 tok/s) and was neutral on prose pre-fusion, so `6:6` stays the
-default and `7:6` is a loop-only choice.
+**`gdn_step` splits each state sweep across two thread groups.** Group `g` owns
+rows `g*d_v/2 ..` of every head, so each lane's dependent `i` chain is 64 steps
+instead of 128 and a workgroup carries 8 warps instead of 4. The two partial
+sums are added at the end of the dot and of the readout, which reassociates two
+128-term folds into 64-term pairs. Everything else keeps its order: the state
+update is still per element, and both L2 norms plus the RMS reduction are run
+redundantly by each group on identical values, so they are unchanged.
+
+The tolerance evidence, since this is a reassociation and not a bit-exact
+change:
+
+- `test_vulkan_gdn_step_split_matches_reference` against an f64 reference:
+  state `max|d| = 2.07e-8` on a scale of `0.27`, output `max|d| = 4.75e-7` on a
+  scale of `1.44` -- a few ulp.
+- 400-token greedy stream: identical to both the pre-split device lane *and*
+  the f32 CPU lane, i.e. the ulp change did not flip a single argmax.
+- `verify_m m=8` still bit-identical to sequential decode (every column runs the
+  same kernel, so this is unaffected by the tolerance).
+
+Same-clock old/new: greedy 62.1/62.0 → 66.8/66.8 (+7.6 %), loop spec
+104.4/105.0 → 117.5/118.2 (+12.4 %), prose spec 70.8 → 76.3 (+7.8 %), `m=7`
+pass 59.6 → 52.9 ms. Note the side effect: the plain step gains more than the
+fired pass, so the *ratio* narrows on low-acceptance prose (1.16 → 1.11) and
+technical prose (0.98 → 0.95) even though every arm is faster in tok/s.
+
+Because `C(m)` is linear and acceptance is 100 %, `k=7` now beats `k=6` on a
+loop (122.2 vs 117.9 tok/s); it has not been re-measured on prose, so `6:6`
+stays the default and `7:6` is a loop-only choice.
 
 ### Next, in order
 
 
-1. ~~**Speculative decoding for the MoE.**~~ Done: 1.67× on a loop, 1.48× on
-   repetitive code, 1.16× on narrative prose, 0.98× on technical prose, and
+1. ~~**Speculative decoding for the MoE.**~~ Done: 1.76× on a loop, 1.48× on
+   repetitive code, 1.11× on narrative prose, 0.95× on technical prose, and
    0.96× when nothing fires at all. The remaining leverage is the
-   **7.5 ms marginal column**, and it is mostly structural. The delta-rule state
+   **6.0 ms marginal column**, and it is structural. The delta-rule state
    cannot batch across columns (column `r+1`'s state depends on `r`), and the
    per-column attention call is deliberate, not an oversight: the split-KV
    kernel is `seq_q == 1` only, and the comment at the call site records that one
@@ -727,36 +757,17 @@ default and `7:6` is a loop-only choice.
    full `seq_k` for every row. So the lever is the *per-step* cost of
    `gdn_step`, which helps greedy as much as spec.
 
-   Shape today: 30 dispatches per step (one per GDN layer), each `n_v`
-   workgroups (32) of 128 threads -- 4 warps per workgroup and one workgroup per
-   CU, ~56 GB/s effective (2.2 ms/step against a ~61 MB state walked twice).
-   **Occupancy is not the problem**: packing two heads into one 256-lane
-   workgroup (bit-exact) measured −2.2 % on greedy and −2.1 % on spec. That
-   leaves the per-lane serial `i` chain, so the remaining candidate is a
-   two-thread-group split of each sweep (halves the chain, reassociates the dot
-   and readout sums). It needs a tolerance argument plus a `max|d|` report
-   rather than a token-id diff, and it is the only lever left of this size.
-   First experiment inside the milestone came back **negative** (see
-   `docs/research-sparse-attention.md` §4): match-length-scheduled `k` has no
-   signal to key on. `KORE_SPEC_PROFILE` now prints acceptance per match length,
-   and on the dense 2B the length is either saturated (looping output, 96-100 %
-   acceptance) or just above `min_match` (fibonacci: 50 % falling to 25 %, the
-   whole fire loses at 0.995x, which the payoff guard already handles). The
-   instrumentation stays; the schedule is closed.
-   The batch path now has two primitives. `router_matvec_cols` (column is
-   `workgroup_id.y`) is bit-identical to one dispatch per column
-   (`test_vulkan_router_matvec_cols_matches_single_column`). The expert-strided
-   Q2_K/Q3_K GEMVs take a `pos_div` uniform: position `p` reads activation row
-   `p / pos_div`, where `pos_div` is `n_used` for a verify batch and 1 for a
-   single token. Every existing call passes 1, and the device lane still emits
-   the host lane's 64-token ids exactly. The `pos_div > 1` path has no caller
-   yet; its gate is the batch FFN's `verify_m` (bit-identity at `m=1..8`), so it
-   must be checked there rather than assumed.
-2. **`gdn_gates` (1.8 ms) and what is left of `gdn_step` (~2.9 ms).** The
-   i-major state made `gdn_step` coalesce; its three 128-step sweeps are still
-   one workgroup per head (16 workgroups), so it occupies half the CUs. Splitting
-   the sweeps across two thread groups per head would reassociate the sums, which
-   needs a tolerance argument rather than byte-identity.
+   The per-step cost of `gdn_step` is now split across two thread groups (see
+   above), which took the `m=7` pass from 59.6 to 52.9 ms. The next lever is the
+   **payoff guard on low-acceptance prose**: technical prose reads 0.95× because
+   a fire that loses still gets re-probed every 16 plain steps, and the plain
+   step got 15 % faster while the lost fire did not. A re-probe that backs off
+   (16, 32, 64 plain steps) until a fire wins again would remove the residual
+   loss without touching the code arm, where fires do win.
+2. ~~**`gdn_step` chain split**~~ Done: two thread groups, tolerance pinned by
+   `test_vulkan_gdn_step_split_matches_reference` (`max|d|` ~2e-8 state, ~5e-7
+   output) and a 400-token stream identical to both the pre-split device lane and
+   the CPU lane.
 3. ~~Fuse SwiGLU with the routing scale, and `sum_rows` with the shared-expert
    add~~ Done: `swiglu_rows` (mode-2 `row_scale`) and `sum_rows_add` (bias
    binding), 120 dispatches and +1.7 %. The host lane reads the same kernels but

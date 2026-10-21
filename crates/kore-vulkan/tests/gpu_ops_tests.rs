@@ -285,6 +285,143 @@ fn test_vulkan_router_matvec_cols_matches_single_column() {
     }
 }
 
+/// The split `gdn_step` reassociates two 128-term sums (the state dot and the
+/// readout) into two 64-term halves. This pins down what that costs against a
+/// double-precision reference: the state and the head output must agree to a
+/// few ulp of their own magnitude. The bound is deliberately loose relative to
+/// the measured error so it catches an indexing bug, not a rounding change.
+#[test]
+fn test_vulkan_gdn_step_split_matches_reference() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let n_v = 2usize;
+    let n_k = 2usize;
+    let d = 128usize;
+    let eps = 1e-6f32;
+    let mut seed = 0x1234_5678u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 8) as f32 / (1u32 << 24) as f32
+    };
+    let sym = |x: f32| x * 2.0 - 1.0;
+
+    let qkv: Vec<f32> = (0..2 * n_k * d + n_v * d).map(|_| sym(next())).collect();
+    let z: Vec<f32> = (0..n_v * d).map(|_| sym(next())).collect();
+    let state: Vec<f32> = (0..n_v * d * d).map(|_| sym(next()) * 0.5).collect();
+    let beta: Vec<f32> = (0..n_v).map(|_| 0.25 + 0.5 * next()).collect();
+    // Negative so `decay = exp(gate)` is a contraction, as in the model.
+    let gate: Vec<f32> = (0..n_v).map(|_| -2.0 * next()).collect();
+    let norm_w: Vec<f32> = (0..d).map(|_| 0.5 + next()).collect();
+
+    // One call: the kernel updates `state` in place, as the model relies on.
+    // The state has to be a *device* tensor first, or `from_storage` uploads a
+    // private copy and the in-place update is invisible after the call.
+    let dev_state = Tensor::from_f32(&state, &[n_v * d * d])
+        .to(kore_core::Device::Vulkan(0))
+        .expect("state to device");
+    let got_out = backend
+        .gdn_step(
+            &Tensor::from_f32(&qkv, &[qkv.len()]),
+            &Tensor::from_f32(&z, &[n_v * d]),
+            &dev_state,
+            &Tensor::from_f32(&beta, &[n_v]),
+            &Tensor::from_f32(&gate, &[n_v]),
+            &Tensor::from_f32(&norm_w, &[d]),
+            n_v,
+            n_k,
+            d,
+            d,
+            eps,
+        )
+        .expect("gdn_step");
+    let got_out = got_out
+        .to(kore_core::Device::Cpu)
+        .unwrap()
+        .as_f32_slice()
+        .unwrap()
+        .to_vec();
+    let got_state = dev_state
+        .to(kore_core::Device::Cpu)
+        .unwrap()
+        .as_f32_slice()
+        .unwrap()
+        .to_vec();
+
+    // f64 reference: the same update, original 0..d order, no sharing.
+    let mut want_state = state.iter().map(|&x| x as f64).collect::<Vec<_>>();
+    let mut want_out = vec![0.0f64; n_v * d];
+    for hv in 0..n_v {
+        let hk = hv % n_k;
+        let q_off = hk * d;
+        let k_off = n_k * d + hk * d;
+        let v_off = 2 * n_k * d + hv * d;
+        let s_base = hv * d * d;
+        let mut k = (0..d).map(|i| qkv[k_off + i] as f64).collect::<Vec<_>>();
+        let mut q = (0..d).map(|i| qkv[q_off + i] as f64).collect::<Vec<_>>();
+        let kn: f64 = k.iter().map(|x| x * x).sum();
+        let qn: f64 = q.iter().map(|x| x * x).sum();
+        let kinv = 1.0 / kn.sqrt().max(eps as f64);
+        let qinv = 1.0 / qn.sqrt().max(eps as f64);
+        for x in k.iter_mut() {
+            *x *= kinv;
+        }
+        for x in q.iter_mut() {
+            *x *= qinv;
+        }
+        let decay = (gate[hv] as f64).exp();
+        let b = beta[hv] as f64;
+        let mut dlt = vec![0.0f64; d];
+        for j in 0..d {
+            let mut dot = 0.0f64;
+            for i in 0..d {
+                dot += want_state[s_base + i * d + j] * k[i];
+            }
+            dlt[j] = (qkv[v_off + j] as f64 - decay * dot) * b;
+        }
+        let mut o = vec![0.0f64; d];
+        for j in 0..d {
+            let mut acc = 0.0f64;
+            for i in 0..d {
+                let idx = s_base + i * d + j;
+                want_state[idx] = decay * want_state[idx] + k[i] * dlt[j];
+                acc += want_state[idx] * q[i];
+            }
+            o[j] = acc / (d as f64).sqrt();
+        }
+        let ss: f64 = o.iter().map(|x| x * x).sum();
+        let rms = 1.0 / (ss / d as f64 + eps as f64).sqrt();
+        for j in 0..d {
+            let zv = z[hv * d + j] as f64;
+            let silu = zv / (1.0 + (-zv).exp());
+            want_out[hv * d + j] = o[j] * rms * norm_w[j] as f64 * silu;
+        }
+    }
+
+    let mut max_state = 0.0f64;
+    for (a, b) in got_state.iter().zip(want_state.iter()) {
+        max_state = max_state.max((*a as f64 - *b).abs());
+    }
+    let mut max_out = 0.0f64;
+    for (a, b) in got_out.iter().zip(want_out.iter()) {
+        max_out = max_out.max((*a as f64 - *b).abs());
+    }
+    let scale_state = want_state.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    let scale_out = want_out.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    eprintln!(
+        "gdn_step split vs f64: state max|d| {max_state:.3e} (scale {scale_state:.3e}),          out max|d| {max_out:.3e} (scale {scale_out:.3e})"
+    );
+    assert!(
+        max_state <= 1e-5 * scale_state.max(1.0),
+        "state deviates {max_state:e} from the reference"
+    );
+    assert!(
+        max_out <= 1e-5 * scale_out.max(1.0),
+        "output deviates {max_out:e} from the reference"
+    );
+}
+
 /// A verify batch picks experts for every column in one dispatch. The column
 /// is `workgroup_id.y` and each column keeps its own sequential normaliser, so
 /// ids, weights and the shared gate must match one call per column exactly.

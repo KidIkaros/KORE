@@ -5354,6 +5354,13 @@ impl VulkanBackend {
         d_v: usize,
         eps: f32,
     ) -> Result<Tensor> {
+        // The shader maps lane `j` straight onto a state column and splits the
+        // `i` range in half, so both dims are the 128 the warp layout assumes.
+        if d_k != 128 || d_v != 128 {
+            return Err(VulkanError::UnsupportedOperation(format!(
+                "gdn_step expects d_k = d_v = 128, got d_k = {d_k}, d_v = {d_v}"
+            )));
+        }
         let qkv_buf = KoreVulkanBuffer::from_storage(
             qkv.storage_ref(),
             qkv.shape().dims(),
