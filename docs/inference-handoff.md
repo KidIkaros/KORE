@@ -579,7 +579,8 @@ no longer launch-bound; it is spread across GDN, attention and the MoE matvecs.
 | **Device-side embedding handoff** | Would buy nothing. `KORE_STEP_PROFILE=1` shows the host is idle **11.3 ms of a 16.1 ms step**: the per-token round trip is fully hidden behind the GPU. Not built. |
 | **Sparse attention (DSA / CSA / CSA2)** | Not applicable, and not worth it here even if it were free. All three are pretraining changes a frozen GGUF cannot adopt; attention costs at most ~0.9 ms in a ~16 ms step, and the step is only 0.6 ms slower at 8K tokens than at 96, because only 10 of 40 layers attend and they keep 2 KV heads (~11 KB/token). Mechanisms and the spec-decode interaction: `docs/research-sparse-attention.md`. |
 | **Pre-batch snapshot + replay instead of per-column snapshots** | Not worth it. `copy_buffer` now records a real buffer copy, so the per-column snapshots cost 1.15 ms per fired step, and the 6 cut steps in 192 tokens rewind in 0.19 ms each. |
-| **Two heads per `gdn_step` workgroup** (256 lanes, 8 warps) | Slower: loop greedy 60.8/61.3 → 59.9/60.1, spec 101.7/101.9 → 99.7/99.5 (−2.1 %), prose −0.9 %. Bit-exact (device ids unchanged), so the kernel is not short of warps -- the extra warps just contend for the same memory pipeline. Reverted. The suspect is now the per-lane serial `i` chain, not occupancy. |
+| **Two heads per `gdn_step` workgroup** (256 lanes, 8 warps) | Slower: loop greedy 60.8/61.3 → 59.9/60.1, spec 101.7/101.9 → 99.7/99.5 (−2.1 %), prose −0.9 %. Bit-exact (device ids unchanged). This was the wrong shape: 16 workgroups of 256 left half the CUs idle, so it never tested the chain. Splitting each sweep's *rows* across two groups keeps 32 workgroups and halves the chain -- that is the win recorded above (+7.6 % greedy, +12.4 % loop spec). |
+| **Payoff-guard re-probe backoff** (16 → 32 → 64 plain steps) | Slower on the arm it was meant to fix: technical prose 66.5 → 64.8 tok/s. The fires it suppressed were winners -- `6:6:0` fires 24 times for 66.62 tok/s, the shipped guard 18 for 66.46, the backoff 12 for 64.77 -- because ~4.3 tokens per 52.5 ms pass beats ~14.7 ms per plain token. The 0.95× reading was the clock, not the guard (see the note under the regime table). Reverted. |
 
 ### Dense at the current state
 
@@ -656,6 +657,14 @@ Interleave the arms and reverse the order within one batch. A batch that runs
 every time and reads 10-30 % low -- the code arm measured 71.4 tok/s that way
 and 101.5 in a proper `gpu, spec, spec, gpu` A/B. The table above is the latter.
 
+**A low-acceptance arm's ratio moves with the core clock.** Technical prose
+reads 0.95× with the plain step at 68.7 tok/s and 1.00× with it at 66.3 -- same
+binary, same prompt, four interleaved runs each way. The plain step is
+latency-bound and tracks the core clock; a fired pass has more parallel work and
+sits closer to bandwidth-bound, so the two arms do not scale together. Always
+report the greedy arm next to a sub-1.05× ratio: one absolute pair is a
+measurement of the clock as much as of the policy.
+
 Repetitive code is the second-biggest win, not a wash: the replay's code stream
 happened not to repeat, but real code reuses the same call shape and the 6-gram
 trigger catches it. `min_match=8` removes the technical loss but costs 22 % on
@@ -682,7 +691,10 @@ table above predates this change (it adds ~2-3 % at `n=400` and ~9 % at
 `n=128`).
 
 Absolute tok/s tracks the card's clock -- greedy reads 57-64 across batches --
-but the loop ratio does not: 1.64 at 57 tok/s greedy and 1.65 at 64. One
+but the loop ratio does not: 1.64 at 57 tok/s greedy and 1.65 at 64. That
+stability is a property of the loop arm (100 % acceptance, so both arms are the
+same fired pass), not of the ratio in general; see the technical-prose note
+above. One
 outlier batch read 69.6 tok/s on the loop arm and was chased as a cold-start
 payoff-guard effect; it was **cleared**: three runs after 60 s idle read 94.4
 (guard on), 94.6 (guard off), 94.1 (guard on), so the guard is not the variable
@@ -747,9 +759,10 @@ stays the default and `7:6` is a loop-only choice.
 
 
 1. ~~**Speculative decoding for the MoE.**~~ Done: 1.76× on a loop, 1.48× on
-   repetitive code, 1.11× on narrative prose, 0.95× on technical prose, and
-   0.96× when nothing fires at all. The remaining leverage is the
-   **6.0 ms marginal column**, and it is structural. The delta-rule state
+   repetitive code, 1.11× on narrative prose, 0.95-1.00× on technical prose
+   (clock-dependent, see the note above), and 0.96× when nothing fires at all.
+   The remaining leverage is the **6.0 ms marginal column**, and it is
+   structural. The delta-rule state
    cannot batch across columns (column `r+1`'s state depends on `r`), and the
    per-column attention call is deliberate, not an oversight: the split-KV
    kernel is `seq_q == 1` only, and the comment at the call site records that one
@@ -758,12 +771,18 @@ stays the default and `7:6` is a loop-only choice.
    `gdn_step`, which helps greedy as much as spec.
 
    The per-step cost of `gdn_step` is now split across two thread groups (see
-   above), which took the `m=7` pass from 59.6 to 52.9 ms. The next lever is the
-   **payoff guard on low-acceptance prose**: technical prose reads 0.95× because
-   a fire that loses still gets re-probed every 16 plain steps, and the plain
-   step got 15 % faster while the lost fire did not. A re-probe that backs off
-   (16, 32, 64 plain steps) until a fire wins again would remove the residual
-   loss without touching the code arm, where fires do win.
+   above), which took the `m=7` pass from 59.6 to 52.9 ms.
+
+   The payoff guard's re-probe was the obvious suspect for the technical-prose
+   loss, and it was **measured and rejected**. Backing the re-probe off
+   (16 -> 32 -> 64 plain steps after each losing probe, with the wait reset by a
+   winning fire) made the arm *worse*: 64.8 vs 66.5 tok/s on the same profile.
+   The profile says why. `6:6:0` (guard off) fires 24 times for 66.62 tok/s; the
+   shipped guard fires 18 for 66.46; the backoff fires 12 for 64.77. The fires it
+   suppressed were winners -- 79 drafts accepted over 24 fires is ~4.3 tokens per
+   52.5 ms pass against ~14.7 ms per plain token -- and the guard pauses on a
+   6-fire window that two low-acceptance draws can dominate. Suppressing fires
+   is not free on this arm, so there is no backoff to win.
 2. ~~**`gdn_step` chain split**~~ Done: two thread groups, tolerance pinned by
    `test_vulkan_gdn_step_split_matches_reference` (`max|d|` ~2e-8 state, ~5e-7
    output) and a 400-token stream identical to both the pre-split device lane and
