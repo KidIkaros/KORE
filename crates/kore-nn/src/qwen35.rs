@@ -3631,14 +3631,17 @@ impl Qwen35Gpu {
         if prompt.is_empty() {
             return Err(err("prefill needs at least one token"));
         }
-        // Each column of a routed FFN picks its own experts, so a four-column
-        // chunk would not amortise the expert read the way it amortises a
-        // resident weight -- it would multiply the traffic instead.
-        let width = if self.cfg.n_experts > 0 {
-            1
-        } else {
-            PREFILL_CHUNK
-        };
+        // A routed FFN cannot share an expert read across columns -- each one
+        // picks its own eight experts, so the bank traffic per token is what it
+        // is -- but that is the only thing that does not amortise. The routed
+        // FFN now takes all `PREFILL_CHUNK` columns in one set of dispatches
+        // (`moe_ffn_gpu_resident` over `cols`, `pos_div = n_used`), so the dense
+        // projections, both Hadamards and the shared expert stream their weights
+        // once per chunk instead of once per token, and the dispatch count drops
+        // by the chunk width. The per-column state (GDN conv + recurrence,
+        // attention) still runs column by column, which is what keeps a chunk
+        // bit-identical to that many single-token steps.
+        let width = PREFILL_CHUNK;
         let n_chunks = prompt.len().div_ceil(width);
         let mut out = Vec::new();
         for (i, chunk) in prompt.chunks(width).enumerate() {

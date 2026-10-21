@@ -59,7 +59,7 @@ change it.
 | GGUF load (K-quants, Q2_0…Q8_0, F32/F16 first-class) | `kore-nn/src/qwen35.rs`, `kore-kernels/` | done |
 | Dense decode (CPU + GPU lanes) | `qwen35.rs` | done |
 | Batched decode, up to 8 columns | `forward_batch`, `MAX_BATCH_COLS = 8` (`qwen35.rs:132`) | done, two row groups; `verify_m` bit-identical |
-| Chunked prefill | `prefill` (`qwen35.rs:3006`) | done |
+| Chunked prefill | `prefill` (`qwen35.rs:3006`) | done, `PREFILL_CHUNK = 8` including the routed FFN |
 | Split-KV long-context decode attention | `kore-vulkan/src/backend.rs` | done |
 | Q2_0 / Q4_K / Q5_K / Q6_K / Q8_0 GPU GEMV | `backend.rs` | done |
 | MoE engine (host routing, promote-on-miss expert cache, LRU) | `qwen35.rs` `moe_ffn_gpu` (`:2577`), `DeviceBank` (`:1954`) | done, v1 |
@@ -68,8 +68,8 @@ change it.
 | Rewind engine + per-row Delta-state snapshots | `new_rewind`/`rewind` (`:3040`,`:3097`) | done |
 | P6.6a: rotated KV quant | KV dump + probe | done, **opt-in** (capacity-only) |
 
-**Not built, on purpose:** tree/beam drafting, CUDA backend, expert requant (P12),
-prefill batching beyond the MoE boundary. See §8.
+**Not built, on purpose:** tree/beam drafting, CUDA backend, expert requant (P12).
+See §8.
 
 **The two most useful files to read first:** `crates/kore-nn/src/qwen35.rs` (the
 whole model, both lanes) and `crates/kore-vulkan/src/backend.rs` (the whole Vulkan
@@ -655,6 +655,27 @@ Repetitive code is the second-biggest win, not a wash: the replay's code stream
 happened not to repeat, but real code reuses the same call shape and the 6-gram
 trigger catches it. `min_match=8` removes the 2 % technical loss but costs 22 %
 on code (those wins are 6- and 7-gram repeats), so `6:6` stays.
+
+**MoE prefill batches again.** `prefill` used to force width 1 whenever
+`n_experts > 0`, which was only true because the routed FFN rejected
+`rows != 1`. With `moe_ffn_gpu_resident` taking `cols`, the chunk is back to
+`PREFILL_CHUNK = 8`: the dense projections, both Hadamards and the shared expert
+stream once per chunk and the dispatch count drops 8x. The routed bank read
+does *not* amortise -- each column picks its own eight experts -- so that sets
+the floor, and it is why the win is 1.8x and not 5x.
+
+| measurement | before | after |
+|---|---|---|
+| 501-token prompt, prefill only | 6.29 s (12.6 ms/token) | **3.50 s (7.0 ms/token)** |
+| 501-token prompt + 64 greedy | 8.92 tok/s | **14.54 tok/s (1.63x)** |
+| 23-token prompt, 128 spec | 79.9 tok/s | **86.8 tok/s** |
+| 23-token prompt, 400 spec | 101.8 tok/s | **105.3 tok/s**, ids identical |
+
+Gates: `verify_m` prefill leg at `m=4` and `m=8` (57 positions bit-identical to
+sequential decode), and the 64-token device-vs-host id check still exact. The
+table above predates this change (it adds ~2-3 % at `n=400` and ~9 % at
+`n=128`), and spec arms carry a few percent of guard-timing variance between
+batches, so read the ratios within a row.
 
 On a 128-token prose run with no 6-gram match the ratio is 0.96×: the whole
 difference is trigger and loop overhead, so drafting is free when it does not
