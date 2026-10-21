@@ -599,17 +599,50 @@ policy: on the repetitive stream the fully-accepted cost per token falls to
 3.51 ms at `m=7` (from 3.88 ms at `m=4`), and the projected optimum moved from
 `k=3` to `k=6`; `k=7` loses because the eighth draft almost never lands.
 
+### MoE speculative headroom, measured offline
+
+`spec_replay` replays an existing greedy stream through the real `DraftPolicy`
+and projects throughput, so the batch path's value was settled before any
+kernel work. Four 400-token MoE streams, `k=6 min_match=6`, `c1 = 16.1 ms`,
+1.15 ms snapshot per fire, `C(m) = c1 * (1 + alpha*(m-1))`:
+
+| stream | fires | drafts accepted | ratio at alpha 0.2 / 0.3 / 0.4 / 0.5 |
+|---|---|---|---|
+| repeated sentence (loop) | 100 % | 100 % | 3.09× / 2.44× / 2.02× / 1.72× |
+| narrative prose (400-token story) | 9.4 % | 89.3 % | 1.34× / 1.28× / 1.22× / 1.17× |
+| technical explanation (mutex vs semaphore) | 2.3 % | 14.8 % | 0.99× / 0.98× / 0.97× / 0.96× → **1.00×** under the guard |
+| code from the prompt | 0.8 % | 38.9 % | 1.01× / 1.01× / 1.00× / 1.00× |
+
+The win is **workload-dependent**, and the shape is the same as dense (1.58×
+repetitive / 1.38× prose) with a lower prose floor: ~1.2–1.3× on echo-rich
+narrative, 2–3× on repetition, nothing on technical exposition — there the few
+fires lose, and the payoff guard pauses them, so it is a no-op rather than a
+loss. `min_match=8` is within noise of 6 on prose (1.29× vs 1.28×) and removes
+the technical fires entirely; the default stays 6 to match dense.
+
+The projection's one unknown is `alpha`, the marginal cost of a verify column.
+Dense measures ~0.33 (24.6 ms at `m=7` against a 7.9 ms plain step); if the MoE
+pass amortises its expert reads the same way it lands in that band, where
+repetitive is ~2.3× and prose ~1.26×. The first batch measurement replaces the
+sweep — and it is the only number that can still cancel the milestone.
+
 ### Next, in order
 
-1. **Speculative decoding for the MoE.** This is the only lever left that is
-   worth more than a few percent: the dense path measures 1.7×, and the device
-   routed MoE is much closer to supporting `m > 1` than the note below assumed.
+1. **Speculative decoding for the MoE.** Decision: **build it**, with the
+   workload caveat above. This is the only lever left worth more than a few
+   percent (kernel work is into single digits), and on the two regimes where
+   users actually feel the difference — long narrative and loops — it is 1.2×
+   to 3×. It is also free on technical prose, because the guard only fires when
+   a fire beats a plain step.
    The expert-strided GEMVs already take a per-position activation row
-   (`x_stride`), so `gate/up` and `down` work over `m*n_used` rows unchanged;
-   what is missing is per-column routing (one router matvec + top-k per column,
-   `idx` laid out as `column*n_used + e`), a per-column SwiGLU scale vector, and
-   the `moe_ffn_gpu_host` `rows != 1` rejection. `forward_batch` and the
-   snapshot/rewind machinery already handle columns for the dense model.
+   (`x_stride`), so `down` works over `m*n_used` rows unchanged; `gate/up` do
+   not, because their activation row is shared by all `n_used` experts of a
+   column and the shader maps `pos` straight to the row (see the `pos_div` note
+   below). The rest of what is missing: per-column routing (one router matvec +
+   top-k per column, `idx` laid out as `column*n_used + e`), a per-column SwiGLU
+   scale vector, and the `moe_ffn_gpu_host` `rows != 1` rejection.
+   `forward_batch` and the snapshot/rewind machinery already handle columns for
+   the dense model.
    First experiment inside the milestone came back **negative** (see
    `docs/research-sparse-attention.md` §4): match-length-scheduled `k` has no
    signal to key on. `KORE_SPEC_PROFILE` now prints acceptance per match length,
