@@ -718,6 +718,34 @@ work that cannot amortise: `gdn_step` (the state sweep runs per column), the
 attention loop (10 attended layers, one dispatch per column) and GEMV arithmetic
 that stops being bandwidth-bound once `m` columns share a weight read.
 
+**What a step is made of.** `KORE_OP_COUNT=1` census, greedy, 8 steps, 823
+dispatches per step:
+
+| label | /step | | label | /step |
+|---|---|---|---|---|
+| `had_pre_pass` | 171 | | `gdn_gates/conv/step_pass` | 30 each |
+| `gemv_q2_k` | 152 | | `gemv_q3_k` | 20 |
+| `gemv_q4_k` | 100 | | `quantize_q8_rows` | 20 |
+| `gemv_q8_0` | 95 | | `qknorm_rope` | 10 |
+| `router_matvec` / `moe_topk` / `sum_rows` | 40 each | | `kv_append` x3 / `flash_decode_gqa` | 10 each |
+
+`KORE_STEP_PROFILE` splits the 14.24 ms step into **5.07 ms host encode + 9.05 ms
+queue drain** (1.6 ms of the encode hides under the GPU because a flush happens
+every 48 ops). That is **6.2 µs of host time per dispatch** -- the dispatch floor
+-- and ~13 µs of GPU time per dispatch, of which ~6 µs is launch. So the step is
+limited by *dispatch count on both sides*, not by arithmetic. The sweep in the
+`KORE_BATCH_OPS` comment shows the host/GPU overlap is already at its optimum:
+finer flushes move time from the drain to the encode and the sum rises.
+
+`KORE_SKIP_OPS=had_pre_pass` is the one ablation that is safe to read (a rotation
+has no denormals, so the timing stays representative): it takes the step
+**14.27 → 12.45 ms (58.7 → 66.4 tok/s)**, i.e. 171 dispatches of 2048-element
+rotation cost **1.82 ms, 12.7 %**, split 1.23 host / 0.55 GPU. They cannot be
+batched across layers -- each one feeds the next GEMV in a strict sequence -- so
+the only lever there is folding the norm+rotate into a neighbour. The other skip
+rows (router, topk, sum_rows, gdn_gates) produce garbage that changes downstream
+timing, `gdn_gates` even makes the step slower; they are not ablations.
+
 **`gdn_step` fused update + readout.** The third state sweep is gone: the lane
 computes `S = decay*S + k*delta`, stores it, and accumulates `S·q` on the way.
 The values and the summation order are unchanged, so the kernel stayed
@@ -791,7 +819,9 @@ stays the default and `7:6` is a loop-only choice.
    add~~ Done: `swiglu_rows` (mode-2 `row_scale`) and `sum_rows_add` (bias
    binding), 120 dispatches and +1.7 %. The host lane reads the same kernels but
    is bandwidth-bound, so its tok/s did not move (15.7 vs 15.7, `n=64`).
-4. **Fuse routed gate+up into one dispatch.** Worked out, not built: put both
+4. **Fuse routed gate+up into one dispatch.** The census above is the argument:
+40 layers x 1 saved dispatch is ~0.25 ms of host encode and ~0.12 ms of GPU
+launch on its own, before the saved bank read. Worked out, not built: put both
    projections in one buffer as `[all experts' gate | all experts' up]`, dispatch
    `n = 2*n_used*F` rows with `rows_per_expert = F` and two extra uniforms
    (`n_pos = n_used`, `w2_off = n_experts*expert_words`) so the upper half reads
@@ -801,10 +831,17 @@ stays the default and `7:6` is a loop-only choice.
    the staging copy (`upload_u8` allocates twice) does not fit comfortably next
    to the mmapped GGUF. It needs a chunked upload (`alloc_u8` + `write_u8_at`)
    so the host peak is one chunk. 40 dispatches, ~0.7 ms.
-5. **Per-expert routing counters** for hot-set pinning on 8 GB cards
+5. **Dispatch count is the binding cost on both sides** (823/step, 6.2 µs host
+   + ~13 µs GPU each). After the gate+up fusion the next candidates, in
+   decreasing size, are `had_pre` (171, but sequential -- fold it into the
+   neighbouring normalize/GEMV rather than trying to batch it), the
+   `router_matvec` + `moe_topk` pair (40 + 40, would need the router to run in
+   one workgroup so the top-k can stay in shared memory) and the three
+   `kv_append` dispatches per attended layer (30).
+6. **Per-expert routing counters** for hot-set pinning on 8 GB cards
    (`KORE_MOE_RESIDENT=N` currently pins the first N, not the hottest N). See
    `docs/deepinfer-scaled-down.md` §3.
-6. **Device routing stays opt-in.** Peak VRAM is ~16.1 of 17.1 GB, so enabling
+7. **Device routing stays opt-in.** Peak VRAM is ~16.1 of 17.1 GB, so enabling
    it without a free-memory check would fail on a busy desktop.
 
 DeepInfer mapping and verdicts: `docs/deepinfer-scaled-down.md`.
