@@ -579,6 +579,7 @@ no longer launch-bound; it is spread across GDN, attention and the MoE matvecs.
 | **Device-side embedding handoff** | Would buy nothing. `KORE_STEP_PROFILE=1` shows the host is idle **11.3 ms of a 16.1 ms step**: the per-token round trip is fully hidden behind the GPU. Not built. |
 | **Sparse attention (DSA / CSA / CSA2)** | Not applicable, and not worth it here even if it were free. All three are pretraining changes a frozen GGUF cannot adopt; attention costs at most ~0.9 ms in a ~16 ms step, and the step is only 0.6 ms slower at 8K tokens than at 96, because only 10 of 40 layers attend and they keep 2 KV heads (~11 KB/token). Mechanisms and the spec-decode interaction: `docs/research-sparse-attention.md`. |
 | **Pre-batch snapshot + replay instead of per-column snapshots** | Not worth it. `copy_buffer` now records a real buffer copy, so the per-column snapshots cost 1.15 ms per fired step, and the 6 cut steps in 192 tokens rewind in 0.19 ms each. |
+| **Two heads per `gdn_step` workgroup** (256 lanes, 8 warps) | Slower: loop greedy 60.8/61.3 → 59.9/60.1, spec 101.7/101.9 → 99.7/99.5 (−2.1 %), prose −0.9 %. Bit-exact (device ids unchanged), so the kernel is not short of warps -- the extra warps just contend for the same memory pipeline. Reverted. The suspect is now the per-lane serial `i` chain, not occupancy. |
 
 ### Dense at the current state
 
@@ -701,14 +702,13 @@ default and `7:6` is a loop-only choice.
 
    Shape today: 30 dispatches per step (one per GDN layer), each `n_v`
    workgroups (32) of 128 threads -- 4 warps per workgroup and one workgroup per
-   CU, so it is latency-bound at ~56 GB/s effective (2.2 ms/step against a
-   ~61 MB state walked twice). Two ways to raise warps per workgroup:
-   (a) two heads per workgroup of 256 -- bit-exact, since each head keeps its
-   own 128-lane tree reduction; needs an even `n_v` (16 and 32 both are) and
-   barriers outside the validity mask for the tail; (b) a two-thread-group split
-   of the two sweeps, which halves the serial `i` chain but reassociates the dot
-   and readout sums, so it needs a tolerance argument plus a `max|d|` report
-   rather than a token-id diff. Try (a) first.
+   CU, ~56 GB/s effective (2.2 ms/step against a ~61 MB state walked twice).
+   **Occupancy is not the problem**: packing two heads into one 256-lane
+   workgroup (bit-exact) measured −2.2 % on greedy and −2.1 % on spec. That
+   leaves the per-lane serial `i` chain, so the remaining candidate is a
+   two-thread-group split of each sweep (halves the chain, reassociates the dot
+   and readout sums). It needs a tolerance argument plus a `max|d|` report
+   rather than a token-id diff, and it is the only lever left of this size.
    First experiment inside the milestone came back **negative** (see
    `docs/research-sparse-attention.md` §4): match-length-scheduled `k` has no
    signal to key on. `KORE_SPEC_PROFILE` now prints acceptance per match length,
