@@ -831,10 +831,13 @@ stays the default and `7:6` is a loop-only choice.
 5. **Dispatch count is the binding cost on both sides** (823/step, 6.2 µs host
    + ~13 µs GPU each). The remaining candidates, in decreasing size, are
    `had_pre` (171, but sequential -- fold it into the neighbouring
-   normalize/GEMV rather than trying to batch it), the `router_matvec` +
-   `moe_topk` pair (40 + 40, would need the router to run in one workgroup so
-   the top-k can stay in shared memory) and the three `kv_append` dispatches per
-   attended layer (30).
+   normalize/GEMV rather than trying to batch it) and the three `kv_append`
+   dispatches per attended layer (30). **Do not** fuse `router_matvec` into
+   `moe_topk` by moving the router into one workgroup: the router reads 256 x
+   2048 f16 = 1 MB per layer, which the current 256-workgroup matvec spreads
+   across every CU in ~5 us, while a single workgroup is stuck on one CU at
+   memory latency -- ~100 us a layer, 4 ms a step. The pair only looks cheap
+   because both labels cost the same 40 dispatches.
 6. **Per-expert routing counters** for hot-set pinning on 8 GB cards
    (`KORE_MOE_RESIDENT=N` currently pins the first N, not the hottest N). See
    `docs/deepinfer-scaled-down.md` §3.
