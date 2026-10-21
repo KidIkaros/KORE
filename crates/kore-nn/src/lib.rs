@@ -8,6 +8,7 @@ pub mod bit_linear;
 pub mod conv;
 pub mod dequant;
 pub mod dropout;
+pub mod flint;
 pub mod embedding;
 pub mod geometric;
 pub mod gguf_min;

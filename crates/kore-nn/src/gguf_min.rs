@@ -305,10 +305,22 @@ fn read_value(rd: &mut Rd, vtype: u32, store: bool) -> Result<Option<MetaVal>> {
                     }
                     MetaVal::I64Arr(v)
                 }
+                7 => {
+                    // Per-layer bool arrays (`attention.rope_pattern` and its
+                    // sliding-window twin) are the one place a GGUF spells a
+                    // 0/1 flag vector, and a hybrid-attention model cannot be
+                    // read without them. Store them in the integer array so a
+                    // caller has one shape to match on.
+                    let mut v = Vec::with_capacity(count.min(1 << 16));
+                    for _ in 0..count {
+                        v.push(rd.u8()? as i64);
+                    }
+                    MetaVal::I64Arr(v)
+                }
                 _ => {
                     // unsupported elem type: skip remaining elements
                     let esz = match et {
-                        0..=1 | 7 => 1usize,
+                        0..=1 => 1usize,
                         2..=3 => 2,
                         _ => return Err(err("bad array elem type")),
                     };

@@ -853,3 +853,84 @@ DeepInfer mapping and verdicts: `docs/deepinfer-scaled-down.md`.
   too (`q[0,13]: got 191, want 192`). It is a pre-existing tie-rounding
   disagreement between the test's expectation and the shader, not a regression
   from this work.
+
+## 14. A second architecture: Flint (40 B-A2.5 B MoE)
+
+`crates/kore-nn/src/flint.rs` is a host-path port of Recursive's Flint, and
+`cargo run --release -p kore-cli --example flint -- <gguf> <tokenizer.json>
+"<prompt>" <n>` runs it. The model is not a qwen35 variant: it is a plain
+transformer stack with hybrid attention.
+
+**Geometry** (from `flint.*` in the GGUF, cross-checked against
+`RecursiveSI/flint`'s `config.json` and the reference implementation in
+`github.com/recursive-oss/rec`, `engine/src/rec_mlx/model.py`):
+
+- 49 layers, the first **2 dense**, the remaining 47 routed.
+- 32 Q heads over 4 KV heads, `head_dim` 128, so `q` is 2048 -> 4096.
+- **35 layers slide over a 513-token window; 14 are full causal — and those 14
+  are exactly the ones with no RoPE** (`attention.rope_pattern`). Both patterns
+  ship as per-layer bool arrays, which is why `gguf_min` now stores type-7
+  arrays (as `I64Arr` of 0/1) instead of skipping them.
+- Q and K are RMS-normalised **per head** (`attn_q_norm` / `attn_k_norm` are
+  128-wide, shared by all heads) **before** RoPE.
+- Every attention layer carries `attn_sinks` (one learned scalar per Q head).
+  The sink is an extra softmax entry whose value is zero:
+  `p_i = exp(s_i) / (sum_j exp(s_j) + exp(sink))`. It cannot be modeled as an
+  extra KV row because the checkpoint has no such value row.
+- Routing is **sigmoid**, top-6 of 256, renormalised over the six
+  (`expert_weights_norm`), plus one dense shared expert (1024 wide) added
+  unconditionally. `expert_bias` is part of the training code but is zeros in
+  the checkpoint and absent from the GGUF.
+- Untied head: 2048 -> 150144, Q6_K. Vocab 150144.
+
+**Which file.** Every `unsloth/*` quant (UD-Q2_K_XL, UD-Q3_K_XL, UD-Q4_K_XL,
+UD-IQ3_XXS) mixes IQ formats into the expert banks (`IQ1_S`, `IQ2_S`,
+`IQ3_XXS`, `IQ3_S`, `IQ4_XS`), and the engine has no IQ dequantizer at all.
+`lmstudio-community/flint-Q4_K_M.gguf` (24.17 GB) is **100 % Q4_K / Q6_K /
+F32**, i.e. entirely inside the existing kernel set, so that is the file to use
+until IQ kernels exist. Nothing else needs to change to run another quant of
+this architecture in the same formats.
+
+**Numbers (i5-14400F, 31 GB RAM, `n=64`, greedy, page cache warm).** Decode is
+7.0-7.8 tok/s, i.e. ~0.13 s/step; prefill is the same rate because the path is
+one token at a time. Nothing is cached between steps: ~1.2 GB of packed weights
+is read per token (6 experts x 47 layers = 500 MB, attention 345 MB, head
+172 MB, dense + shared 165 MB), so the rate is the box's effective read
+bandwidth, ~9 GB/s, not arithmetic. The very first run took 2m17s for 5+23
+tokens because the 24 GB file had to come off disk; `free` then reads 23 GB of
+buff/cache and a second run is 30x faster. This is a *correctness* number, not a
+GPU number.
+
+**Correctness evidence.** There is no external oracle: llama.cpp master has no
+`flint` arch (neither `src/models/flint.cpp` nor `LLM_ARCH_FLINT` in
+`llama-model.cpp`/`llama-arch.cpp`), and HF modeling code is not published yet,
+so the reference is the MLX implementation above. What we have is (a) every
+config field matching it exactly, and (b) coherent generation: the chat-template
+form answers "The answer is Paris.", and a bare `def fibonacci(n):\n    if n <
+2:` continues `return n` / `return fibonacci(n-1) + fibonacci(n-2)` and then
+writes a `main`. The rope layout is the one genuinely ambiguous convention
+(split-half vs interleaved pairs); split-half is what the reference uses
+(`nn.RoPE(traditional=False)`) and it is what produces coherent text here.
+`KORE_FLINT_ROPE=pairs` exists only to re-test that on a second file and should
+be deleted once one confirms the layout.
+
+**What a device path needs**, in the order the work would pay:
+
+1. **A Q4_K expert-strided GEMV.** `wgemv_id` covers Q2_K/Q3_K only. Either add
+   the id branch to `gemv_q4_k.wgsl` (the Q2_K shader already shows the shape:
+   `w_off` / `rows_per_expert` / `expert_words`) or keep the streaming design
+   and upload the six selected experts into a staging bank per step.
+2. **Flash decode with a sink and a window start.** The q8 GQA kernel indexes
+   from token 0 and has no sink term; both are small additions, but they should
+   be a *new* shader rather than a change to the one the qwen MoE is gated on.
+   The sink is one extra `li += exp(sink - mi)` seed at `mi = sink`.
+3. **Per-head QK norm with optional RoPE.** `qknorm_rope.wgsl` is close but
+   assumes the `[q | gate]` interleaving that qwen35 has and flint does not.
+4. **Sigmoid gating** in place of the softmax the existing `moe_topk` path uses.
+
+The shape of the prize: the non-expert stack is ~0.9 GB and fits in VRAM, so the
+only cross-PCIe traffic is the 6 experts of each routed layer, ~350 MB/step
+(~17 ms at 20 GB/s) against a resident read of 0.9 GB at VRAM speed. That puts a
+first device path in the 20-30 ms/step range, i.e. 30-50 tok/s, versus 130 ms on
+the host. The 24 GB file itself cannot be resident in 16 GB, which is the same
+constraint the qwen 35B already lives under.

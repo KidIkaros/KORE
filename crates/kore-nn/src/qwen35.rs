@@ -323,7 +323,7 @@ fn gemv_f32(w: &[f32], m: usize, x: &[f32], out: &mut [f32]) {
 /// one can carry Q4_K, Q5_K and Q6_K tensors all at once (the 9B staging fixture
 /// does: Q5_K holds its 24 `ssm_out.weight` matrices).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum QKind {
+pub(crate) enum QKind {
     /// GGML type 0: plain f32. Routers keep this format even inside an
     /// otherwise K-quant file, so it is not a corner case.
     F32,
@@ -355,7 +355,7 @@ enum QKind {
 }
 
 impl QKind {
-    fn from_type_id(id: u32) -> Option<Self> {
+    pub(crate) fn from_type_id(id: u32) -> Option<Self> {
         match id {
             0 => Some(Self::F32),
             1 => Some(Self::F16),
@@ -389,7 +389,7 @@ impl QKind {
     }
 
     /// Weights per packed block.
-    const fn block(self) -> usize {
+    pub(crate) const fn block(self) -> usize {
         match self {
             Self::F32 | Self::F16 => 1,
             Self::Q2_0 => kore_kernels::q2_0::Q2_0_BLOCK,
@@ -399,7 +399,7 @@ impl QKind {
     }
 
     /// Bytes per packed block.
-    const fn block_bytes(self) -> usize {
+    pub(crate) const fn block_bytes(self) -> usize {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
@@ -468,24 +468,24 @@ unsafe impl ByteOwner for TensorBytes {
 /// arithmetic are chosen from `kind` inside [`QW::gemv`], so no layer struct has
 /// to know — or care — which format a particular file happens to use.
 #[derive(Clone)]
-struct QW {
-    name: String,
+pub(crate) struct QW {
+    pub(crate) name: String,
     /// Row length (GGUF `ne[0]`): the matvec's input width.
-    m: usize,
+    pub(crate) m: usize,
     /// Row count (GGUF `ne[1]`): the matvec's output width.
-    n: usize,
-    kind: QKind,
+    pub(crate) n: usize,
+    pub(crate) kind: QKind,
     /// Byte offset of this matrix inside the tensor's payload. Zero for a plain
     /// 2-D weight; `e * stride` for one expert of a stacked `[.., .., n_experts]`
     /// tensor, which is how a `qwen35moe` FFN addresses its experts without
     /// copying (or even touching) the ones it is not using.
-    off: usize,
+    pub(crate) off: usize,
     /// Zero-copy view over the packed bytes, resolved once at load. Keeps the
     /// file's mapping alive for as long as the model is.
-    shared: SharedBytes,
+    pub(crate) shared: SharedBytes,
     /// The whole-tensor owner, kept so an expert window can be re-sliced
     /// without copying.
-    owner: Arc<dyn ByteOwner>,
+    pub(crate) owner: Arc<dyn ByteOwner>,
 }
 
 /// Fused GEMV for the K-quant formats unpacked by [`k_quant`].
@@ -518,14 +518,14 @@ fn gemv_k_quant(w: &QW, x: &[f32], out: &mut [f32]) -> Result<()> {
 
 impl QW {
     /// The packed payload, `n * (m / block) * block_bytes` bytes.
-    fn bytes(&self) -> &[u8] {
+    pub(crate) fn bytes(&self) -> &[u8] {
         let all = self.shared.as_slice();
         let end = self.off.saturating_add(self.byte_len()).min(all.len());
         &all[self.off.min(all.len())..end]
     }
 
     /// Payload size of one matrix: `n * (m / block) * block_bytes`.
-    fn byte_len(&self) -> usize {
+    pub(crate) fn byte_len(&self) -> usize {
         self.n * self.row_bytes()
     }
 
@@ -540,15 +540,28 @@ impl QW {
     }
 
     /// Expert `e` of a stacked tensor whose slices are `stride` bytes apart.
-    fn expert(&self, e: usize, stride: usize) -> Self {
+    pub(crate) fn expert(&self, e: usize, stride: usize) -> Self {
         Self {
             off: self.off + e * stride,
             ..self.clone()
         }
     }
 
+    /// Rows `[start, start + count)` of the same matrix, as their own view.
+    ///
+    /// Rows are contiguous and each is a whole number of blocks, so this is a
+    /// byte-range re-slice like [`Self::expert`]. It is what lets a wide
+    /// projection be cut across threads without copying the matrix.
+    pub(crate) fn rows(&self, start: usize, count: usize) -> Self {
+        Self {
+            off: self.off + start * self.row_bytes(),
+            n: count,
+            ..self.clone()
+        }
+    }
+
     /// Bytes per matrix row.
-    fn row_bytes(&self) -> usize {
+    pub(crate) fn row_bytes(&self) -> usize {
         (self.m / self.kind.block()) * self.kind.block_bytes()
     }
 
@@ -557,7 +570,7 @@ impl QW {
     /// `x` must already be in whatever basis the weights are stored in — i.e.
     /// Hadamard-transformed exactly when the file is folded. That choice lives
     /// with the caller, because it is a property of the file, not of the format.
-    fn gemv(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
+    pub(crate) fn gemv(&self, x: &[f32], out: &mut [f32]) -> Result<()> {
         if x.len() != self.m || out.len() != self.n {
             return Err(err(&format!(
                 "'{}': gemv wants {}x{} but got x={} out={}",
@@ -591,7 +604,7 @@ impl QW {
     }
 
     /// One row, dequantized to f32.
-    fn row_f32(&self, index: usize) -> Result<Vec<f32>> {
+    pub(crate) fn row_f32(&self, index: usize) -> Result<Vec<f32>> {
         let rb = self.row_bytes();
         let start = index
             .checked_mul(rb)
