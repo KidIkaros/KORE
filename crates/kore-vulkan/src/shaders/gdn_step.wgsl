@@ -89,17 +89,18 @@ fn main(
     kq[384u + j] = (kq[256u + j] - decay * dot) * b;
     workgroupBarrier();
 
-    // S[i][j] = decay * S[i][j] + k[i] * delta[j]
+    // S[i][j] = decay * S[i][j] + k[i] * delta[j], accumulating the readout in
+    // the same walk: out[j] = (S_new . q)[j]. Lane `j` owns column `j` of the
+    // state and the dot runs over `i` in the same order it used to, so folding
+    // the third state sweep into the update is bit-identical -- it just drops
+    // one full 64 KB re-read per head.
     let dlt = kq[384u + j];
-    for (var i = 0u; i < dv; i = i + 1u) {
-        let idx = s_base + i * dv + j;
-        state[idx] = decay * state[idx] + kq[i] * dlt;
-    }
-
-    // out[j] = (S_new . q)[j] / sqrt(d_v)
     var acc = 0.0;
     for (var i = 0u; i < dv; i = i + 1u) {
-        acc += state[s_base + i * dv + j] * kq[128u + i];
+        let idx = s_base + i * dv + j;
+        let s = decay * state[idx] + kq[i] * dlt;
+        state[idx] = s;
+        acc += s * kq[128u + i];
     }
     let o = acc * inverseSqrt(f32(dv));
     workgroupBarrier();

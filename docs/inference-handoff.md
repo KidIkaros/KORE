@@ -640,12 +640,13 @@ path per column as the correctness oracle. Gates:
 - GPU suite 32/33 (only the pre-existing `quantize_q8_rows` failure).
 
 Measured hot, arms interleaved and order reversed per round (device routing,
-`max_ctx=512`). Two clock states, so each block is self-consistent:
+`max_ctx=512`). The card drifts ~10 % between sweeps, so compare rows within a
+block, not across blocks:
 
 | prompt | n | greedy | spec `6:6` | spec `7:6` |
 |---|---|---|---|---|
-| repeated sentence | 128 | 51.9 / 48.8 | 74.6 / 66.6 → **1.40×** | 77.3 / 73.1 → **1.49×** |
-| narrative prose | 400 | 54.28 / 54.23 | 60.60 / 60.06 → **1.11×** | 59.46 / 59.69 → 1.10× |
+| repeated sentence | 128 | 54.58 / 54.00 | 80.16 / 80.20 → **1.46×** | 83.2 → **1.52×** |
+| narrative prose | 400 | 60.33 / 59.39 | 69.36 → **1.16×** | — (1.10 pre-fusion) |
 
 On a 128-token prose run with no 6-gram match the ratio is 0.96×: the whole
 difference is trigger and loop overhead, so drafting is free when it does not
@@ -656,37 +657,40 @@ fire, but not literally free.
 
 | m | 3 | 4 | 5 | 6 | 7 | 8 |
 |---|---|---|---|---|---|---|
-| ms/pass | 30.7 | 38.0 | 48.9 | 55.0 | 63.5 | 70.5 |
+| ms/pass | 28.5 | 35.3 | 45.8 | 52.6 | 59.6 | 66.2 |
 
-That is linear with no knee: `C(m) ≈ 15 + 8·(m−1)` against a ~15 ms plain step,
-so `alpha = 0.53` and a batch column costs about **half** a sequential token.
-The 8 ms is not expert traffic -- gate/up and down read the bank once -- it is
-per-column work that cannot amortise: `gdn_step` (~2.2 ms per column, it sweeps
-the state for every column), the attention loop (10 attended layers, one
-dispatch per column) and GEMV arithmetic that stops being bandwidth-bound once
-`m` columns share a weight read.
+Linear with no knee, `C(m) ≈ 13.5 + 7.5·(m−1)`. Against a ~17 ms plain step a
+marginal column is **~7.5 ms, about 45 % of one token** (`alpha ≈ 0.45`). It is
+not expert traffic -- gate/up and down read the bank once -- it is per-column
+work that cannot amortise: `gdn_step` (the state sweep runs per column), the
+attention loop (10 attended layers, one dispatch per column) and GEMV arithmetic
+that stops being bandwidth-bound once `m` columns share a weight read.
 
-Because `C(m)` is linear and acceptance is 100 %, `k=7` wins on a loop (1.49×)
-and is neutral on prose (1.10 vs 1.11), so the shipped default stays `6:6` and
-`7:6` is a loop-only choice.
+**`gdn_step` fused update + readout.** The third state sweep is gone: the lane
+computes `S = decay*S + k*delta`, stores it, and accumulates `S·q` on the way.
+The values and the summation order are unchanged, so the kernel stayed
+bit-exact -- the device lane still emits the same 64-token ids as the host lane
+and `verify_m` is still green -- and one 64 KB re-read per head disappeared.
+Same-clock old/new pairs: loop arm 77.6/78.0 → 80.2/80.2 tok/s (+3.0 %), prose
+67.7 → 69.4 (+2.4 %), `m=7` pass 63.5 → 59.6 ms.
+
+Because `C(m)` is linear and acceptance is 100 %, `k=7` beats `k=6` on a loop
+(83.2 vs 79.6 tok/s) and was neutral on prose pre-fusion, so `6:6` stays the
+default and `7:6` is a loop-only choice.
 
 ### Next, in order
 
 
-1. ~~**Speculative decoding for the MoE.**~~ Done: ~1.4-1.5× on a loop, 1.11×
+1. ~~**Speculative decoding for the MoE.**~~ Done: 1.46-1.52× on a loop, 1.16×
    on narrative prose, 0.96× when nothing fires. The remaining leverage is the
-   **8 ms marginal column**. `gdn_step` is the largest identified piece (~2.2 ms
-   per column), and the "split the sweeps across two thread groups" item below
-   just became 7× more valuable: 0.5-1 ms at `m=1` is 3-6 ms per `m=7` pass.
-   The expert-strided GEMVs already take a per-position activation row
-   (`x_stride`), so `down` works over `m*n_used` rows unchanged; `gate/up` do
-   not, because their activation row is shared by all `n_used` experts of a
-   column and the shader maps `pos` straight to the row (see the `pos_div` note
-   below). The rest of what is missing: per-column routing (one router matvec +
-   top-k per column, `idx` laid out as `column*n_used + e`), a per-column SwiGLU
-   scale vector, and the `moe_ffn_gpu_host` `rows != 1` rejection.
-   `forward_batch` and the snapshot/rewind machinery already handle columns for
-   the dense model.
+   **7.5 ms marginal column**. Two identified pieces, in decreasing confidence:
+   (a) the per-column attention loop -- 10 attended layers, one dispatch per
+   column, ~1 ms/column; a batched kernel would need per-column KV lengths but
+   would be bit-exact, since each column's key dot keeps its own order;
+   (b) a two-thread-group split of `gdn_step`'s remaining two sweeps, which
+   halves the serial `i` chain but reassociates the dot and readout sums, so it
+   needs the tolerance argument plus a `max|d|` report rather than a token-id
+   diff. Do (a) first: it is exact and the same size.
    First experiment inside the milestone came back **negative** (see
    `docs/research-sparse-attention.md` §4): match-length-scheduled `k` has no
    signal to key on. `KORE_SPEC_PROFILE` now prints acceptance per match length,
