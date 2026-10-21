@@ -639,14 +639,21 @@ path per column as the correctness oracle. Gates:
 - 64-token greedy ids identical between the device and host lanes.
 - GPU suite 32/33 (only the pre-existing `quantize_q8_rows` failure).
 
-Measured hot, arms interleaved and order reversed per round (device routing,
-`max_ctx=512`). The card drifts ~10 % between sweeps, so compare rows within a
-block, not across blocks:
+Measured hot, `max_ctx=512`, device routing, `n=400` per arm so prefill is
+amortised the same way a user's run would be. The prompt is the same in both
+arms (each arm pays it once), so these are end-to-end tok/s:
 
-| prompt | n | greedy | spec `6:6` | spec `7:6` |
+| regime | greedy | spec `6:6` | ratio | spec `6:8` |
 |---|---|---|---|---|
-| repeated sentence | 128 | 54.58 / 54.00 | 80.16 / 80.20 → **1.46×** | 83.2 → **1.52×** |
-| narrative prose | 400 | 60.33 / 59.39 | 69.36 → **1.16×** | — (1.10 pre-fusion) |
+| repeated sentence (loop) | 60.9 | 101.8 | **1.67×** | 101.8 |
+| repetitive code | 58.0 | 85.6 | **1.48×** | 67.2 |
+| narrative prose | 59.9 | 69.3 | **1.16×** | 69.9 |
+| technical prose | 60.3 | 59.1 | 0.98× | 62.4 |
+
+Repetitive code is the second-biggest win, not a wash: the replay's code stream
+happened not to repeat, but real code reuses the same call shape and the 6-gram
+trigger catches it. `min_match=8` removes the 2 % technical loss but costs 22 %
+on code (those wins are 6- and 7-gram repeats), so `6:6` stays.
 
 On a 128-token prose run with no 6-gram match the ratio is 0.96×: the whole
 difference is trigger and loop overhead, so drafting is free when it does not
@@ -681,8 +688,9 @@ default and `7:6` is a loop-only choice.
 ### Next, in order
 
 
-1. ~~**Speculative decoding for the MoE.**~~ Done: 1.46-1.52× on a loop, 1.16×
-   on narrative prose, 0.96× when nothing fires. The remaining leverage is the
+1. ~~**Speculative decoding for the MoE.**~~ Done: 1.67× on a loop, 1.48× on
+   repetitive code, 1.16× on narrative prose, 0.98× on technical prose, and
+   0.96× when nothing fires at all. The remaining leverage is the
    **7.5 ms marginal column**. Two identified pieces, in decreasing confidence:
    (a) the per-column attention loop -- 10 attended layers, one dispatch per
    column, ~1 ms/column; a batched kernel would need per-column KV lengths but
