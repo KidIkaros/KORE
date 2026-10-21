@@ -366,7 +366,8 @@ LLAMA_SRC=/path/to/llama.cpp kore-tools/llama-oracle/build_ref.sh
 **Env knobs:** `KORE_MOE_SLOTS`, `KORE_MOE_PROFILE` (an *empty* value still enables
 profiling — unset it to disable), `KORE_MOE_ROUTE_DUMP`, `KORE_MOE_BATCH`,
 `KORE_MOE_FORCE_EXPERT`, `KORE_GEMV_BLOCKS`, `KORE_ATTN_SPLIT_MIN`, `KORE_HAD_OFF`,
-`KORE_NO_FUSE`, `KORE_OP_COUNT`, `KORE_SKIP_OPS`, `KORE_SPEC_DEBUG`, `KORE_MTP`,
+`KORE_NO_FUSE`, `KORE_OP_COUNT`, `KORE_SKIP_OPS`, `KORE_STEP_PROFILE` (split one
+step into embed / host encode / queue drain), `KORE_SPEC_DEBUG`, `KORE_MTP`,
 `KORE_COOL_C`, `KORE_COOL_MAX_S`, `KORE_KV_*`, `KORE_QWEN36_GGUF`.
 
 **Instruments:** `kore-tools/moe-route-locality.py`,
@@ -576,6 +577,7 @@ no longer launch-bound; it is spread across GDN, attention and the MoE matvecs.
 | **`vec4` router matvec** | Neutral (53.5 vs 53.6 tok/s, ablation delta unchanged): the 2 MB row read is latency-bound, not issue-bound. Reverted so the logits keep their current rounding. |
 | **One warp for `moe_topk`** (`workgroup_size(32)`) | Slower (56.3 → 54.8 tok/s): 8 × 5 barrier steps on one warp lose to 1 expert per lane with an 8-step tree. The 256-lane form is at its floor. |
 | **Device-side embedding handoff** | Would buy nothing. `KORE_STEP_PROFILE=1` shows the host is idle **11.3 ms of a 16.1 ms step**: the per-token round trip is fully hidden behind the GPU. Not built. |
+| **Sparse attention (DSA / CSA / CSA2)** | Not applicable, and not worth it here even if it were free. All three are pretraining changes a frozen GGUF cannot adopt; attention costs at most ~0.9 ms in a ~16 ms step, and the step is only 0.6 ms slower at 8K tokens than at 96, because only 10 of 40 layers attend and they keep 2 KV heads (~11 KB/token). Mechanisms and the spec-decode interaction: `docs/research-sparse-attention.md`. |
 | **Pre-batch snapshot + replay instead of per-column snapshots** | Not worth it. `copy_buffer` now records a real buffer copy, so the per-column snapshots cost 1.15 ms per fired step, and the 6 cut steps in 192 tokens rewind in 0.19 ms each. |
 
 ### Dense at the current state
@@ -608,6 +610,12 @@ policy: on the repetitive stream the fully-accepted cost per token falls to
    `idx` laid out as `column*n_used + e`), a per-column SwiGLU scale vector, and
    the `moe_ffn_gpu_host` `rows != 1` rejection. `forward_batch` and the
    snapshot/rewind machinery already handle columns for the dense model.
+   First experiment inside the milestone, independent of the batch plumbing:
+   **confidence-scheduled verify length** (DSpark, arXiv 2607.05147, shipped in
+   DeepSeek-V4.1). The lookup drafter already computes the match length in
+   `longest_match` and then ignores its magnitude -- any match `>= min_match`
+   drafts the same continuation (capped at `k`). Scaling `k` with the match length is free, cannot change
+   the output, and `draft_headroom` already sweeps `m`/`k`.
 2. **`gdn_gates` (1.8 ms) and what is left of `gdn_step` (~2.9 ms).** The
    i-major state made `gdn_step` coalesce; its three 128-step sweeps are still
    one workgroup per head (16 workgroups), so it occupies half the CUs. Splitting
