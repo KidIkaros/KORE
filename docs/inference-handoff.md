@@ -691,14 +691,24 @@ default and `7:6` is a loop-only choice.
 1. ~~**Speculative decoding for the MoE.**~~ Done: 1.67× on a loop, 1.48× on
    repetitive code, 1.16× on narrative prose, 0.98× on technical prose, and
    0.96× when nothing fires at all. The remaining leverage is the
-   **7.5 ms marginal column**. Two identified pieces, in decreasing confidence:
-   (a) the per-column attention loop -- 10 attended layers, one dispatch per
-   column, ~1 ms/column; a batched kernel would need per-column KV lengths but
-   would be bit-exact, since each column's key dot keeps its own order;
-   (b) a two-thread-group split of `gdn_step`'s remaining two sweeps, which
-   halves the serial `i` chain but reassociates the dot and readout sums, so it
-   needs the tolerance argument plus a `max|d|` report rather than a token-id
-   diff. Do (a) first: it is exact and the same size.
+   **7.5 ms marginal column**, and it is mostly structural. The delta-rule state
+   cannot batch across columns (column `r+1`'s state depends on `r`), and the
+   per-column attention call is deliberate, not an oversight: the split-KV
+   kernel is `seq_q == 1` only, and the comment at the call site records that one
+   batched call would force the latency-bound single-group kernel and read the
+   full `seq_k` for every row. So the lever is the *per-step* cost of
+   `gdn_step`, which helps greedy as much as spec.
+
+   Shape today: 30 dispatches per step (one per GDN layer), each `n_v`
+   workgroups (32) of 128 threads -- 4 warps per workgroup and one workgroup per
+   CU, so it is latency-bound at ~56 GB/s effective (2.2 ms/step against a
+   ~61 MB state walked twice). Two ways to raise warps per workgroup:
+   (a) two heads per workgroup of 256 -- bit-exact, since each head keeps its
+   own 128-lane tree reduction; needs an even `n_v` (16 and 32 both are) and
+   barriers outside the validity mask for the tail; (b) a two-thread-group split
+   of the two sweeps, which halves the serial `i` chain but reassociates the dot
+   and readout sums, so it needs a tolerance argument plus a `max|d|` report
+   rather than a token-id diff. Try (a) first.
    First experiment inside the milestone came back **negative** (see
    `docs/research-sparse-attention.md` §4): match-length-scheduled `k` has no
    signal to key on. `KORE_SPEC_PROFILE` now prints acceptance per match length,
