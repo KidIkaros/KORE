@@ -892,7 +892,7 @@ until IQ kernels exist. Nothing else needs to change to run another quant of
 this architecture in the same formats.
 
 **Numbers (i5-14400F, 31 GB RAM, `n=64`, greedy, page cache warm).** Decode is
-7.0-7.8 tok/s, i.e. ~0.13 s/step; prefill is the same rate because the path is
+7.4-7.8 tok/s, i.e. ~0.13 s/step; prefill is the same rate because the path is
 one token at a time. Nothing is cached between steps: ~1.2 GB of packed weights
 is read per token (6 experts x 47 layers = 500 MB, attention 345 MB, head
 172 MB, dense + shared 165 MB), so the rate is the box's effective read
@@ -900,6 +900,80 @@ bandwidth, ~9 GB/s, not arithmetic. The very first run took 2m17s for 5+23
 tokens because the 24 GB file had to come off disk; `free` then reads 23 GB of
 buff/cache and a second run is 30x faster. This is a *correctness* number, not a
 GPU number.
+
+### 14.4 Where the 134 ms goes, and why more threads do not help
+
+`KORE_PROFILE=1` accumulates wall clock per phase (`flint::prof`), and
+`KORE_BENCH=1` times single tensors. Both are diagnostics with no cost when
+off. Warm, `n=60`, one process:
+
+| phase | ms/step | share | packed bytes | GB/s |
+| --- | ---: | ---: | ---: | ---: |
+| attention (4 projections + 32-head loop) | 46.8 | 35 % | 520 MB | 11.1 |
+| MoE: router + shared gate/up | 17.1 | 13 % | 125 MB | 7.3 |
+| MoE: shared down | 5.1 | 4 % | 47 MB | 9.2 |
+| MoE: 6 experts x 47 layers | 55.1 | 41 % | 500 MB | 9.1 |
+| dense ffn (2 layers) | 2.7 | 2 % | 42 MB | 15.6 |
+| head (2048 -> 150144) | 7.4 | 6 % | 252 MB | 34.1 |
+| **total** | **134.4** | | **1.49 GB** | **11.1** |
+
+The head is the control: one 150144-row matvec reaches **34-36 GB/s**, which is
+this box's practical DRAM ceiling (DDR5-4800 dual channel, ~45 % of peak). It
+is also the only call in the step big enough to get there. Per-call timing
+against `OXILLAMA_NUM_THREADS` shows why the rest cannot:
+
+| matvec | rows | 1 thread | 2 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| attn_q Q4_K | 4096 | 3.4 GB/s | 4.9 | 9.0 | 17.9 | 22.9 |
+| attn_k Q4_K | 512 | 3.4 | 6.1 | 9.3 | 12.8 | 14.6 |
+| expert gate Q4_K | 512 | 3.4 | 4.3 | 9.2 | 12.2 | 10.4 |
+| head Q6_K | 150144 | 6.3 | 12.2 | 21.4 | 30.7 | 34.5 |
+
+A 512-row call tops out near 12-14 GB/s no matter how many threads it is given;
+a 4096-row call reaches 23; only the 150k-row call reaches the DRAM ceiling.
+Fitting the two Q4_K rows gives ~46 ns per row and ~17 us of fixed cost per
+`gemv`, and the step issues ~1200 of them (846 of those are the experts alone:
+6 experts x 3 matrices x 47 layers). **The host path is limited by call
+granularity, not by thread count.**
+
+That is a measured negative result for the "just parallelise it better" theory,
+and it was tested both ways rather than argued:
+
+- `gemv_split`, which cut each matrix into 4-16 outer blocks on rayon's *global*
+  pool while `oxillama`'s `gemv` split rows again on its own 16-thread pool, was
+  nesting two pools. Removing it is neutral end to end (134.5 -> 134.4 ms/step)
+  but the code is simpler and the nesting is gone.
+- A hand-rolled "rows lane" that pinned `oxillama`'s pool to one thread and did
+  the split on the global pool measured **worse**: 14.9 GB/s on a 4096-row
+  matvec against 22.9, and 5.0 GB/s on a 512-row expert against 10.4. Rayon's
+  fork/join from the main thread costs about what the kernel's own pool costs,
+  and the kernel cooperates with a warm 16-thread pool better than with chunks.
+- Byte identity held throughout: on 4 prompts x 48 greedy tokens the ids match
+  the pre-change binary exactly, because every variant is row-partitioned and a
+  row's accumulator is never split.
+
+Consequence for the device path: the GPU does not have this problem. One
+dispatch per matvec, expert banks read at VRAM speed, and the 6 experts of a
+layer as one gather. That is why the port is still worth its cost — but its
+baseline is 7.4 tok/s, not a 20 tok/s CPU path, and the streaming estimate
+above is unchanged.
+
+### 14.5 The file's home matters as much as the code
+
+The GGUF lives on `/mnt/gamedrive`, an SPCC SATA SSD measuring **395 MB/s**
+(`dd iflag=direct`, 2 MiB blocks). `/` is a Kingston NV2 NVMe measuring
+**5.0 GB/s** the same way. The expert bank is 24.5 GB against 23 GB of page
+cache, so a cold step reads ~500 MB of experts from disk and decode falls to
+**1.2-1.4 tok/s** (experts alone 620 ms/step) — an 8x cliff that any other
+workload on the box can trigger. Two runs back to back are enough to warm it,
+because one pass touches all 47 layers' banks.
+
+This is the same failure the Maya engine designs around (`docs/SETTINGS.md`:
+pinned arena instead of `MapViewOfFile`, per-layer `PrefetchVirtualMemory`, a
+routing profile deciding what is hot). The next host-path work is the same
+three pieces: an anonymous pinned arena for the hot expert set, per-layer
+prefetch of the routed blobs, and a route profile that decides the hot set
+instead of hoping the page cache keeps it.
 
 **Correctness evidence.** There is no external oracle: llama.cpp master has no
 `flint` arch (neither `src/models/flint.cpp` nor `LLM_ARCH_FLINT` in

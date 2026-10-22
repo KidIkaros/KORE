@@ -54,6 +54,11 @@ fn main() {
         (0..model.cfg.n_layers).filter(|&i| model.cfg.sliding.get(i).copied().unwrap_or(false)).count(),
     );
 
+    if std::env::var("KORE_BENCH").ok().as_deref() == Some("1") {
+        let reps: usize = std::env::var("KORE_BENCH_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+        model.bench(reps);
+        return;
+    }
     let tok = tokenizers::Tokenizer::from_file(&tok_path).expect("tokenizer");
     let text = if std::env::var("KORE_CHAT").ok().as_deref() == Some("1") {
         format!("<|user|>{prompt}<|assistant|>")
@@ -102,6 +107,7 @@ fn main() {
     }
 
     let t_dec = Instant::now();
+    FlintModel::profile_reset();
     let mut out = Vec::with_capacity(n_new);
     for k in 0..n_new {
         out.push(next);
@@ -120,6 +126,10 @@ fn main() {
     // One token came out of the prompt's last forward, so the steady-state rate
     // is (emitted - 1) over the decode window.
     let steps = out.len().saturating_sub(1);
+    FlintModel::profile_dump(steps);
+    if std::env::var("KORE_IDS").ok().as_deref() == Some("1") {
+        println!("ids: {out:?}");
+    }
     eprintln!(
         "prefill {} tokens in {:.2} s = {:.2} tok/s | decode {} steps in {:.2} s = {:.2} tok/s",
         ids.len(),

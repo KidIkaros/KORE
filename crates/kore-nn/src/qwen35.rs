@@ -547,19 +547,6 @@ impl QW {
         }
     }
 
-    /// Rows `[start, start + count)` of the same matrix, as their own view.
-    ///
-    /// Rows are contiguous and each is a whole number of blocks, so this is a
-    /// byte-range re-slice like [`Self::expert`]. It is what lets a wide
-    /// projection be cut across threads without copying the matrix.
-    pub(crate) fn rows(&self, start: usize, count: usize) -> Self {
-        Self {
-            off: self.off + start * self.row_bytes(),
-            n: count,
-            ..self.clone()
-        }
-    }
-
     /// Bytes per matrix row.
     pub(crate) fn row_bytes(&self) -> usize {
         (self.m / self.kind.block()) * self.kind.block_bytes()

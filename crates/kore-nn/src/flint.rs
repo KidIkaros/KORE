@@ -37,6 +37,103 @@ fn err(msg: impl Into<String>) -> KoreError {
     KoreError::StorageError(msg.into())
 }
 
+// ---------- phase profile (diagnostics only) ----------
+//
+// `KORE_PROFILE=1` accumulates wall clock per phase so the host path can be
+// attributed before any kernel work starts. Off by default and free when off
+// (one cached env lookup, no timers).
+
+mod prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub const ATTN: usize = 0;
+    pub const DENSE: usize = 1;
+    pub const MOE: usize = 2;
+    /// Router + shared gate/up: one fused parallel region inside the MoE.
+    pub const PRE: usize = 3;
+    /// Shared expert down-projection.
+    pub const SHARED: usize = 4;
+    pub const EXPERTS: usize = 5;
+    pub const HEAD: usize = 6;
+    pub const NAMES: [&str; 7] = [
+        "attn",
+        "dense_ffn",
+        "  moe_total",
+        "  pre",
+        "  sh_down",
+        "  experts",
+        "head",
+    ];
+
+    static ON: OnceLock<bool> = OnceLock::new();
+    static NS: [AtomicU64; 7] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    pub fn on() -> bool {
+        *ON.get_or_init(|| std::env::var("KORE_PROFILE").map(|v| v != "0").unwrap_or(false))
+    }
+
+    pub struct T(pub Instant);
+
+    pub fn t() -> Option<T> {
+        if on() { Some(T(Instant::now())) } else { None }
+    }
+
+    pub fn acc(slot: usize, t: Option<T>) {
+        if let Some(T(t0)) = t {
+            NS[slot].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dump(steps: usize) {
+        if !on() || steps == 0 {
+            return;
+        }
+        let get = |i: usize| NS[i].load(Ordering::Relaxed) as f64;
+        // ROUTER/SHARED/EXPERTS are nested inside MOE, so they are reported
+        // against the MoE total rather than against the step.
+        let total: f64 = [ATTN, DENSE, MOE, HEAD].iter().map(|&i| get(i)).sum();
+        let moe = get(MOE).max(1.0);
+        eprintln!(
+            "--- flint host profile: {steps} steps, {:.2} ms/step ---",
+            total / 1e6 / steps as f64
+        );
+        let rows = [
+            (ATTN, total),
+            (DENSE, total),
+            (MOE, total),
+            (PRE, moe),
+            (SHARED, moe),
+            (EXPERTS, moe),
+            (HEAD, total),
+        ];
+        for (i, denom) in rows {
+            let ns = get(i);
+            eprintln!(
+                "  {:<12} {:8.2} ms/step  {:5.1}%",
+                NAMES[i],
+                ns / 1e6 / steps as f64,
+                100.0 * ns / denom.max(1.0)
+            );
+        }
+    }
+
+    pub fn reset() {
+        for a in NS.iter() {
+            a.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 // ---------- config ----------
 
 #[derive(Debug, Clone)]
@@ -314,22 +411,40 @@ fn rope_inplace(x: &mut [f32], n_heads: usize, hd: usize, pos: usize, theta: f32
     }
 }
 
-/// `out = W x`, cut across threads by row block when the matrix is wide enough
-/// to pay for the fork/join. Rows are independent and each row keeps one
-/// sequential accumulator, so the result does not depend on the block count.
-fn gemv_split(w: &QW, x: &[f32], out: &mut [f32]) -> Result<()> {
-    const PAR_MIN: usize = 1 << 21;
-    let n = w.n;
-    if n * w.m < PAR_MIN || out.len() != n {
-        return w.gemv(x, out);
-    }
-    let blocks = rayon::current_num_threads().clamp(1, 16).min(n.div_ceil(512));
-    let per = n.div_ceil(blocks);
-    out.par_chunks_mut(per).enumerate().try_for_each(|(b, o)| {
-        let rows = o.len();
-        w.rows(b * per, rows).gemv(x, o)
-    })
+/// `out = W x`.
+///
+/// **Rows are split inside the kernel, and that is the only lane that pays.**
+/// `oxillama`'s `gemv` hands its row loop to a dedicated pool sized to the
+/// machine, so cutting the matrix into outer chunks here nests two pools: the
+/// outer workers block in `ThreadPool::install` while the inner pool serves
+/// them. Measured on the i5-14400F, the nested form ran the attention
+/// projections at 10.7 GB/s where one call reaches 22.9 GB/s. A hand-rolled
+/// row lane with the kernel pinned to one thread was slower still (14.9 GB/s),
+/// because rayon's own fork/join costs about as much as the kernel's.
+///
+/// What this leaves is the shape of the call, not the threading: 512-row
+/// matvecs top out near 12 GB/s and 150k-row ones reach 35 GB/s, which is the
+/// box's practical DRAM ceiling (`docs/inference-handoff.md` §14.4).
+fn gemv_par(w: &QW, x: &[f32], out: &mut [f32]) -> Result<()> {
+    w.gemv(x, out)
 }
+
+/// Same, for one stacked MoE tensor: `out` is `ids.len()` row-blocks,
+/// expert-major. The outer split is exact (one chunk per expert), so nesting
+/// the inner row split is safe.
+fn gemv_experts(
+    t: &QW,
+    stride: usize,
+    ids: &[usize],
+    rows: usize,
+    x: &[f32],
+    out: &mut [f32],
+) -> Result<()> {
+    out.par_chunks_mut(rows)
+        .zip(ids.par_iter())
+        .try_for_each(|(o, &e)| gemv_par(&t.expert(e, stride), x, o))
+}
+
 
 // ---------- model ----------
 
@@ -521,9 +636,9 @@ impl FlintModel {
         let mut q = vec![0.0f32; qn];
         let mut k = vec![0.0f32; kn];
         let mut v = vec![0.0f32; kn];
-        gemv_split(&l.wq, &xn, &mut q)?;
-        l.wk.gemv(&xn, &mut k)?;
-        l.wv.gemv(&xn, &mut v)?;
+        gemv_par(&l.wq, &xn, &mut q)?;
+        gemv_par(&l.wk, &xn, &mut k)?;
+        gemv_par(&l.wv, &xn, &mut v)?;
 
         for h in 0..cfg.n_heads {
             rms_inplace(&mut q[h * hd..(h + 1) * hd], &l.q_norm, cfg.eps);
@@ -589,7 +704,7 @@ impl FlintModel {
         });
 
         let mut proj = vec![0.0f32; cfg.hidden];
-        gemv_split(&l.wo, &out, &mut proj)?;
+        gemv_par(&l.wo, &out, &mut proj)?;
         for (xv, pv) in x.iter_mut().zip(&proj) {
             *xv += pv;
         }
@@ -603,13 +718,13 @@ impl FlintModel {
         let wide = l.gate.n;
         let mut g = vec![0.0f32; wide];
         let mut u = vec![0.0f32; wide];
-        gemv_split(&l.gate, &xn, &mut g)?;
-        gemv_split(&l.up, &xn, &mut u)?;
+        gemv_par(&l.gate, &xn, &mut g)?;
+        gemv_par(&l.up, &xn, &mut u)?;
         for (gi, ui) in g.iter_mut().zip(&u) {
             *gi = silu(*gi) * *ui;
         }
         let mut d = vec![0.0f32; cfg.hidden];
-        gemv_split(&l.down, &g, &mut d)?;
+        gemv_par(&l.down, &g, &mut d)?;
         for (xv, dv) in x.iter_mut().zip(&d) {
             *xv += dv;
         }
@@ -621,11 +736,21 @@ impl FlintModel {
         let mut xn = vec![0.0f32; cfg.hidden];
         rms_into(x, &l.norm, cfg.eps, &mut xn);
 
+        // The router and the shared expert's gate/up all read `xn` and do not
+        // depend on each other, so they share one parallel region. The experts
+        // cannot join it: they need the router's top-k.
+        let sh = cfg.shexp_ffn;
+        let mut logits = vec![0.0f32; cfg.n_experts];
+        let mut sg = vec![0.0f32; sh];
+        let mut su = vec![0.0f32; sh];
+        let tp = prof::t();
+        gemv_par(&l.router, &xn, &mut logits)?;
+        gemv_par(&l.sh_gate, &xn, &mut sg)?;
+        gemv_par(&l.sh_up, &xn, &mut su)?;
+
         // Router: raw sigmoid scores, top-k by score, renormalised over the
         // chosen set. (`expert_bias` exists in the training code but the
         // checkpoint ships it as zeros and the GGUF does not carry it at all.)
-        let mut logits = vec![0.0f32; cfg.n_experts];
-        l.router.gemv(&xn, &mut logits)?;
         let scores: Vec<f32> = logits.iter().map(|&z| sigmoid(z)).collect();
         let k = cfg.n_experts_used;
         let mut picked: Vec<usize> = Vec::with_capacity(k);
@@ -646,46 +771,44 @@ impl FlintModel {
         for w in weights.iter_mut() {
             *w *= inv;
         }
+        prof::acc(prof::PRE, tp);
 
         // Shared expert runs on every token, unconditionally, and is added
         // rather than gated.
-        let sh = cfg.shexp_ffn;
-        let mut sg = vec![0.0f32; sh];
-        let mut su = vec![0.0f32; sh];
-        l.sh_gate.gemv(&xn, &mut sg)?;
-        l.sh_up.gemv(&xn, &mut su)?;
+        let ts = prof::t();
         for (gi, ui) in sg.iter_mut().zip(&su) {
             *gi = silu(*gi) * *ui;
         }
         let mut acc = vec![0.0f32; cfg.hidden];
-        gemv_split(&l.sh_down, &sg, &mut acc)?;
+        gemv_par(&l.sh_down, &sg, &mut acc)?;
+        prof::acc(prof::SHARED, ts);
 
-        // The six experts are independent, so they run in parallel; the results
-        // are then summed in expert order, which keeps the answer independent
-        // of the thread count.
-        let parts: Vec<Result<Vec<f32>>> = (0..k)
-            .into_par_iter()
-            .map(|j| {
-                let e = picked[j];
-                let mut g = vec![0.0f32; cfg.moe_ffn];
-                let mut u = vec![0.0f32; cfg.moe_ffn];
-                l.gate_exps.expert(e, l.gate_stride).gemv(&xn, &mut g)?;
-                l.up_exps.expert(e, l.gate_stride).gemv(&xn, &mut u)?;
-                for (gi, ui) in g.iter_mut().zip(&u) {
-                    *gi = silu(*gi) * *ui;
-                }
-                let mut d = vec![0.0f32; cfg.hidden];
-                l.down_exps.expert(e, l.down_stride).gemv(&g, &mut d)?;
-                Ok(d)
-            })
-            .collect();
-        for (j, part) in parts.into_iter().enumerate() {
-            let d = part?;
-            let w = weights[j];
-            for (a, dv) in acc.iter_mut().zip(&d) {
+        let te = prof::t();
+        // Every chosen expert is one row-block of the flat output, and each
+        // expert is itself cut across threads. Rows are independent, so the
+        // sum below is still taken in expert order and the result does not
+        // depend on the thread count.
+        let m = cfg.moe_ffn;
+        let mut g = vec![0.0f32; k * m];
+        let mut u = vec![0.0f32; k * m];
+        gemv_experts(&l.gate_exps, l.gate_stride, &picked, m, &xn, &mut g)?;
+        gemv_experts(&l.up_exps, l.gate_stride, &picked, m, &xn, &mut u)?;
+        for (gi, ui) in g.iter_mut().zip(&u) {
+            *gi = silu(*gi) * *ui;
+        }
+        let mut d = vec![0.0f32; k * cfg.hidden];
+        // The down projection takes each expert's own SwiGLU output, so the
+        // input is cut by expert block too.
+        for ((xg, o), &e) in g.chunks(m).zip(d.chunks_mut(cfg.hidden)).zip(&picked) {
+            gemv_par(&l.down_exps.expert(e, l.down_stride), xg, o)?;
+        }
+        for (j, w) in weights.iter().enumerate() {
+            let part = &d[j * cfg.hidden..(j + 1) * cfg.hidden];
+            for (a, dv) in acc.iter_mut().zip(part) {
                 *a += w * dv;
             }
         }
+        prof::acc(prof::EXPERTS, te);
         if let Some(t) = trace {
             t.extend_from_slice(&picked);
         }
@@ -700,7 +823,7 @@ impl FlintModel {
         let mut h = vec![0.0f32; self.cfg.hidden];
         rms_into(x, &self.out_norm, self.cfg.eps, &mut h);
         let mut logits = vec![0.0f32; self.head.n];
-        gemv_split(&self.head, &h, &mut logits)?;
+        gemv_par(&self.head, &h, &mut logits)?;
         Ok(logits)
     }
 
@@ -718,13 +841,26 @@ impl FlintModel {
     ) -> Result<Vec<f32>> {
         let mut x = self.embd.row_f32(token as usize)?;
         for (i, layer) in self.layers.iter().enumerate() {
+            let ta = prof::t();
             self.attn_step(&layer.attn, &mut x, pos, &mut st.kv[i])?;
+            prof::acc(prof::ATTN, ta);
             match &layer.mlp {
-                Mlp::Dense(l) => self.dense_ffn(l, &mut x)?,
-                Mlp::Moe(l) => self.moe_ffn(l, &mut x, trace.as_deref_mut())?,
+                Mlp::Dense(l) => {
+                    let td = prof::t();
+                    self.dense_ffn(l, &mut x)?;
+                    prof::acc(prof::DENSE, td);
+                }
+                Mlp::Moe(l) => {
+                    let tm = prof::t();
+                    self.moe_ffn(l, &mut x, trace.as_deref_mut())?;
+                    prof::acc(prof::MOE, tm);
+                }
             }
         }
-        self.logits(&x)
+        let th = prof::t();
+        let out = self.logits(&x);
+        prof::acc(prof::HEAD, th);
+        out
     }
 
     pub fn argmax(logits: &[f32]) -> u32 {
@@ -771,5 +907,68 @@ impl FlintModel {
             let _ = self.forward_traced(t, i, &mut st, Some(&mut trace))?;
         }
         Ok(trace)
+    }
+
+    /// Phase totals accumulated since `profile_reset` (needs `KORE_PROFILE=1`).
+    pub fn profile_dump(steps: usize) {
+        prof::dump(steps);
+    }
+
+    /// Per-tensor matvec timing, for separating kernel throughput from per-call
+    /// cost. `KORE_BENCH=1` calls this once; it is diagnostics only.
+    pub fn bench(&self, reps: usize) {
+        let x: Vec<f32> = (0..self.cfg.hidden).map(|i| (i % 17) as f32 * 0.01 + 0.3).collect();
+        let cases: Vec<(&str, &QW, usize, usize)> = vec![
+            ("attn_q blk0", &self.layers[0].attn.wq, self.layers[0].attn.wq.n, self.layers[0].attn.wq.m),
+            ("attn_k blk0", &self.layers[0].attn.wk, self.layers[0].attn.wk.n, self.layers[0].attn.wk.m),
+            ("attn_v blk0", &self.layers[0].attn.wv, self.layers[0].attn.wv.n, self.layers[0].attn.wv.m),
+            ("attn_o blk0", &self.layers[0].attn.wo, self.layers[0].attn.wo.n, self.layers[0].attn.wo.m),
+            ("head", &self.head, self.head.n, self.head.m),
+        ];
+        for (name, w, n, _m) in cases {
+            let mut out = vec![0.0f32; n];
+            let _ = gemv_par(w, &x, &mut out);
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                let _ = gemv_par(w, &x, &mut out);
+            }
+            let dt = t.elapsed().as_secs_f64();
+            let bytes = w.byte_len() as f64;
+            eprintln!(
+                "  {name:<12} {:>7} rows {:>4.2} MiB  {:7.1} us/call  {:6.1} GB/s  [{:?}]",
+                n,
+                bytes / 1048576.0,
+                dt * 1e6 / reps as f64,
+                bytes * reps as f64 / dt / 1e9,
+                w.kind
+            );
+        }
+        // The routed experts: same shape, one Q4_K and one Q6_K layer.
+        for (label, li) in [("expert blk2", 2usize), ("expert blk6", 6usize)] {
+            if let Mlp::Moe(m) = &self.layers[li].mlp {
+                let w = m.gate_exps.expert(0, m.gate_stride);
+                let mut out = vec![0.0f32; w.n];
+                let _ = gemv_par(&w, &x, &mut out);
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    let _ = gemv_par(&w, &x, &mut out);
+                }
+                let dt = t.elapsed().as_secs_f64();
+                let bytes = w.byte_len() as f64;
+                eprintln!(
+                    "  {label:<12} {:>7} rows {:>4.2} MiB  {:7.1} us/call  {:6.1} GB/s  [{:?}]",
+                    w.n,
+                    bytes / 1048576.0,
+                    dt * 1e6 / reps as f64,
+                    bytes * reps as f64 / dt / 1e9,
+                    w.kind
+                );
+            }
+        }
+    }
+
+    /// Zero the phase accumulators (so prefill is not mixed into decode).
+    pub fn profile_reset() {
+        prof::reset();
     }
 }
