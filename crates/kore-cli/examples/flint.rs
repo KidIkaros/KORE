@@ -80,6 +80,47 @@ fn main() {
     }
     eprintln!("prompt: {} tokens, max_ctx {ctx}", ids.len());
 
+    if let Ok(path) = std::env::var("KORE_ROUTE_PROFILE") {
+        let ctx = ids.len() + n_new + 8;
+        let prof = model.profile_routes(&ids, n_new, ctx).expect("profile routes");
+        prof.summary();
+        if !path.is_empty() {
+            prof.save(Path::new(&path)).expect("save profile");
+            eprintln!("wrote {path}");
+        }
+        return;
+    }
+    if let Ok(path) = std::env::var("KORE_ROUTE_TEST") {
+        // Held-out check: the hot set comes from a saved profile (built on some
+        // other prompt), and coverage is measured on this prompt's routes.
+        let ctx = ids.len() + n_new + 8;
+        let train = kore_nn::flint::RouteProfile::load(Path::new(&path)).expect("load profile");
+        let test = model.profile_routes(&ids, n_new, ctx).expect("profile routes");
+        eprintln!(
+            "=== held-out hot set: {path} ({} tokens) applied to this prompt ({} tokens) ===",
+            train.tokens, test.tokens
+        );
+        if test.expert_bytes == 0 || test.moe_layers == 0 {
+            eprintln!("no expert_bytes/moe_layers in the test profile");
+            return;
+        }
+        eprintln!("pin       experts   of bank   same-prompt   held-out");
+        for gib in [2u64, 4, 6, 8, 10, 12, 14] {
+            let n = (gib << 30) as usize / test.expert_bytes as usize;
+            if n == 0 || n >= test.counts.len() {
+                continue;
+            }
+            let hot = train.hot_set_n(n);
+            eprintln!(
+                "  {gib:2} GiB  {n:7}  {:5.1}%   {:9.1}%   {:7.1}%",
+                100.0 * n as f64 / test.counts.len() as f64,
+                train.coverage(&hot),
+                test.coverage(&hot)
+            );
+        }
+        return;
+    }
+
     // Prefill and decode are timed apart: the first token carries the whole
     // prompt, so folding it into the decode rate would understate the steady
     // state on a long prompt.

@@ -67,6 +67,55 @@ mod prof {
         "head",
     ];
 
+    /// Histogram of `|predicted ∩ actual|` for next-layer routing, and the
+    /// number of scored layers. `KORE_PREDICT=1` only.
+    static PRED_HIST: [AtomicU64; 8] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+
+    static PRED: OnceLock<bool> = OnceLock::new();
+
+    pub fn predict_on() -> bool {
+        *PRED.get_or_init(|| std::env::var("KORE_PREDICT").map(|v| v != "0").unwrap_or(false))
+    }
+
+    pub fn pred_score(pred: &[usize], actual: &[usize]) {
+        let hit = pred.iter().filter(|e| actual.contains(e)).count();
+        PRED_HIST[hit.min(7)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn pred_dump() {
+        if !predict_on() {
+            return;
+        }
+        let n: u64 = PRED_HIST.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+        if n == 0 {
+            return;
+        }
+        let mean: f64 = PRED_HIST
+            .iter()
+            .enumerate()
+            .map(|(i, c)| i as f64 * c.load(Ordering::Relaxed) as f64)
+            .sum::<f64>()
+            / n as f64;
+        let hist: Vec<String> = PRED_HIST
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{i}:{:.0}%", 100.0 * c.load(Ordering::Relaxed) as f64 / n as f64))
+            .collect();
+        eprintln!(
+            "next-layer route prediction (router of L+1 on L's input): mean {mean:.2} of 6 over {n} layers  [{}]",
+            hist.join(" ")
+        );
+    }
+
     static ON: OnceLock<bool> = OnceLock::new();
     static NS: [AtomicU64; 7] = [
         AtomicU64::new(0),
@@ -411,6 +460,26 @@ fn rope_inplace(x: &mut [f32], n_heads: usize, hd: usize, pos: usize, theta: f32
     }
 }
 
+/// Top-`k` expert ids by score, highest first. Ties break towards the lower
+/// index, which is what the reference's `argpartition`-then-sort does on the
+/// scores this router produces.
+fn topk_ids(logits: &[f32], k: usize) -> Vec<usize> {
+    let scores: Vec<f32> = logits.iter().map(|&z| sigmoid(z)).collect();
+    let mut picked: Vec<usize> = Vec::with_capacity(k);
+    for _ in 0..k {
+        let mut best = usize::MAX;
+        let mut best_v = f32::NEG_INFINITY;
+        for (e, &s) in scores.iter().enumerate() {
+            if s > best_v && !picked.contains(&e) {
+                best_v = s;
+                best = e;
+            }
+        }
+        picked.push(best);
+    }
+    picked
+}
+
 /// `out = W x`.
 ///
 /// **Rows are split inside the kernel, and that is the only lane that pays.**
@@ -445,6 +514,203 @@ fn gemv_experts(
         .try_for_each(|(o, &e)| gemv_par(&t.expert(e, stride), x, o))
 }
 
+
+// ---------- route profile ----------
+
+/// Per-(layer, expert) routing counts over a real workload.
+///
+/// 47 x 256 u32 is 48 KiB, so this is cheap enough to keep resident and to
+/// persist (`--expert-profile-save` in the Maya engine is the same idea). What
+/// it answers is whether an expert tier can pay at all: if the top 40 % of the
+/// experts take 90 % of the reads, pinning them is worth it; if the distribution
+/// is flat, it is not, and the only lever left is cheaper misses.
+pub struct RouteProfile {
+    pub n_layers: usize,
+    pub n_experts: usize,
+    /// `n_layers * n_experts`, row-major by layer.
+    pub counts: Vec<u32>,
+    /// Routed tokens seen (each contributes `n_moe * k` reads).
+    pub tokens: u64,
+    /// Histogram of `|previous token's set ∩ this token's set|`, one entry per
+    /// layer per token. Length `k + 1`.
+    pub overlap: Vec<u64>,
+    /// Bytes one expert occupies (gate + up + down), for the budget table.
+    pub expert_bytes: u64,
+    /// Number of routed layers, for the summary.
+    pub moe_layers: usize,
+    /// Experts chosen per token.
+    pub k: usize,
+}
+
+impl RouteProfile {
+    pub fn new(n_layers: usize, n_experts: usize) -> Self {
+        Self {
+            n_layers,
+            n_experts,
+            counts: vec![0; n_layers * n_experts],
+            tokens: 0,
+            overlap: vec![0; 8],
+            expert_bytes: 0,
+            moe_layers: 0,
+            k: 0,
+        }
+    }
+
+    /// One token's trace: `moe_layers.len() * k` ids, layer-major.
+    fn absorb(&mut self, trace: &[usize], moe_layers: &[usize], prev: &mut [Vec<usize>], k: usize) {
+        if k == 0 || trace.len() != moe_layers.len() * k {
+            return;
+        }
+        for (j, &layer) in moe_layers.iter().enumerate() {
+            let ids = &trace[j * k..(j + 1) * k];
+            for &e in ids {
+                if e < self.n_experts {
+                    self.counts[layer * self.n_experts + e] += 1;
+                }
+            }
+            let p = &mut prev[layer];
+            if p.len() == k {
+                let hit = p.iter().filter(|e| ids.contains(e)).count();
+                if hit < self.overlap.len() {
+                    self.overlap[hit] += 1;
+                }
+            }
+            *p = ids.to_vec();
+        }
+        self.tokens += 1;
+    }
+
+    /// Total route reads, and the counts sorted per layer.
+    pub fn total(&self) -> u64 {
+        self.counts.iter().map(|&c| c as u64).sum()
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut buf = Vec::with_capacity(24 + self.counts.len() * 4);
+        buf.extend_from_slice(b"KRP2");
+        buf.extend_from_slice(&(self.n_layers as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.n_experts as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.k as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.tokens as u64).to_le_bytes());
+        for &c in &self.counts {
+            buf.extend_from_slice(&c.to_le_bytes());
+        }
+        std::fs::write(path, buf).map_err(|e| err(format!("flint: profile save: {e}")))
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let buf = std::fs::read(path).map_err(|e| err(format!("flint: profile load: {e}")))?;
+        if buf.len() < 24 || &buf[..4] != b"KRP2" {
+            return Err(err("flint: profile: not a KRP2 file"));
+        }
+        let rd32 = |o: usize| u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) as usize;
+        let rd64 = |o: usize| u64::from_le_bytes(buf[o..o + 8].try_into().unwrap());
+        let (n_layers, n_experts) = (rd32(4), rd32(8));
+        if buf.len() != 24 + n_layers * n_experts * 4 {
+            return Err(err("flint: profile: truncated"));
+        }
+        let counts = buf[24..]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        Ok(Self {
+            n_layers,
+            n_experts,
+            counts,
+            k: rd32(12),
+            tokens: rd64(16),
+            overlap: vec![0; 8],
+            expert_bytes: 0,
+            moe_layers: 0,
+        })
+    }
+
+    /// The `n` busiest (layer, expert) pairs, most used first.
+    pub fn hot_set_n(&self, n: usize) -> Vec<u32> {
+        let mut idx: Vec<u32> = (0..self.counts.len() as u32).collect();
+        idx.sort_unstable_by_key(|&i| std::cmp::Reverse(self.counts[i as usize]));
+        idx.truncate(n.min(idx.len()));
+        idx
+    }
+
+    /// Share of *this* profile's reads that `hot` serves. Applying one profile's
+    /// hot set to another profile is the only honest test of a pinned set: a
+    /// fit on the same routes it is measured on always looks good.
+    pub fn coverage(&self, hot: &[u32]) -> f64 {
+        let total = self.total();
+        if total == 0 {
+            return 0.0;
+        }
+        let hit: u64 = hot
+            .iter()
+            .filter(|&&i| (i as usize) < self.counts.len())
+            .map(|&i| self.counts[i as usize] as u64)
+            .sum();
+        100.0 * hit as f64 / total as f64
+    }
+
+    /// The table that decides the hot-set size: for a pinned budget, the share
+    /// of routed reads it serves.
+    pub fn summary(&self) {
+        let total = self.total().max(1);
+        let mut all: Vec<u32> = self.counts.clone();
+        all.sort_unstable_by(|a, b| b.cmp(a));
+        let mut cum = vec![0u64; all.len() + 1];
+        for (i, &c) in all.iter().enumerate() {
+            cum[i + 1] = cum[i] + c as u64;
+        }
+        eprintln!(
+            "routes: {} tokens x {} MoE layers x {} experts = {} reads over {} (layer, expert) pairs",
+            self.tokens,
+            self.moe_layers,
+            self.k,
+            total,
+            self.counts.len()
+        );
+        let uniq = self.counts.iter().filter(|&&c| c > 0).count();
+        eprintln!(
+            "experts ever used: {uniq} of {} ({:.0}%), max count {} (mean {:.1})",
+            self.counts.len(),
+            100.0 * uniq as f64 / self.counts.len() as f64,
+            all[0],
+            total as f64 / self.counts.len() as f64
+        );
+        if self.expert_bytes > 0 {
+            eprintln!("\npinned budget -> route reads served");
+            for gib in [2u64, 4, 6, 8, 10, 12, 14, 16] {
+                let n = (gib << 30) as usize / self.expert_bytes.max(1) as usize;
+                if n == 0 || n >= all.len() {
+                    continue;
+                }
+                eprintln!(
+                    "  {gib:2} GiB  ({n:5} experts, {:4.1}% of the bank)  {:5.1}%",
+                    100.0 * n as f64 / all.len() as f64,
+                    100.0 * cum[n] as f64 / total as f64
+                );
+            }
+        }
+        // Temporal stability: how much of this token's set was already set last
+        // token. High overlap is what makes a prefetch or a small cache work.
+        let pairs: u64 = self.overlap.iter().sum();
+        if pairs > 0 {
+            let mean: f64 = self
+                .overlap
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| i as f64 * c as f64)
+                .sum::<f64>()
+                / pairs as f64;
+            let h: Vec<String> = self
+                .overlap
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c > 0)
+                .map(|(i, &c)| format!("{i}:{:.0}%", 100.0 * c as f64 / pairs as f64))
+                .collect();
+            eprintln!("\nconsecutive-token set overlap: mean {mean:.2} of 6  [{}]", h.join(" "));
+        }
+    }
+}
 
 // ---------- model ----------
 
@@ -731,7 +997,13 @@ impl FlintModel {
         Ok(())
     }
 
-    fn moe_ffn(&self, l: &MoeW, x: &mut [f32], trace: Option<&mut Vec<usize>>) -> Result<()> {
+    fn moe_ffn(
+        &self,
+        l: &MoeW,
+        next: Option<&MoeW>,
+        x: &mut [f32],
+        trace: Option<&mut Vec<usize>>,
+    ) -> Result<()> {
         let cfg = &self.cfg;
         let mut xn = vec![0.0f32; cfg.hidden];
         rms_into(x, &l.norm, cfg.eps, &mut xn);
@@ -753,17 +1025,19 @@ impl FlintModel {
         // checkpoint ships it as zeros and the GGUF does not carry it at all.)
         let scores: Vec<f32> = logits.iter().map(|&z| sigmoid(z)).collect();
         let k = cfg.n_experts_used;
-        let mut picked: Vec<usize> = Vec::with_capacity(k);
-        for _ in 0..k {
-            let mut best = usize::MAX;
-            let mut best_v = f32::NEG_INFINITY;
-            for (e, &s) in scores.iter().enumerate() {
-                if s > best_v && !picked.contains(&e) {
-                    best_v = s;
-                    best = e;
-                }
+        let picked = topk_ids(&logits, k);
+        // Diagnostics: would the *next* layer's router, run on this layer's
+        // input, have predicted this? That is the prediction a prefetch of the
+        // next layer has to live on (Maya's PREFETCH_N), and it costs one extra
+        // router matvec per layer.
+        if prof::predict_on() {
+            if let Some(nx) = next {
+                let mut pn = vec![0.0f32; cfg.hidden];
+                rms_into(x, &nx.norm, cfg.eps, &mut pn);
+                let mut pl = vec![0.0f32; cfg.n_experts];
+                nx.router.gemv(&pn, &mut pl)?;
+                prof::pred_score(&topk_ids(&pl, k), &picked);
             }
-            picked.push(best);
         }
         let mut weights: Vec<f32> = picked.iter().map(|&e| scores[e]).collect();
         let sum: f32 = weights.iter().sum();
@@ -852,7 +1126,11 @@ impl FlintModel {
                 }
                 Mlp::Moe(l) => {
                     let tm = prof::t();
-                    self.moe_ffn(l, &mut x, trace.as_deref_mut())?;
+                    let next = self.layers[i + 1..].iter().find_map(|n| match &n.mlp {
+                        Mlp::Moe(m) => Some(m),
+                        Mlp::Dense(_) => None,
+                    });
+                    self.moe_ffn(l, next, &mut x, trace.as_deref_mut())?;
                     prof::acc(prof::MOE, tm);
                 }
             }
@@ -907,6 +1185,114 @@ impl FlintModel {
             let _ = self.forward_traced(t, i, &mut st, Some(&mut trace))?;
         }
         Ok(trace)
+    }
+
+    /// Route every token of `prompt` and `n_new` generated ones, accumulating a
+    /// per-(layer, expert) count and the overlap between consecutive tokens.
+    ///
+    /// This is the measurement the expert tier stands or falls on: a hot set is
+    /// only worth pinning if the routing is skewed (a few experts take most of
+    /// the reads) and if it is *stable* across tokens (yesterday's hot expert is
+    /// tomorrow's). Both are reported by [`RouteProfile::summary`].
+    pub fn profile_routes(
+        &self,
+        prompt: &[u32],
+        n_new: usize,
+        max_ctx: usize,
+    ) -> Result<RouteProfile> {
+        let mut st = self.new_state(max_ctx);
+        let cfg = &self.cfg;
+        let moe_layers: Vec<usize> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l.mlp, Mlp::Moe(_)))
+            .map(|(i, _)| i)
+            .collect();
+        let mut prof = RouteProfile::new(cfg.n_layers, cfg.n_experts);
+        if let Some(&li) = moe_layers.first() {
+            if let Mlp::Moe(m) = &self.layers[li].mlp {
+                // `byte_len` is one expert's payload (the stacked tensor's
+                // `n` is a single expert's row count), so this is gate + up +
+                // down for one expert, which is the granularity a hot set has.
+                prof.expert_bytes = (m.gate_exps.byte_len()
+                    + m.up_exps.byte_len()
+                    + m.down_exps.byte_len()) as u64;
+            }
+        }
+        prof.moe_layers = moe_layers.len();
+        prof.k = cfg.n_experts_used;
+        let mut prev: Vec<Vec<usize>> = vec![Vec::new(); cfg.n_layers];
+        let mut trace = Vec::new();
+        let mut logits = Vec::new();
+        let mut traces: Vec<Vec<usize>> = Vec::new();
+
+        for (i, &t) in prompt.iter().enumerate() {
+            trace.clear();
+            logits = self.forward_traced(t, i, &mut st, Some(&mut trace))?;
+            prof.absorb(&trace, &moe_layers, &mut prev, cfg.n_experts_used);
+            traces.push(trace.clone());
+        }
+        for k in 0..n_new {
+            let tok = Self::argmax(&logits);
+            trace.clear();
+            logits = self.forward_traced(tok, prompt.len() + k, &mut st, Some(&mut trace))?;
+            prof.absorb(&trace, &moe_layers, &mut prev, cfg.n_experts_used);
+            traces.push(trace.clone());
+        }
+        if std::env::var("KORE_ROUTE_SPLIT").ok().as_deref() == Some("1") && traces.len() >= 8 {
+            // A hot set built from the first half of *this* document, scored on
+            // the second half. This is the only version of pinning that could
+            // still pay: no cross-prompt transfer, just the document's own
+            // topic holding still.
+            let half = traces.len() / 2;
+            let build = |ts: &[Vec<usize>]| {
+                let mut out = vec![0u32; cfg.n_layers * cfg.n_experts];
+                for t in ts {
+                    for (j, &layer) in moe_layers.iter().enumerate() {
+                        for &e in &t[j * cfg.n_experts_used..(j + 1) * cfg.n_experts_used] {
+                            out[layer * cfg.n_experts + e] += 1;
+                        }
+                    }
+                }
+                out
+            };
+            let (a, b) = traces.split_at(half);
+            let train = build(a);
+            let test = build(b);
+            let tsum: u64 = test.iter().map(|&c| c as u64).sum();
+            let mut idx: Vec<u32> = (0..train.len() as u32).collect();
+            idx.sort_unstable_by_key(|&i| std::cmp::Reverse(train[i as usize]));
+            eprintln!(
+                "\nwithin-document hot set: first {} tokens -> next {} tokens",
+                a.len(),
+                b.len()
+            );
+            if test.iter().all(|&c| c == 0) || tsum == 0 {
+                eprintln!("  (second half has no routes)");
+            } else {
+                let mut cum = 0u64;
+                for (rank, &i) in idx.iter().enumerate() {
+                    cum += test[i as usize] as u64;
+                    let n = rank + 1;
+                    let report = [64usize, 256, 1024, 2048, 4211, 6316, 8422]
+                        .iter()
+                        .any(|&r| r == n);
+                    if report {
+                        eprintln!(
+                            "  top {:5} pairs ({:4.1}% of bank, {:4.1} GiB)  {:5.1}% of second-half reads  (random {:4.1}%)",
+                            n,
+                            100.0 * n as f64 / idx.len() as f64,
+                            n as f64 * prof.expert_bytes as f64 / (1u64 << 30) as f64,
+                            100.0 * cum as f64 / tsum as f64,
+                            100.0 * n as f64 / idx.len() as f64
+                        );
+                    }
+                }
+            }
+        }
+        prof::pred_dump();
+        Ok(prof)
     }
 
     /// Phase totals accumulated since `profile_reset` (needs `KORE_PROFILE=1`).

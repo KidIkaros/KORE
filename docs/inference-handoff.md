@@ -970,10 +970,9 @@ because one pass touches all 47 layers' banks.
 
 This is the same failure the Maya engine designs around (`docs/SETTINGS.md`:
 pinned arena instead of `MapViewOfFile`, per-layer `PrefetchVirtualMemory`, a
-routing profile deciding what is hot). The next host-path work is the same
-three pieces: an anonymous pinned arena for the hot expert set, per-layer
-prefetch of the routed blobs, and a route profile that decides the hot set
-instead of hoping the page cache keeps it.
+routing profile deciding what is hot). Section 14.6 measures which of those
+three pieces actually survives contact with Flint's router -- the answer is
+"one of them, and not in the form the design assumes".
 
 **Correctness evidence.** There is no external oracle: llama.cpp master has no
 `flint` arch (neither `src/models/flint.cpp` nor `LLM_ARCH_FLINT` in
@@ -1008,3 +1007,75 @@ only cross-PCIe traffic is the 6 experts of each routed layer, ~350 MB/step
 first device path in the 20-30 ms/step range, i.e. 30-50 tok/s, versus 130 ms on
 the host. The 24 GB file itself cannot be resident in 16 GB, which is the same
 constraint the qwen 35B already lives under.
+
+### 14.6 Routing has no static hot set and no forward predictor -- but it is stable within a document
+
+Before building an expert tier on top of "pin the hot experts", the routing was
+measured rather than assumed. `KORE_ROUTE_PROFILE=<file>` profiles a run
+(`RouteProfile`: 47 x 256 counts, 48 KiB), `KORE_ROUTE_TEST=<file>` applies a
+saved profile to a different prompt, `KORE_ROUTE_SPLIT=1` builds a hot set from
+the first half of a document and scores it on the second half, and
+`KORE_PREDICT=1` scores the predictor a prefetch would have to use.
+
+**Runs are greedy, n=200-400, one process, page cache warm.** Random baselines
+are `pinned / 12544` pairs.
+
+| mechanism | 8 GiB pinned (33.6 % of bank) | 12 GiB (50.4 %) | verdict |
+| --- | ---: | ---: | --- |
+| static profile, same prompt (fit on itself) | 90.0 % | 97.9 % | meaningless |
+| static profile, other prompt | 39.9-42.6 % | 56.3-59.4 % | dead (+6 pts over random) |
+| dynamic, first half of the doc -> second half | 58.1-71.0 % | 74.2-82.6 % | **alive (1.7-2.1x random)** |
+| -- | -- | -- | -- |
+| consecutive-token set overlap | 0.83-1.00 of 6 | random 0.14 | dead |
+| next layer's router on this layer's input | 0.15 of 6 | random 0.14 | dead |
+
+Three things follow, and they are the reason the expert tier is being designed
+around recency instead of around a saved profile:
+
+1. **A profile does not transfer between prompts.** Fitted on the same routes it
+   is scored on, 8 GiB looks like 90 %; applied to another prompt of the same
+   size it is 40 %, against a 33.6 % random baseline. The apparent skew is real
+   but prompt-specific.
+2. **Every cheap forward predictor is at chance.** Consecutive tokens share
+   0.83 of 6 experts (0.14 is chance), and predicting layer L+1 from layer L's
+   input -- the mechanism Maya's `PREFETCH_N` uses -- is 0.15 of 6. Flint's
+   router is a bias-free sigmoid top-6 on a residual stream that attention and
+   the MoE both write to, so the choice decorrelates immediately. Nothing can
+   prefetch an expert before the router that picks it has run.
+3. **The set is stable at document scale, which is what a cache needs.** A hot
+   set learned from the first half of a document serves 58-71 % of the second
+   half at 8 GiB, and it decays as the document drifts (71 % at 111+111 tokens,
+   58 % at 211+211). Recency-weighted retention, not a baked profile.
+
+So the 1.2-1.4 tok/s cold cliff is not fixable by pinning: with 24.5 GB of
+experts against 23 GB of page cache there is no set to pin that stays hot. It
+*is* fixable by not needing the bytes, which is the device path: the non-expert
+stack is 1.1 GB resident, and the ~13 GB left on a 16 GB card holds ~6400 of
+the 12032 expert slots. At the 58-71 % hit rate measured above, misses are
+150-210 MB/token instead of 500 MB.
+
+The 6 experts of a layer are all known before the first one is computed, so the
+device path also does not need a predictor at all: issue all six uploads when
+the router returns, then compute them in order as they land. That is the
+overlap the registry's partial-offload recipes are built on.
+
+**External anchors** (Sybil AI local-ai-registry, `dist/catalog.json`, 369
+recipes; "offload" = model larger than VRAM):
+
+| card | model | engine | decode |
+| --- | --- | --- | ---: |
+| RX 9070 XT 16 GB | qwen3.8-27B | ExLlamaV3 EXL3 3.0 bpw + dflash | 115.6 tok/s |
+| RX 9070 XT 16 GB | qwen3.8-27B | llama.cpp IQ3_S + MTP (Vulkan) | 54.0 |
+| RX 7900 XT 20 GB | qwen3.8-27B | llama.cpp Vulkan IQ3_S + MTP | 54.9 |
+| RX 7900 XT 20 GB | qwen3.8-27B | llama.cpp ROCm, same weights | 42.7 |
+| RX 7600 XT 16 GB | qwen3.8-27B | llama.cpp Q2_K_XL + MTP | 17.8 |
+| RTX 4080 16 GB | qwen3.8-flash-next (MoE) | sglang EXL3, offload | 60.5 |
+| RTX 3090 24 GB | glm-5.3-flash | exllamav3 3.05 bpw, offload to RAM | 28.6 |
+| RTX 3090 24 GB | glm-5.3-flash | same, offload 55 % to NVMe | 20.0 |
+| RTX 3090 24 GB | glm-5.3-flash | same, offload 16 % to NVMe | 14.7 |
+
+Two readings. Vulkan beats ROCm by 29 % on the one card where both were run
+with identical weights, which is the reason the device path is Vulkan. And
+offloading to NVMe costs 30-50 % where this host path loses 82 % -- so the gap
+is overlap, not the SSD: their engines keep the compute fed while the read is
+in flight, and this one does not. That is the part of the design worth copying.
