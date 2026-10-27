@@ -83,7 +83,11 @@ mod prof {
     static PRED: OnceLock<bool> = OnceLock::new();
 
     pub fn predict_on() -> bool {
-        *PRED.get_or_init(|| std::env::var("KORE_PREDICT").map(|v| v != "0").unwrap_or(false))
+        *PRED.get_or_init(|| {
+            std::env::var("KORE_PREDICT")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+        })
     }
 
     pub fn pred_score(pred: &[usize], actual: &[usize]) {
@@ -108,7 +112,12 @@ mod prof {
         let hist: Vec<String> = PRED_HIST
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("{i}:{:.0}%", 100.0 * c.load(Ordering::Relaxed) as f64 / n as f64))
+            .map(|(i, c)| {
+                format!(
+                    "{i}:{:.0}%",
+                    100.0 * c.load(Ordering::Relaxed) as f64 / n as f64
+                )
+            })
             .collect();
         eprintln!(
             "next-layer route prediction (router of L+1 on L's input): mean {mean:.2} of 6 over {n} layers  [{}]",
@@ -128,13 +137,21 @@ mod prof {
     ];
 
     pub fn on() -> bool {
-        *ON.get_or_init(|| std::env::var("KORE_PROFILE").map(|v| v != "0").unwrap_or(false))
+        *ON.get_or_init(|| {
+            std::env::var("KORE_PROFILE")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+        })
     }
 
     pub struct T(pub Instant);
 
     pub fn t() -> Option<T> {
-        if on() { Some(T(Instant::now())) } else { None }
+        if on() {
+            Some(T(Instant::now()))
+        } else {
+            None
+        }
     }
 
     pub fn acc(slot: usize, t: Option<T>) {
@@ -289,8 +306,11 @@ fn load_qw(gg: &Arc<MiniGguf>, name: &str) -> Result<QW> {
         gg: gg.clone(),
         name: name.to_string(),
     });
-    let shared = SharedBytes::from_owner(owner.clone(), 0, total)
-        .ok_or_else(|| err(format!("flint: tensor '{name}': {total} bytes out of range")))?;
+    let shared = SharedBytes::from_owner(owner.clone(), 0, total).ok_or_else(|| {
+        err(format!(
+            "flint: tensor '{name}': {total} bytes out of range"
+        ))
+    })?;
     Ok(QW {
         name: name.to_string(),
         m,
@@ -514,7 +534,6 @@ fn gemv_experts(
         .try_for_each(|(o, &e)| gemv_par(&t.expert(e, stride), x, o))
 }
 
-
 // ---------- route profile ----------
 
 /// Per-(layer, expert) routing counts over a real workload.
@@ -707,7 +726,10 @@ impl RouteProfile {
                 .filter(|(_, &c)| c > 0)
                 .map(|(i, &c)| format!("{i}:{:.0}%", 100.0 * c as f64 / pairs as f64))
                 .collect();
-            eprintln!("\nconsecutive-token set overlap: mean {mean:.2} of 6  [{}]", h.join(" "));
+            eprintln!(
+                "\nconsecutive-token set overlap: mean {mean:.2} of 6  [{}]",
+                h.join(" ")
+            );
         }
     }
 }
@@ -884,13 +906,7 @@ impl FlintModel {
         }
     }
 
-    fn attn_step(
-        &self,
-        l: &AttnW,
-        x: &mut [f32],
-        pos: usize,
-        kv: &mut FlintKv,
-    ) -> Result<()> {
+    fn attn_step(&self, l: &AttnW, x: &mut [f32], pos: usize, kv: &mut FlintKv) -> Result<()> {
         let cfg = &self.cfg;
         let hd = cfg.head_dim;
         let kn = cfg.n_kv * hd;
@@ -1215,9 +1231,8 @@ impl FlintModel {
                 // `byte_len` is one expert's payload (the stacked tensor's
                 // `n` is a single expert's row count), so this is gate + up +
                 // down for one expert, which is the granularity a hot set has.
-                prof.expert_bytes = (m.gate_exps.byte_len()
-                    + m.up_exps.byte_len()
-                    + m.down_exps.byte_len()) as u64;
+                prof.expert_bytes =
+                    (m.gate_exps.byte_len() + m.up_exps.byte_len() + m.down_exps.byte_len()) as u64;
             }
         }
         prof.moe_layers = moe_layers.len();
@@ -1303,12 +1318,34 @@ impl FlintModel {
     /// Per-tensor matvec timing, for separating kernel throughput from per-call
     /// cost. `KORE_BENCH=1` calls this once; it is diagnostics only.
     pub fn bench(&self, reps: usize) {
-        let x: Vec<f32> = (0..self.cfg.hidden).map(|i| (i % 17) as f32 * 0.01 + 0.3).collect();
+        let x: Vec<f32> = (0..self.cfg.hidden)
+            .map(|i| (i % 17) as f32 * 0.01 + 0.3)
+            .collect();
         let cases: Vec<(&str, &QW, usize, usize)> = vec![
-            ("attn_q blk0", &self.layers[0].attn.wq, self.layers[0].attn.wq.n, self.layers[0].attn.wq.m),
-            ("attn_k blk0", &self.layers[0].attn.wk, self.layers[0].attn.wk.n, self.layers[0].attn.wk.m),
-            ("attn_v blk0", &self.layers[0].attn.wv, self.layers[0].attn.wv.n, self.layers[0].attn.wv.m),
-            ("attn_o blk0", &self.layers[0].attn.wo, self.layers[0].attn.wo.n, self.layers[0].attn.wo.m),
+            (
+                "attn_q blk0",
+                &self.layers[0].attn.wq,
+                self.layers[0].attn.wq.n,
+                self.layers[0].attn.wq.m,
+            ),
+            (
+                "attn_k blk0",
+                &self.layers[0].attn.wk,
+                self.layers[0].attn.wk.n,
+                self.layers[0].attn.wk.m,
+            ),
+            (
+                "attn_v blk0",
+                &self.layers[0].attn.wv,
+                self.layers[0].attn.wv.n,
+                self.layers[0].attn.wv.m,
+            ),
+            (
+                "attn_o blk0",
+                &self.layers[0].attn.wo,
+                self.layers[0].attn.wo.n,
+                self.layers[0].attn.wo.m,
+            ),
             ("head", &self.head, self.head.n, self.head.m),
         ];
         for (name, w, n, _m) in cases {

@@ -388,6 +388,31 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    /// Fused GQA decode attention with a learned sink and a window offset.
+    ///
+    /// `k`/`v` are the whole cache; the `window` keys starting at `kv_start`
+    /// are the ones attended. `sinks[head]` is added to the softmax denominator
+    /// as an extra term with no value vector of its own.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_attention_decode_gqa_sink(
+        &self,
+        _q: &crate::Tensor,
+        _k: &crate::Tensor,
+        _v: &crate::Tensor,
+        _sinks: &crate::Tensor,
+        _num_heads: usize,
+        _num_kv_heads: usize,
+        _head_dim: usize,
+        _scale: f32,
+        _kv_start: usize,
+        _window: usize,
+    ) -> crate::Result<crate::Tensor> {
+        Err(crate::KoreError::StorageError(format!(
+            "fused_attention_decode_gqa_sink not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     /// Fused GQA decode attention (quantized; K/V are INT8 + per-token scales).
     ///
     /// `seq_k` is the number of leading keys of `k_q8` this call may attend to.
@@ -1199,6 +1224,32 @@ pub trait DeviceBackend: Send + Sync {
     // marshals exactly these, and bundling them in a struct would only move
     // the same fields to a call site.
     #[allow(clippy::too_many_arguments)]
+    /// Per-head RMS normalisation plus optional split-half RoPE, for a plain
+    /// `[n_heads * head_dim]` / `[n_kv * head_dim]` layout.
+    ///
+    /// `rope == false` leaves the head unrotated (NoPE layers). Distinct from
+    /// [`Self::qknorm_rope`], which is qwen's q|gate layout at head_dim 256.
+    #[allow(clippy::too_many_arguments)]
+    fn flint_qknorm_rope(
+        &self,
+        _q: &crate::Tensor,
+        _k: &crate::Tensor,
+        _q_norm: &crate::Tensor,
+        _k_norm: &crate::Tensor,
+        _n_heads: usize,
+        _n_kv: usize,
+        _head_dim: usize,
+        _rope: bool,
+        _pos: usize,
+        _theta: f32,
+        _eps: f32,
+    ) -> crate::Result<(crate::Tensor, crate::Tensor)> {
+        Err(crate::KoreError::StorageError(format!(
+            "flint_qknorm_rope not implemented for backend '{}'",
+            self.device_name()
+        )))
+    }
+
     fn qknorm_rope(
         &self,
         _qg: &crate::Tensor,

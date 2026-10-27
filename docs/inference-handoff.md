@@ -1079,3 +1079,84 @@ with identical weights, which is the reason the device path is Vulkan. And
 offloading to NVMe costs 30-50 % where this host path loses 82 % -- so the gap
 is overlap, not the SSD: their engines keep the compute fed while the read is
 in flight, and this one does not. That is the part of the design worth copying.
+
+### 14.7 Host->device ceiling, and the architecture that follows from it
+
+The device path is now committed, so the upload link was measured before any
+kernel work, because the estimate it feeds (~15-25 ms of a 25-45 ms step) is
+the whole design.
+
+`crates/kore-cli/examples/upload_bw.rs` writes into **pre-allocated** slots, the
+way an expert cache is laid out, and varies the copy size and the submit
+pattern. `group` submits and waits once per six copies (one layer), `pipeline`
+submits per group and waits once at the end, `burst` rewrites a single buffer.
+
+| mode | copy | groups | GiB/s |
+| --- | ---: | ---: | ---: |
+| group | 1 MiB | 6 | 7.43 |
+| group | 2 MiB | 6 | 7.78 |
+| group | 4 MiB | 6 | 8.42 |
+| group | 8 MiB | 6 | 8.11 |
+| group | 16 MiB | 6 | 8.57 |
+| pipeline | 8 MiB | 6 | 8.36 |
+| burst | 2 MiB | 6 | 4.04 |
+| -- | -- | -- | -- |
+| host memcpy reference | 2 MiB | -- | 21.9 |
+
+Three readings:
+
+1. **It is flat from 1 to 16 MiB**, so this is not per-copy overhead and not
+   `write_buffer` chunking: it is a hard ceiling of ~8.5-9.4 GiB/s.
+2. **Waiting per group costs 13 %** (8.13 vs 9.37 at 2 MiB). So a layer's six
+   uploads can be issued together and computed in order as they land without
+   paying a round trip each.
+3. **Never rewrite a buffer that a copy is still reading.** `burst`, which
+   hammers one 2 MiB buffer, is 2x slower than the same bytes into distinct
+   slots -- that is write-after-write serialisation, and it is why the cache
+   must own a pool of slots rather than one scratch buffer.
+
+The ceiling is not the link. `lspci` shows the card's own port (`03:00.0`) and
+the switch downstream port at **32.0 GT/s x16**, but the switch *upstream* port
+(`01:00.0`) negotiated **16.0 GT/s x16** -- 31.5 GB/s of raw bandwidth, or ~28
+GB/s of payload. The card sits behind a PCIe switch board, and the switch to
+host link is running a generation below its own capability. Even so, 9.4 GiB/s
+is 32 % of what Gen4 x16 carries, and the same ~9-10 GB/s shows up when the GPU
+*reads* host-resident weights (the rejected gate+up fusion), so this is the
+amdgpu/wgpu copy path, not the wire. Recorded as a diagnostic, not a plan: the
+only known lever is writing straight into host-visible slots, which the same
+fusion experiment shows the GPU then reads at ~10 GB/s.
+
+**Architecture, from 14.6 and this table.** Keep all 49 layers on the device and
+make the *expert bank* the cached tier:
+
+| VRAM for experts | slots of 12032 | hit rate (14.6, within doc) | miss bytes/step | upload ms @8.1 GiB/s |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 GiB | 1024 | 35.7 % | 320 MB | 40 |
+| 8 GiB | 4211 | 71.0 % | 145 MB | 18 |
+| 12 GiB | 6316 | 82.6 % | 87 MB | 11 |
+
+The alternative -- split the layers, host runs the ones that do not fit -- was
+priced and rejected: a host layer costs 2.6 ms (0.95 attention + 1.65 routed)
+against ~0.2 ms for a device layer, so the ~21 layers that would not fit cost
+57 ms on their own, for ~15 tok/s. Expert-level residency keeps the cheap engine
+on everything and only pays for the misses, and 14.6 says those misses are
+predictable by recency, which is what an LRU already does.
+
+Port status: two kernels are in with CPU-oracle tests (both green):
+
+- `shaders/flash_decode_gqa_sink.wgsl` -- decode GQA over an f32 KV cache, with
+  `kv_start`/`window` uniforms for the sliding window and a learned sink seeded
+  into the online softmax (`m = sink, l = 1` reproduces
+  `exp(sink-m) / (exp(sink-m) + sum exp(s_j-m))` exactly). Tested across a
+  window offset and sinks both below and above the score range, max|delta|
+  2e-5 at 32 heads / 4 KV heads / head_dim 128.
+- `shaders/flint_qknorm_rope.wgsl` -- per-head RMS with its own weight, then
+  split-half RoPE, and a `rope = 0` path for the 14 NoPE layers. qwen's
+  `qknorm_rope` could not be reused: it is fixed at head_dim 256 and carries a
+  q|gate pair this model does not have. Tested at pos 0 and 7, with and without
+  rotation, max|delta| 1e-5.
+
+Still to build: f32 KV append with the ring window, the routed expert path over
+`DeviceBank` (reusing qwen35's host-routed lane, which already measures one 8 KB
+readback per layer), and the model wiring with the embedding row and the Q6_K
+head kept on the device.

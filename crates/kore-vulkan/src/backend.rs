@@ -86,6 +86,36 @@ fn skip_op(label: &'static str) -> bool {
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FlintQkNormRopeUniforms {
+    n_heads: u32,
+    n_kv: u32,
+    head_dim: u32,
+    pos: u32,
+    rope: u32,
+    _pad: u32,
+    theta: f32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct FlashDecodeGqaSinkUniforms {
+    seq_q: u32,
+    seq_k: u32,
+    head_dim: u32,
+    scale: f32,
+    num_heads: u32,
+    num_kv_heads: u32,
+    kv_dim: u32,
+    q_dim: u32,
+    kv_start: u32,
+    has_sink: u32,
+    _pad0: u32,
+    _pad1: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GemmUniforms {
     m: u32,
     n: u32,
@@ -703,6 +733,8 @@ pub struct VulkanBackend {
     hadamard_pipeline: Arc<wgpu::ComputePipeline>,
     flash_decode_pipeline: Arc<wgpu::ComputePipeline>,
     flash_decode_gqa_pipeline: Arc<wgpu::ComputePipeline>,
+    flash_decode_gqa_sink_pipeline: Arc<wgpu::ComputePipeline>,
+    flint_qknorm_rope_pipeline: Arc<wgpu::ComputePipeline>,
     rope_pipeline: Arc<wgpu::ComputePipeline>,
     argmax_pipeline: Arc<wgpu::ComputePipeline>,
     moe_topk_pipeline: Arc<wgpu::ComputePipeline>,
@@ -926,6 +958,23 @@ impl VulkanBackend {
                 label: Some("kore_flash_decode_gqa_pipeline"),
                 layout: None,
                 module: &flash_decode_gqa_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+        let flash_decode_gqa_sink_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("kore_flash_decode_gqa_sink_shader"),
+                source: wgpu::ShaderSource::Wgsl(
+                    include_str!("shaders/flash_decode_gqa_sink.wgsl").into(),
+                ),
+            });
+        let flash_decode_gqa_sink_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_flash_decode_gqa_sink_pipeline"),
+                layout: None,
+                module: &flash_decode_gqa_sink_shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
@@ -1377,6 +1426,21 @@ impl VulkanBackend {
             },
         ));
 
+        let flint_qknr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kore_flint_qknorm_rope_shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/flint_qknorm_rope.wgsl").into()),
+        });
+        let flint_qknorm_rope_pipeline = Arc::new(device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label: Some("kore_flint_qknorm_rope_pipeline"),
+                layout: None,
+                module: &flint_qknr_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            },
+        ));
+
         let qknr_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kore_qknorm_rope_shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/qknorm_rope.wgsl").into()),
@@ -1421,6 +1485,7 @@ impl VulkanBackend {
             hadamard_pipeline,
             flash_decode_pipeline,
             flash_decode_gqa_pipeline,
+            flash_decode_gqa_sink_pipeline,
             flash_decode_gqa_q8_pipeline,
             flash_decode_gqa_q8_split_pipeline,
             flash_decode_gqa_q8_combine_pipeline,
@@ -1444,6 +1509,7 @@ impl VulkanBackend {
             gdn_gates_pipeline,
             gdn_step_pipeline,
             qknorm_rope_pipeline,
+            flint_qknorm_rope_pipeline,
             batch,
             q6k_pad_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         };
@@ -2794,6 +2860,120 @@ impl VulkanBackend {
         Ok(self.make_tensor(out_kore_buf, &[seq_q, q_dim]))
     }
 
+    /// Fused GQA decode attention with a learned sink and a window offset.
+    ///
+    /// `k`/`v` are the whole cache (`[cap, kv_dim]`); the kernel reads the
+    /// `window` keys starting at `kv_start`, so a sliding window costs nothing
+    /// but a different uniform. `sinks[head]` joins the softmax denominator as
+    /// its own term and contributes no V -- see
+    /// `shaders/flash_decode_gqa_sink.wgsl` for why seeding the online softmax
+    /// with it is exact.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_attention_decode_gqa_sink(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        sinks: &Tensor,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        kv_start: usize,
+        window: usize,
+    ) -> Result<Tensor> {
+        let q_shape = q.shape().dims();
+        let k_shape = k.shape().dims();
+        let v_shape = v.shape().dims();
+        if q_shape.len() != 2 || k_shape.len() != 2 || v_shape.len() != 2 {
+            return Err(VulkanError::UnsupportedOperation(
+                "fused_attention_decode_gqa_sink requires 2D Q, K, V tensors".into(),
+            ));
+        }
+        let seq_q = q_shape[0];
+        let q_dim = q_shape[1];
+        let kv_dim = k_shape[1];
+
+        if q_dim != num_heads * head_dim || kv_dim != num_kv_heads * head_dim {
+            return Err(VulkanError::ShapeMismatch {
+                op: "fused_attention_decode_gqa_sink".into(),
+                lhs: q_shape.to_vec(),
+                rhs: k_shape.to_vec(),
+            });
+        }
+        if num_heads % num_kv_heads != 0 {
+            return Err(VulkanError::UnsupportedOperation(
+                "fused_attention_decode_gqa_sink needs num_heads % num_kv_heads == 0".into(),
+            ));
+        }
+        if sinks.numel() != num_heads {
+            return Err(VulkanError::ShapeMismatch {
+                op: "fused_attention_decode_gqa_sink sinks".into(),
+                lhs: sinks.shape().dims().to_vec(),
+                rhs: vec![num_heads],
+            });
+        }
+        if window == 0 || kv_start + window > k_shape[0] || kv_start + window > v_shape[0] {
+            return Err(VulkanError::UnsupportedOperation(format!(
+                "fused_attention_decode_gqa_sink window {kv_start}..{} outside cache of {}",
+                kv_start + window,
+                k_shape[0]
+            )));
+        }
+
+        let q_buf =
+            KoreVulkanBuffer::from_storage(q.storage_ref(), q_shape, &self.device, &self.queue)?;
+        let k_buf =
+            KoreVulkanBuffer::from_storage(k.storage_ref(), k_shape, &self.device, &self.queue)?;
+        let v_buf =
+            KoreVulkanBuffer::from_storage(v.storage_ref(), v_shape, &self.device, &self.queue)?;
+        let s_buf = KoreVulkanBuffer::from_storage(
+            sinks.storage_ref(),
+            sinks.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+
+        let out_bytes = (seq_q * q_dim * std::mem::size_of::<f32>()).max(4);
+        let out_buffer = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            out_bytes,
+            "kore_flash_decode_gqa_sink_out",
+        );
+
+        let uniforms = FlashDecodeGqaSinkUniforms {
+            seq_q: seq_q as u32,
+            seq_k: window as u32,
+            head_dim: head_dim as u32,
+            scale,
+            num_heads: num_heads as u32,
+            num_kv_heads: num_kv_heads as u32,
+            kv_dim: kv_dim as u32,
+            q_dim: q_dim as u32,
+            kv_start: kv_start as u32,
+            has_sink: 1,
+            _pad0: 0,
+            _pad1: 0,
+        };
+
+        self.record_dispatch(
+            &self.flash_decode_gqa_sink_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[
+                q_buf.arc_buffer(),
+                k_buf.arc_buffer(),
+                v_buf.arc_buffer(),
+                &out_buffer,
+                s_buf.arc_buffer(),
+            ],
+            (num_heads as u32, seq_q as u32, 1),
+            "flash_decode_gqa_sink_compute_pass",
+        );
+
+        let out_kore_buf = KoreVulkanBuffer::new(out_buffer, DType::F32, vec![seq_q, q_dim]);
+        Ok(self.make_tensor(out_kore_buf, &[seq_q, q_dim]))
+    }
+
     /// Fused GQA decode attention (quantized; K/V are INT8 + per-token scales).
     ///
     /// Reads K/V as 8-bit storage arrays and dequantizes per-thread with the
@@ -3222,8 +3402,12 @@ impl VulkanBackend {
                 rhs: vec![n * k],
             });
         }
-        let x_buf =
-            KoreVulkanBuffer::from_storage(x.storage_ref(), x.shape().dims(), &self.device, &self.queue)?;
+        let x_buf = KoreVulkanBuffer::from_storage(
+            x.storage_ref(),
+            x.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
         let w_buf = KoreVulkanBuffer::from_storage(
             w_raw.storage_ref(),
             w_raw.shape().dims(),
@@ -3349,7 +3533,8 @@ impl VulkanBackend {
             &self.queue,
         )?;
         let out_bytes = (cols * k * std::mem::size_of::<f32>()).max(4);
-        let idx_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_moe_topk_idx");
+        let idx_buf =
+            crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_moe_topk_idx");
         let w_buf = crate::buffer::alloc_storage_buffer(&self.device, out_bytes, "kore_moe_topk_w");
         let gate_buf = crate::buffer::alloc_storage_buffer(
             &self.device,
@@ -3467,7 +3652,11 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.moe_gather_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[bank_buf.arc_buffer(), idx_buf.arc_buffer(), dst_buf.arc_buffer()],
+            &[
+                bank_buf.arc_buffer(),
+                idx_buf.arc_buffer(),
+                dst_buf.arc_buffer(),
+            ],
             ((k * groups) as u32, 1, 1),
             "moe_gather_pass",
         );
@@ -3487,13 +3676,7 @@ impl VulkanBackend {
     /// This is the routed `down` reduction plus the shared expert's output --
     /// they are adjacent on the decode chain, and `bias` is independent of the
     /// routed rows, so the add folds in without a second launch.
-    pub fn sum_rows_add(
-        &self,
-        x: &Tensor,
-        rows: usize,
-        n: usize,
-        bias: &Tensor,
-    ) -> Result<Tensor> {
+    pub fn sum_rows_add(&self, x: &Tensor, rows: usize, n: usize, bias: &Tensor) -> Result<Tensor> {
         self.sum_rows_impl(x, rows, n, Some(bias), 1)
     }
 
@@ -3548,8 +3731,12 @@ impl VulkanBackend {
                 });
             }
         }
-        let x_buf =
-            KoreVulkanBuffer::from_storage(x.storage_ref(), x.shape().dims(), &self.device, &self.queue)?;
+        let x_buf = KoreVulkanBuffer::from_storage(
+            x.storage_ref(),
+            x.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
         // Binding 3 is never read when `has_bias` is 0, so `x` stands in as a
         // valid read-only buffer for the plain reduction.
         let bias_buf = match bias {
@@ -3581,11 +3768,7 @@ impl VulkanBackend {
         self.record_dispatch(
             &self.sum_rows_pipeline,
             bytemuck::bytes_of(&uniforms),
-            &[
-                x_buf.arc_buffer(),
-                &y_buffer,
-                bias_buf.arc_buffer(),
-            ],
+            &[x_buf.arc_buffer(), &y_buffer, bias_buf.arc_buffer()],
             (workgroups, groups as u32, 1),
             "sum_rows_pass",
         );
@@ -3959,7 +4142,11 @@ impl VulkanBackend {
         // number of routing positions that share one row -- `n_used` for a
         // verify batch, 1 for a single token.
         let rows = experts.div_ceil(pos_div);
-        let x_need = if x_stride == 0 { k } else { rows * x_stride * 4 };
+        let x_need = if x_stride == 0 {
+            k
+        } else {
+            rows * x_stride * 4
+        };
         if x.numel() < x_need {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q2_k_id x".into(),
@@ -4077,7 +4264,11 @@ impl VulkanBackend {
         }
         // Position `p` reads activation row `p / pos_div` (see `gemv_q2_k_id`).
         let rows = experts.div_ceil(pos_div);
-        let x_need = if x_stride == 0 { k } else { rows * x_stride * 4 };
+        let x_need = if x_stride == 0 {
+            k
+        } else {
+            rows * x_stride * 4
+        };
         if x.numel() < x_need {
             return Err(VulkanError::ShapeMismatch {
                 op: "gemv_q3_k_id x".into(),
@@ -4995,8 +5186,24 @@ impl VulkanBackend {
         eps: f32,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let shape = a.shape().dims();
-        let cols = if shape.len() == 2 { shape[1] } else { a.numel() };
-        self.had_pre_at(mode, had, a, b, a.numel(), cols, cols, 0, weight, signs, eps)
+        let cols = if shape.len() == 2 {
+            shape[1]
+        } else {
+            a.numel()
+        };
+        self.had_pre_at(
+            mode,
+            had,
+            a,
+            b,
+            a.numel(),
+            cols,
+            cols,
+            0,
+            weight,
+            signs,
+            eps,
+        )
     }
 
     /// `had_pre` over `a_len` logical elements of `a` laid out as `[rows, cols]`
@@ -5462,6 +5669,107 @@ impl VulkanBackend {
     // The argument list is the kernel's binding table; it mirrors the
     // `DeviceBackend` method of the same name.
     #[allow(clippy::too_many_arguments)]
+    /// Per-head RMS normalisation plus optional split-half RoPE, for the plain
+    /// `[n_heads * head_dim]` / `[n_kv * head_dim]` layout Flint uses.
+    ///
+    /// `rope == false` is the NoPE case (14 of Flint's 49 layers): the heads are
+    /// normalised and nothing rotates. The host reference is
+    /// `flint.rs::rms_inplace` + `rope_inplace`, and this kernel exists because
+    /// `qknorm_rope` is specialised to qwen's q|gate pair at head_dim 256.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flint_qknorm_rope(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_norm: &Tensor,
+        k_norm: &Tensor,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        rope: bool,
+        pos: usize,
+        theta: f32,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor)> {
+        let q_dims = q.shape().dims();
+        let k_dims = k.shape().dims();
+        if q_dims.len() != 1 || k_dims.len() != 1 {
+            return Err(VulkanError::UnsupportedOperation(
+                "flint_qknorm_rope requires 1D Q and K".into(),
+            ));
+        }
+        if q_dims[0] != n_heads * head_dim || k_dims[0] != n_kv * head_dim {
+            return Err(VulkanError::ShapeMismatch {
+                op: "flint_qknorm_rope".into(),
+                lhs: q_dims.to_vec(),
+                rhs: k_dims.to_vec(),
+            });
+        }
+        if head_dim == 0 || head_dim > 256 || !head_dim.is_multiple_of(2) {
+            return Err(VulkanError::UnsupportedOperation(format!(
+                "flint_qknorm_rope needs an even head_dim <= 256, got {head_dim}"
+            )));
+        }
+        let q_buf =
+            KoreVulkanBuffer::from_storage(q.storage_ref(), q_dims, &self.device, &self.queue)?;
+        let k_buf =
+            KoreVulkanBuffer::from_storage(k.storage_ref(), k_dims, &self.device, &self.queue)?;
+        let qn_buf = KoreVulkanBuffer::from_storage(
+            q_norm.storage_ref(),
+            q_norm.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let kn_buf = KoreVulkanBuffer::from_storage(
+            k_norm.storage_ref(),
+            k_norm.shape().dims(),
+            &self.device,
+            &self.queue,
+        )?;
+        let q_out = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (q_dims[0] * 4).max(4),
+            "kore_flint_qknr_q",
+        );
+        let k_out = crate::buffer::alloc_storage_buffer(
+            &self.device,
+            (k_dims[0] * 4).max(4),
+            "kore_flint_qknr_k",
+        );
+
+        let uniforms = FlintQkNormRopeUniforms {
+            n_heads: n_heads as u32,
+            n_kv: n_kv as u32,
+            head_dim: head_dim as u32,
+            pos: pos as u32,
+            rope: u32::from(rope),
+            _pad: 0,
+            theta,
+            eps,
+        };
+        self.record_dispatch(
+            &self.flint_qknorm_rope_pipeline,
+            bytemuck::bytes_of(&uniforms),
+            &[
+                q_buf.arc_buffer(),
+                k_buf.arc_buffer(),
+                qn_buf.arc_buffer(),
+                kn_buf.arc_buffer(),
+                &q_out,
+                &k_out,
+            ],
+            ((n_heads + n_kv) as u32, 1, 1),
+            "flint_qknorm_rope_compute_pass",
+        );
+
+        let qo = KoreVulkanBuffer::new(q_out, DType::F32, vec![q_dims[0]]);
+        let ko = KoreVulkanBuffer::new(k_out, DType::F32, vec![k_dims[0]]);
+        Ok((
+            self.make_tensor(qo, &[q_dims[0]]),
+            self.make_tensor(ko, &[k_dims[0]]),
+        ))
+    }
+
     pub fn qknorm_rope(
         &self,
         qg: &Tensor,
@@ -5789,6 +6097,54 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
+    fn flint_qknorm_rope(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        q_norm: &Tensor,
+        k_norm: &Tensor,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        rope: bool,
+        pos: usize,
+        theta: f32,
+        eps: f32,
+    ) -> kore_core::Result<(Tensor, Tensor)> {
+        self.flint_qknorm_rope(
+            q, k, q_norm, k_norm, n_heads, n_kv, head_dim, rope, pos, theta, eps,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
+    fn fused_attention_decode_gqa_sink(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        sinks: &Tensor,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        kv_start: usize,
+        window: usize,
+    ) -> kore_core::Result<Tensor> {
+        self.fused_attention_decode_gqa_sink(
+            q,
+            k,
+            v,
+            sinks,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale,
+            kv_start,
+            window,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+    }
+
     fn fused_attention_decode_gqa(
         &self,
         q: &Tensor,
@@ -5835,12 +6191,7 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
-    fn router_matvec(
-        &self,
-        x: &Tensor,
-        w: &Tensor,
-        n: usize,
-    ) -> kore_core::Result<Tensor> {
+    fn router_matvec(&self, x: &Tensor, w: &Tensor, n: usize) -> kore_core::Result<Tensor> {
         self.router_matvec(x, w, n)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
@@ -5856,11 +6207,7 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
-    fn moe_topk(
-        &self,
-        logits: &Tensor,
-        k: usize,
-    ) -> kore_core::Result<(Tensor, Tensor)> {
+    fn moe_topk(&self, logits: &Tensor, k: usize) -> kore_core::Result<(Tensor, Tensor)> {
         self.moe_topk(logits, k)
             .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
@@ -6258,8 +6605,10 @@ impl kore_core::device::DeviceBackend for VulkanBackend {
         signs: &Tensor,
         eps: f32,
     ) -> kore_core::Result<(Tensor, Tensor, Tensor)> {
-        self.had_pre_at(mode, had, a, b, a_len, cols, a_stride, b_off, weight, signs, eps)
-            .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
+        self.had_pre_at(
+            mode, had, a, b, a_len, cols, a_stride, b_off, weight, signs, eps,
+        )
+        .map_err(|e| kore_core::KoreError::StorageError(e.to_string()))
     }
 
     fn gdn_conv(

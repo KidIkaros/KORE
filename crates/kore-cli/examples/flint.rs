@@ -50,12 +50,19 @@ fn main() {
         model.cfg.n_experts_used,
         model.cfg.n_experts,
         model.cfg.sliding_window,
-        (0..model.cfg.n_layers).filter(|&i| !model.cfg.rope.get(i).copied().unwrap_or(true)).count(),
-        (0..model.cfg.n_layers).filter(|&i| model.cfg.sliding.get(i).copied().unwrap_or(false)).count(),
+        (0..model.cfg.n_layers)
+            .filter(|&i| !model.cfg.rope.get(i).copied().unwrap_or(true))
+            .count(),
+        (0..model.cfg.n_layers)
+            .filter(|&i| model.cfg.sliding.get(i).copied().unwrap_or(false))
+            .count(),
     );
 
     if std::env::var("KORE_BENCH").ok().as_deref() == Some("1") {
-        let reps: usize = std::env::var("KORE_BENCH_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+        let reps: usize = std::env::var("KORE_BENCH_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
         model.bench(reps);
         return;
     }
@@ -82,7 +89,9 @@ fn main() {
 
     if let Ok(path) = std::env::var("KORE_ROUTE_PROFILE") {
         let ctx = ids.len() + n_new + 8;
-        let prof = model.profile_routes(&ids, n_new, ctx).expect("profile routes");
+        let prof = model
+            .profile_routes(&ids, n_new, ctx)
+            .expect("profile routes");
         prof.summary();
         if !path.is_empty() {
             prof.save(Path::new(&path)).expect("save profile");
@@ -95,7 +104,9 @@ fn main() {
         // other prompt), and coverage is measured on this prompt's routes.
         let ctx = ids.len() + n_new + 8;
         let train = kore_nn::flint::RouteProfile::load(Path::new(&path)).expect("load profile");
-        let test = model.profile_routes(&ids, n_new, ctx).expect("profile routes");
+        let test = model
+            .profile_routes(&ids, n_new, ctx)
+            .expect("profile routes");
         eprintln!(
             "=== held-out hot set: {path} ({} tokens) applied to this prompt ({} tokens) ===",
             train.tokens, test.tokens
@@ -142,7 +153,12 @@ fn main() {
         let head: Vec<String> = top
             .iter()
             .take(5)
-            .map(|(i, v)| format!("#{i} {v:.3} '{}'", tok.decode(&[*i], false).unwrap_or_default()))
+            .map(|(i, v)| {
+                format!(
+                    "#{i} {v:.3} '{}'",
+                    tok.decode(&[*i], false).unwrap_or_default()
+                )
+            })
             .collect();
         eprintln!("top-5: {}", head.join(" | "));
     }
@@ -162,7 +178,9 @@ fn main() {
     }
     let dec = t_dec.elapsed().as_secs_f64();
 
-    let text = tok.decode(&out, true).unwrap_or_else(|_| format!("{out:?}"));
+    let text = tok
+        .decode(&out, true)
+        .unwrap_or_else(|_| format!("{out:?}"));
     println!("{text}");
     // One token came out of the prompt's last forward, so the steady-state rate
     // is (emitted - 1) over the decode window.

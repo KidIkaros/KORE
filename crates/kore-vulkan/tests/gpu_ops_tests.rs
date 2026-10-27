@@ -1795,7 +1795,11 @@ fn test_vulkan_sum_rows_add_matches_add() {
     let plain_again = to_cpu(&backend.sum_rows(&x, rows, n).unwrap());
     assert_eq!(plain, plain_again, "sum_rows is not deterministic");
 
-    let want = to_cpu(&backend.add(&backend.sum_rows(&x, rows, n).unwrap(), &bias).unwrap());
+    let want = to_cpu(
+        &backend
+            .add(&backend.sum_rows(&x, rows, n).unwrap(), &bias)
+            .unwrap(),
+    );
     let got = to_cpu(&backend.sum_rows_add(&x, rows, n, &bias).unwrap());
     for i in 0..n {
         assert_eq!(
@@ -2561,4 +2565,172 @@ fn test_vulkan_moe_topk_gate_matches_topk_plus_sigmoid() {
 /// two "all zeros because the kernel never ran" results cannot pass silently.
 fn any_nonzero(x: &[f32]) -> bool {
     x.iter().any(|v| v.is_finite() && *v != 0.0)
+}
+
+#[test]
+fn test_vulkan_attn_sink_window_matches_reference() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+
+    // Flint's decode geometry: 32 query heads over 4 KV heads, head_dim 128,
+    // KV cache larger than the window so `kv_start` actually moves.
+    let (nh, nkv, hd) = (32usize, 4usize, 128usize);
+    let cap = 96usize;
+    let (kv_start, win) = (37usize, 41usize);
+    let kv_dim = nkv * hd;
+    let q_dim = nh * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    // Deterministic pseudo-random inputs; a flat or symmetric field would hide
+    // both the window offset and the sink term.
+    let mut seed = 0x2f6e_2b1du32;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+    };
+    let q: Vec<f32> = (0..q_dim).map(|_| rnd()).collect();
+    let k: Vec<f32> = (0..cap * kv_dim).map(|_| rnd()).collect();
+    let v: Vec<f32> = (0..cap * kv_dim).map(|_| rnd()).collect();
+    // Sinks on both sides of the score range: one very negative (attention is
+    // concentrated), one very positive (the sink dominates and the output
+    // collapses toward zero).
+    let sinks: Vec<f32> = (0..nh)
+        .map(|h| match h % 3 {
+            0 => -4.0,
+            1 => 0.0,
+            _ => 6.0,
+        })
+        .collect();
+
+    let qt = Tensor::from_f32(&q, &[1, q_dim])
+        .to(kore_core::Device::Vulkan(0))
+        .unwrap();
+    let kt = Tensor::from_f32(&k, &[cap, kv_dim])
+        .to(kore_core::Device::Vulkan(0))
+        .unwrap();
+    let vt = Tensor::from_f32(&v, &[cap, kv_dim])
+        .to(kore_core::Device::Vulkan(0))
+        .unwrap();
+    let st = Tensor::from_f32(&sinks, &[nh])
+        .to(kore_core::Device::Vulkan(0))
+        .unwrap();
+
+    let out = backend
+        .fused_attention_decode_gqa_sink(&qt, &kt, &vt, &st, nh, nkv, hd, scale, kv_start, win)
+        .expect("sink attention");
+    let got = out.to(kore_core::Device::Cpu).unwrap();
+    let got = got.as_f32_slice().unwrap();
+
+    let reps = nh / nkv;
+    let mut max_err = 0.0f32;
+    for h in 0..nh {
+        let kvh = h / reps;
+        let qh = &q[h * hd..(h + 1) * hd];
+        let mut scores = vec![0.0f32; win];
+        for j in 0..win {
+            let kb = &k[(kv_start + j) * kv_dim + kvh * hd..][..hd];
+            scores[j] = qh.iter().zip(kb).map(|(a, b)| a * b).sum::<f32>() * scale;
+        }
+        let sink = sinks[h];
+        let m = scores.iter().copied().fold(sink, f32::max);
+        let mut den = (sink - m).exp();
+        for s in scores.iter_mut() {
+            *s = (*s - m).exp();
+            den += *s;
+        }
+        for d in 0..hd {
+            let mut acc = 0.0f32;
+            for j in 0..win {
+                acc += scores[j] * v[(kv_start + j) * kv_dim + kvh * hd + d];
+            }
+            let want = acc / den;
+            max_err = max_err.max((want - got[h * hd + d]).abs());
+        }
+    }
+    assert!(
+        max_err < 2e-5,
+        "sink+window attention differs from the CPU reference by {max_err}"
+    );
+}
+
+#[test]
+fn test_vulkan_flint_qknorm_rope_matches_reference() {
+    let backend = match VulkanBackend::new() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let (nh, nkv, hd) = (32usize, 4usize, 128usize);
+    let eps = 1e-6f32;
+    let theta = 10000.0f32;
+
+    let mut seed = 0x9e37_79b9u32;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((seed >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+    };
+    let q: Vec<f32> = (0..nh * hd).map(|_| rnd() * 3.0).collect();
+    let k: Vec<f32> = (0..nkv * hd).map(|_| rnd() * 3.0).collect();
+    let q_norm: Vec<f32> = (0..hd).map(|_| 0.5 + rnd().abs()).collect();
+    let k_norm: Vec<f32> = (0..hd).map(|_| 0.5 + rnd().abs()).collect();
+
+    // Reference, straight from flint.rs: rms_inplace per head, then the
+    // split-half rotation for elements i <-> i + hd/2.
+    let reference = |x: &[f32], w: &[f32], n: usize, rope: bool, pos: usize| -> Vec<f32> {
+        let mut out = Vec::with_capacity(n * hd);
+        for h in 0..n {
+            let src = &x[h * hd..(h + 1) * hd];
+            let ss: f32 = src.iter().map(|v| v * v).sum();
+            let rms = 1.0 / (ss / hd as f32 + eps).sqrt();
+            let mut v: Vec<f32> = src.iter().zip(w).map(|(a, b)| a * rms * b).collect();
+            if rope {
+                let half = hd / 2;
+                for i in 0..half {
+                    let freq = theta.powf(-(2.0 * i as f32) / hd as f32);
+                    let ang = pos as f32 * freq;
+                    let (c, s) = (ang.cos(), ang.sin());
+                    let a = v[i];
+                    let b = v[i + half];
+                    v[i] = a * c - b * s;
+                    v[i + half] = b * c + a * s;
+                }
+            }
+            out.extend_from_slice(&v);
+        }
+        out
+    };
+    for (rope, pos) in [(true, 7usize), (true, 0), (false, 7)] {
+        let qt = Tensor::from_f32(&q, &[nh * hd])
+            .to(kore_core::Device::Vulkan(0))
+            .unwrap();
+        let kt = Tensor::from_f32(&k, &[nkv * hd])
+            .to(kore_core::Device::Vulkan(0))
+            .unwrap();
+        let qn = Tensor::from_f32(&q_norm, &[hd])
+            .to(kore_core::Device::Vulkan(0))
+            .unwrap();
+        let kn = Tensor::from_f32(&k_norm, &[hd])
+            .to(kore_core::Device::Vulkan(0))
+            .unwrap();
+        let (qo, ko) = backend
+            .flint_qknorm_rope(&qt, &kt, &qn, &kn, nh, nkv, hd, rope, pos, theta, eps)
+            .expect("qknorm");
+        let qo = qo.to(kore_core::Device::Cpu).unwrap();
+        let ko = ko.to(kore_core::Device::Cpu).unwrap();
+        let got_q = qo.as_f32_slice().unwrap();
+        let got_k = ko.as_f32_slice().unwrap();
+        let want_q = reference(&q, &q_norm, nh, rope, pos);
+        let want_k = reference(&k, &k_norm, nkv, rope, pos);
+        let err = got_q
+            .iter()
+            .zip(&want_q)
+            .chain(got_k.iter().zip(&want_k))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            err < 1e-5,
+            "qknorm_rope (rope={rope}, pos={pos}) differs from the reference by {err}"
+        );
+    }
 }
