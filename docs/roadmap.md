@@ -9,8 +9,9 @@ is left, in the order it should be done, with a way to tell whether it is done.
 Green and shipped: qwen3.6-35B-A3B and dense 2B on the device lane with
 speculative decoding, a host-path port of Flint with route profiling, the sink +
 window decode-attention kernel and the flat QK-norm/RoPE kernel (both gated
-against CPU oracles), the H2D ceiling measurement, and a fully green workspace
-under `cargo clippy --workspace -- -D warnings`.
+against CPU oracles), the H2D ceiling measurement, and a fully green workspace:
+34 test suites in both the debug and release profiles, and
+`cargo clippy --workspace -- -D warnings` clean.
 
 Not shipped: any end-to-end *device* model for Flint, and any external oracle
 for Flint. That is the whole gap between "kernels exist" and "a second
@@ -76,7 +77,7 @@ GB expert bank on a 16 GB card; the comparison is against its own host lane.
 |---|---|---|
 | No external oracle for Flint | It matches itself across prompts, which cannot catch a systematic error shared by host and device. | Greedy output vs llama.cpp on the same GGUF and tokenizer, or a documented reason the comparison is not possible. |
 | q8 KV codes are not byte-identical across lanes | Vulkan divides to 2.5 ULP, the CPU is correctly rounded, so `.5` ties can differ by one code. The cache stays self-consistent today. | Only if a bit-identity gate needs it: pass a host-computed reciprocal into `quantize_q8_rows` instead of dividing on device. |
-| Release build never run on the new workspace | `release.yml` builds and tests `--workspace --release` on tag, and that has not run since the tree moved to the USB volume. | `CARGO_TARGET_DIR` off the vfat volume, `cargo build --workspace --release` and `cargo test --workspace --release` both clean. |
+| Release build never run on the new workspace | `release.yml` builds and tests `--workspace --release` on tag. | Done in 0.2.1: `cargo build --workspace --release` (1m43s) and `cargo test --workspace --release` (34 suites, 3m44s) both clean with `CARGO_TARGET_DIR` off the vfat volume. Keep that env var in the tag recipe. |
 
 ## P2 — Performance after the device port lands
 

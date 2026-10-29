@@ -98,10 +98,12 @@ In-tree test suites: `crates/kore-vulkan/tests/gpu_ops_tests.rs`,
 (`qwen36_real.rs`) skips itself when the 13 GiB checkpoint is absent — keep that
 pattern for the next arch.
 
-> **This box can no longer run `cargo test --workspace`.** The root filesystem is
-> 99 % full and the debug-profile build hits `No space left on device`. Everything
-> here was built and tested with `--release`. On the new box, run the full suite
-> before trusting anything below.
+> **Build output does not belong on this volume.** The tree lives on a USB 2.0
+> vfat stick (41 MB/s, no permissions, 2 s mtime granularity), so both profiles
+> are built with `CARGO_TARGET_DIR` on the internal NVMe. With that set, the
+> full workspace suite runs green in both profiles as of 0.2.1 --
+> `cargo test --workspace` (34 suites) and `cargo test --workspace --release`
+> (same 34, 3m44s) -- along with `cargo clippy --workspace -- -D warnings`.
 
 ---
 
