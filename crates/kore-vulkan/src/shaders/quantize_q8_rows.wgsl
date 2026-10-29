@@ -13,6 +13,23 @@ struct QuantQ8Uniforms {
 
 var<workgroup> red: array<f32, 256>;
 
+// WGSL `round` resolves `.5` ties however the implementation likes (GLSL says
+// so explicitly, and RADV reads 63.5 as 63 where the CPU recipe reads 64), so
+// the tie is pinned here: half away from zero, which is what `f32::round` and
+// every GGUF quantizer do.
+//
+// The *contract* is still "codes equal a CPU reference except within 1 code of
+// a `.5` tie": this shader forms the reciprocal `127/absmax` on the device,
+// Vulkan only promises 2.5 ULP for that division, and one ULP is enough to move
+// an exactly-representable 63.5 to 63.4999. The returned `S` is the scale both
+// lanes dequantize with, so the cache stays self-consistent.
+fn round_half_away(x: f32) -> f32 {
+    if (x >= 0.0) {
+        return floor(x + 0.5);
+    }
+    return ceil(x - 0.5);
+}
+
 // Per-row symmetric INT8 quantization (offset-binary, scale = absmax/127).
 // One workgroup per row: reduces absmax across the row, then each thread packs
 // 4 consecutive int8 codes into a u32 word. `cols` must be a multiple of 4.
@@ -46,8 +63,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lx: 
     for (var w: u32 = lx.x; w < nwords; w += 256u) {
         var packed: u32 = 0u;
         for (var k: u32 = 0u; k < 4u; k = k + 1u) {
+            // One correctly-rounded multiply. The reciprocal is not
+            // reproducible across lanes (Vulkan promises 2.5 ULP for division),
+            // so a code can differ from a CPU reference by 1 at a `.5` tie --
+            // see the contract note on `round_half_away`.
             let xv = X[base + 4u * w + k] * inv;
-            let q = clamp(round(xv), -127.0, 127.0);
+            let q = clamp(round_half_away(xv), -127.0, 127.0);
             packed = packed | (u32(i32(q) + 128) << (8u * k));
         }
         Q[row * nwords + w] = packed;

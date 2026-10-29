@@ -1368,8 +1368,17 @@ fn test_vulkan_split_attention_matches_single_group() {
     );
 }
 
-/// GPU per-row INT8 quantization must match the exact CPU recipe:
-/// `scale = absmax/127`, `q = clamp(round(x/scale), -127, 127)`, stored `q + 128`.
+/// GPU per-row INT8 quantization matches the CPU recipe
+/// `scale = absmax/127`, `q = clamp(round(x/scale), -127, 127)`, stored `q + 128`
+/// -- scale to within an ULP, codes exactly except at `.5` ties.
+///
+/// The exception is forced by the arithmetic, not sloppiness. The shader forms
+/// `inv = 127/absmax` on the device, Vulkan only promises 2.5 ULP for division
+/// while the CPU is correctly rounded, and one ULP is enough to turn an exactly
+/// representable `63.5` into `63.4999`. So a code may differ by exactly 1, and
+/// only where the CPU's scaled value is a tie. Everything else is byte-equal;
+/// the returned scale is the one both lanes dequantize with, so the cache stays
+/// self-consistent.
 #[test]
 fn test_vulkan_quantize_q8_rows_matches_reference() {
     let backend = match VulkanBackend::new() {
@@ -1395,22 +1404,53 @@ fn test_vulkan_quantize_q8_rows_matches_reference() {
     let qb = q_cpu.storage_ref().as_bytes();
     let sc = s_cpu.as_f32_slice().unwrap();
 
+    let mut ties = 0usize;
     for r in 0..rows {
         let row = &x[r * cols..(r + 1) * cols];
         let absmax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         let scale = if absmax > 0.0 { absmax / 127.0 } else { 1.0 };
+        // The device divides too, so allow the ULP it is permitted to differ by.
+        let ulp = f32::from_bits(scale.to_bits() + 1) - scale;
         assert!(
-            (sc[r] - scale).abs() < 1e-6,
-            "row {r} scale: got {}, want {scale}",
-            sc[r]
+            (sc[r] - scale).abs() <= ulp,
+            "row {r} scale: got {} (bits {:#x}), want {scale} (bits {:#x})",
+            sc[r],
+            sc[r].to_bits(),
+            scale.to_bits()
         );
         let inv = 1.0 / scale;
         for c in 0..cols {
-            let want = ((row[c] * inv).round().clamp(-127.0, 127.0) as i16 + 128) as u8;
+            let scaled = row[c] * inv;
+            let want = ((scaled.round().clamp(-127.0, 127.0) as i16) + 128) as u8;
             let got = qb[r * cols + c];
-            assert_eq!(got, want, "q[{r}, {c}]: got {got}, want {want}");
+            if got == want {
+                continue;
+            }
+            let (gi, wi) = (got as i16, want as i16);
+            assert_eq!(
+                (gi - wi).abs(),
+                1,
+                "q[{r}, {c}]: got {got}, want {want} -- more than one code apart"
+            );
+            // A one-code difference is only allowed at a tie: the scaled value
+            // must sit within ~1.5 ULP of a `.5` boundary.
+            let frac = scaled.abs() - scaled.abs().floor();
+            assert!(
+                (frac - 0.5).abs() < 1e-5,
+                "q[{r}, {c}]: got {got}, want {want} at scaled {scaled} (frac {frac}), \
+                 which is not a tie -- the 1-code allowance is only for ties"
+            );
+            ties += 1;
         }
     }
+    // Guard against the allowance quietly becoming "anything goes": on this
+    // crafted input the ties are a handful, not a percentile.
+    eprintln!("quantize_q8 tie codes: {ties} of {}", rows * cols);
+    assert!(
+        ties * 20 <= rows * cols,
+        "{ties} of {} codes needed the tie allowance",
+        rows * cols
+    );
 }
 
 /// GPU Q2_0 GEMV must match the CPU reference exactly. `bpr=8` (k=512) forces
