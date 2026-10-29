@@ -291,6 +291,17 @@ Implement `kore_serve::InferenceModel` in your model crate to serve it via the b
 
 ---
 
+## Documentation
+
+| Document | What is in it |
+|----------|---------------|
+| [`docs/roadmap.md`](docs/roadmap.md) | What remains, in order, with an exit criterion per item |
+| [`docs/inference-handoff.md`](docs/inference-handoff.md) | The inference campaign: every measurement, and every experiment that was rejected with the number that killed it |
+| [`RELEASE_NOTES_v0.2.1.md`](RELEASE_NOTES_v0.2.1.md) | What changed in the current release, including the regimes where it is *not* faster |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release history |
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, code style, and PR conventions.

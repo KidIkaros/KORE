@@ -640,7 +640,7 @@ path per column as the correctness oracle. Gates:
   21 positions bit-identical to sequential decode, state probe agrees, prefill
   agrees, rewind legs bit-identical.
 - 64-token greedy ids identical between the device and host lanes.
-- GPU suite 32/33 (only the pre-existing `quantize_q8_rows` failure).
+- GPU suite 36/36, workspace suite fully green (0.2.1).
 
 Measured hot, `max_ctx=512`, device routing, `n=400` per arm so prefill is
 amortised the same way a user's run would be. The prompt is the same in both
@@ -848,11 +848,24 @@ DeepInfer mapping and verdicts: `docs/deepinfer-scaled-down.md`.
 
 ### Known failures at this commit
 
-- `kore-vulkan` integration test
-  `test_vulkan_quantize_q8_rows_matches_reference` fails on the committed tree
-  too (`q[0,13]: got 191, want 192`). It is a pre-existing tie-rounding
-  disagreement between the test's expectation and the shader, not a regression
-  from this work.
+None. The long-standing `quantize_q8_rows` failure is closed (0.2.1) and its
+cause is worth recording, because it is a contract question and not a bug fix:
+
+- The scaled value for the failing element was **exactly 63.5**, a tie. WGSL
+  `round` leaves `.5` ties implementation-defined (GLSL says so explicitly), and
+  RADV reads 63.5 as 63. The shader now pins the tie itself
+  (`round_half_away` = floor(x+0.5) / ceil(x-0.5)), so driver behaviour no
+  longer decides it.
+- A tie is still *reachable* on the device and not on the CPU, because the
+  shader forms `inv = 127/absmax` there and Vulkan only promises 2.5 ULP for
+  division while the CPU is correctly rounded: one ULP turns an exact 63.5 into
+  63.4999. So the test now asserts the contract that is actually achievable --
+  scale within 1 ULP, codes byte-equal **except** within 1 code of a `.5` tie --
+  and additionally asserts how many codes needed that allowance (6 of 256 on
+  the fixture) so it cannot quietly widen. The returned scale is the one both
+  lanes dequantize with, so the cache stays self-consistent. If byte-identity
+  is ever needed here, the fix is to pass a host-computed reciprocal into the
+  kernel instead of dividing on device.
 
 ## 14. A second architecture: Flint (40 B-A2.5 B MoE)
 
@@ -1156,7 +1169,9 @@ Port status: two kernels are in with CPU-oracle tests (both green):
   q|gate pair this model does not have. Tested at pos 0 and 7, with and without
   rotation, max|delta| 1e-5.
 
-Still to build: f32 KV append with the ring window, the routed expert path over
-`DeviceBank` (reusing qwen35's host-routed lane, which already measures one 8 KB
-readback per layer), and the model wiring with the embedding row and the Q6_K
-head kept on the device.
+Still to build: the ring write for the f32 KV append (the append itself exists, but
+`kv_cache_append_pair` copies and takes a row offset, so a 513-token window needs
+a ring index or a pre-rotated layout), the routed expert path over `DeviceBank`
+(reusing qwen35's host-routed lane, which already measures one 8 KB readback per
+layer), and the model wiring with the embedding row and the Q6_K head kept on the
+device. Slice order and exit criteria: `docs/roadmap.md`.
