@@ -2901,7 +2901,7 @@ impl VulkanBackend {
                 rhs: k_shape.to_vec(),
             });
         }
-        if num_heads % num_kv_heads != 0 {
+        if !num_heads.is_multiple_of(num_kv_heads) {
             return Err(VulkanError::UnsupportedOperation(
                 "fused_attention_decode_gqa_sink needs num_heads % num_kv_heads == 0".into(),
             ));
@@ -3387,7 +3387,7 @@ impl VulkanBackend {
         n: usize,
         cols: usize,
     ) -> Result<Tensor> {
-        if cols == 0 || n == 0 || x.numel() % cols != 0 {
+        if cols == 0 || n == 0 || !x.numel().is_multiple_of(cols) {
             return Err(VulkanError::ShapeMismatch {
                 op: "router_matvec_cols".into(),
                 lhs: vec![x.numel()],
@@ -3846,6 +3846,7 @@ impl VulkanBackend {
     /// Like [`gemv_q3_k_at`], but writes into `out` starting at `y_off` f32
     /// elements. With `accum`, the kernel adds onto the existing contents
     /// instead of overwriting, so the routed `down` experts can sum in place.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_q3_k_into(
         &self,
         x: &Tensor,
@@ -3999,6 +4000,7 @@ impl VulkanBackend {
     /// Like [`gemv_q2_k_at`], but writes into `out` starting at `y_off` f32
     /// elements. With `accum`, the kernel adds onto the existing contents
     /// instead of overwriting, so the routed `down` experts can sum in place.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_q2_k_into(
         &self,
         x: &Tensor,
@@ -4101,6 +4103,7 @@ impl VulkanBackend {
     /// `expert_words` words into `w`, and activation row `r / rows_per_expert`
     /// of `x` (`[n_experts, k]`). One dispatch replaces one per expert; `m` is
     /// fixed at 1 because the experts themselves are the batch.
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_q2_k_id(
         &self,
         x: &Tensor,
@@ -4227,6 +4230,7 @@ impl VulkanBackend {
 
     /// One expert-strided Q3_K GEMV over a stacked bank. See
     /// [`Self::gemv_q2_k_id`].
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_q3_k_id(
         &self,
         x: &Tensor,
@@ -5312,7 +5316,7 @@ impl VulkanBackend {
                 rhs: vec![need_a, need_b],
             });
         }
-        if cols % 512 != 0 {
+        if !cols.is_multiple_of(512) {
             return Err(VulkanError::ShapeMismatch {
                 op: "had_pre".into(),
                 lhs: vec![cols],
@@ -5770,6 +5774,7 @@ impl VulkanBackend {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn qknorm_rope(
         &self,
         qg: &Tensor,

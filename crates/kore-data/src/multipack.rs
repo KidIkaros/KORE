@@ -217,7 +217,7 @@ mod tests {
 
         let mask = batch.attention_mask();
         // Seq 0: tokens 0,1,2 — causal within
-        assert_eq!(mask[0 * 5 + 0], 1.0); // token 0 attends to 0
+        assert_eq!(mask[0], 1.0); // token 0 attends to 0
         assert_eq!(mask[1 * 5 + 0], 1.0); // token 1 attends to 0
         assert_eq!(mask[1 * 5 + 1], 1.0); // token 1 attends to 1
         assert_eq!(mask[2 * 5 + 0], 1.0); // token 2 attends to 0
@@ -227,8 +227,8 @@ mod tests {
         assert_eq!(mask[4 * 5 + 3], 1.0); // token 4 attends to 3
 
         // Cross-sequence: blocked
-        assert_eq!(mask[3 * 5 + 0], 0.0); // token 3 cannot attend to token 0
-        assert_eq!(mask[0 * 5 + 3], 0.0); // token 0 cannot attend to token 3
+        assert_eq!(mask[15], 0.0); // token 3 cannot attend to token 0
+        assert_eq!(mask[3], 0.0); // token 0 cannot attend to token 3
     }
 
     #[test]

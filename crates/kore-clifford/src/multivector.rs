@@ -209,8 +209,9 @@ mod tests {
     #[test]
     fn test_scalar() {
         let alg = CliffordAlgebra::new(2, 0);
-        let mv = Multivector::scalar(&alg, 3.14);
-        assert!((mv.scalar_part() - 3.14).abs() < 1e-6);
+        // A generic value, not PI: this checks scalar storage, not trig.
+        let mv = Multivector::scalar(&alg, 3.25);
+        assert!((mv.scalar_part() - 3.25).abs() < 1e-6);
     }
 
     #[test]

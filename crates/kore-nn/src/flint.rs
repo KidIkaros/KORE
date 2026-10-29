@@ -356,6 +356,11 @@ struct MoeW {
     down_stride: usize,
 }
 
+// `MoeW` holds seven `QW` views where `DenseW` holds three -- about a kilobyte
+// of pointers and shape metadata apiece. The enum lives in a 49-entry `Vec`, so
+// the slack is a few KB against a 1.1 GB model, while boxing would add an
+// indirection in front of a field read on the hottest path.
+#[allow(clippy::large_enum_variant)]
 enum Mlp {
     Dense(DenseW),
     Moe(MoeW),
@@ -610,7 +615,7 @@ impl RouteProfile {
         buf.extend_from_slice(&(self.n_layers as u32).to_le_bytes());
         buf.extend_from_slice(&(self.n_experts as u32).to_le_bytes());
         buf.extend_from_slice(&(self.k as u32).to_le_bytes());
-        buf.extend_from_slice(&(self.tokens as u64).to_le_bytes());
+        buf.extend_from_slice(&self.tokens.to_le_bytes());
         for &c in &self.counts {
             buf.extend_from_slice(&c.to_le_bytes());
         }
@@ -1290,9 +1295,7 @@ impl FlintModel {
                 for (rank, &i) in idx.iter().enumerate() {
                     cum += test[i as usize] as u64;
                     let n = rank + 1;
-                    let report = [64usize, 256, 1024, 2048, 4211, 6316, 8422]
-                        .iter()
-                        .any(|&r| r == n);
+                    let report = [64usize, 256, 1024, 2048, 4211, 6316, 8422].contains(&n);
                     if report {
                         eprintln!(
                             "  top {:5} pairs ({:4.1}% of bank, {:4.1} GiB)  {:5.1}% of second-half reads  (random {:4.1}%)",

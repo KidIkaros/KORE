@@ -1060,9 +1060,10 @@ mod tests {
         let n_heads = 4;
         let n_kv_heads = 2;
         let heads_per_kv = n_heads / n_kv_heads;
-        assert_eq!(0 / heads_per_kv, 0);
-        assert_eq!(1 / heads_per_kv, 0);
-        assert_eq!(2 / heads_per_kv, 1);
-        assert_eq!(3 / heads_per_kv, 1);
+        let kv_head = |q: usize| q / heads_per_kv;
+        assert_eq!(kv_head(0), 0);
+        assert_eq!(kv_head(1), 0);
+        assert_eq!(kv_head(2), 1);
+        assert_eq!(kv_head(3), 1);
     }
 }

@@ -598,6 +598,7 @@ pub trait DeviceBackend: Send + Sync {
     /// Q2_K matvec that writes into `out` starting at `y_off` f32 elements.
     /// With `accum`, the kernel adds onto the existing contents instead of
     /// overwriting, so several experts can sum into one buffer.
+    #[allow(clippy::too_many_arguments)]
     fn gemv_q2_k_into(
         &self,
         _x: &crate::Tensor,
@@ -618,6 +619,7 @@ pub trait DeviceBackend: Send + Sync {
     /// Q3_K matvec that writes into `out` starting at `y_off` f32 elements.
     /// With `accum`, the kernel adds onto the existing contents instead of
     /// overwriting, so several experts can sum into one buffer.
+    #[allow(clippy::too_many_arguments)]
     fn gemv_q3_k_into(
         &self,
         _x: &crate::Tensor,
@@ -643,6 +645,7 @@ pub trait DeviceBackend: Send + Sync {
     /// row starts at `position * x_stride` vec4 units in `x` (`x_stride == 0`
     /// means every position shares one row). `pos_div` routing positions share
     /// that row: `n_used` for a verify batch, 1 for a single token.
+    #[allow(clippy::too_many_arguments)]
     fn gemv_q2_k_id(
         &self,
         _x: &crate::Tensor,
@@ -664,6 +667,7 @@ pub trait DeviceBackend: Send + Sync {
 
     /// One expert-strided Q3_K matvec over a stacked bank. See
     /// [`Self::gemv_q2_k_id`].
+    #[allow(clippy::too_many_arguments)]
     fn gemv_q3_k_id(
         &self,
         _x: &crate::Tensor,
@@ -878,6 +882,7 @@ pub trait DeviceBackend: Send + Sync {
 
     /// `had_pre` over the first `a_len` elements of `a`, with the `b` operand
     /// offset `b_off` elements into its buffer.
+    #[allow(clippy::too_many_arguments)]
     fn had_pre_at(
         &self,
         _mode: u32,
@@ -903,6 +908,7 @@ pub trait DeviceBackend: Send + Sync {
     /// `scale[r]` multiplies row `r` of the SwiGLU output, which is what
     /// `mul_rows` would do immediately afterwards. Backends without a fused
     /// kernel compose the two, so results stay identical either way.
+    #[allow(clippy::too_many_arguments)]
     fn swiglu_rows(
         &self,
         a: &crate::Tensor,
@@ -1250,6 +1256,7 @@ pub trait DeviceBackend: Send + Sync {
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn qknorm_rope(
         &self,
         _qg: &crate::Tensor,

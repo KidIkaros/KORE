@@ -1929,7 +1929,11 @@ struct GpuW {
 enum GpuFfn {
     /// Gate and up share one packed matrix: rows `0..gate_n` are gate, the
     /// rest are up, so the pair costs a single GEMV.
-    Dense { gate_up: GpuW, gate_n: usize, down: GpuW },
+    Dense {
+        gate_up: GpuW,
+        gate_n: usize,
+        down: GpuW,
+    },
     Moe(GpuMoe),
 }
 
@@ -2827,6 +2831,7 @@ impl Qwen35Gpu {
     /// `x` is `[n_experts, k]`, one activation row per expert; output row `r`
     /// reads expert `r / rows_per_expert`. `expert_words` is the per-expert
     /// size of the bank in u32 words.
+    #[allow(clippy::too_many_arguments)]
     fn wgemv_id(
         &self,
         kind: QKind,
@@ -2909,7 +2914,11 @@ impl Qwen35Gpu {
             self.cfg.eps,
         )?;
         let down = match w {
-            GpuFfn::Dense { gate_up, gate_n, down } => {
+            GpuFfn::Dense {
+                gate_up,
+                gate_n,
+                down,
+            } => {
                 let n_total = gate_up.n;
                 let signs_ffn = self.signs_or_placeholder(ffn)?;
                 if std::env::var_os("KORE_DENSE_SPLIT_GATE_UP").is_some()
@@ -3151,7 +3160,9 @@ impl Qwen35Gpu {
                 let uv = self.wgemv(&up, ht)?;
                 // `down` is linear, so scaling the activation is the same arithmetic
                 // as scaling its 2048-wide output, for a quarter of the dispatch.
-                let act = b.had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?.2;
+                let act = b
+                    .had_pre(2, self.folded, &gv, &uv, signs, signs, cfg.eps)?
+                    .2;
                 let act = b.mul_scalar(&act, weight)?;
                 let dv = self.wgemv(&down, &act)?;
                 acc = Some(match acc {
@@ -3170,7 +3181,9 @@ impl Qwen35Gpu {
         let sgate = self.wgemv(&m.shexp_gate, ht)?;
         let sup = self.wgemv(&m.shexp_up, ht)?;
         let signs = self.signs_or_placeholder(cfg.shexp_ffn)?;
-        let sact = b.had_pre(2, self.folded, &sgate, &sup, signs, signs, cfg.eps)?.2;
+        let sact = b
+            .had_pre(2, self.folded, &sgate, &sup, signs, signs, cfg.eps)?
+            .2;
         let sact = b.mul_scalar(&sact, gs)?;
         let sd = self.wgemv(&m.shexp_down, &sact)?;
         compute_us += t_c.elapsed().as_micros() as u64;
@@ -3221,7 +3234,14 @@ impl Qwen35Gpu {
         let (idx, weights, gs) = if cols == 1 {
             b.moe_topk_gate(&logits, r.n_routed, n_used, r.n_routed)?
         } else {
-            b.moe_topk_gate_cols(&logits, r.n_routed, n_used, r.n_routed, cols, r.n_routed + 1)?
+            b.moe_topk_gate_cols(
+                &logits,
+                r.n_routed,
+                n_used,
+                r.n_routed,
+                cols,
+                r.n_routed + 1,
+            )?
         };
 
         if std::env::var_os("KORE_MOE_DEBUG_ROUTE").is_some() {
@@ -3235,14 +3255,8 @@ impl Qwen35Gpu {
                 eprintln!("host picks:  {picks:?}");
                 let idx_cpu = idx.to(Device::Cpu).expect("debug idx");
                 let w_cpu = weights.to(Device::Cpu).expect("debug weights");
-                eprintln!(
-                    "device idx:  {:?}",
-                    idx_cpu.as_f32_slice().unwrap_or(&[])
-                );
-                eprintln!(
-                    "device w:    {:?}",
-                    w_cpu.as_f32_slice().unwrap_or(&[])
-                );
+                eprintln!("device idx:  {:?}", idx_cpu.as_f32_slice().unwrap_or(&[]));
+                eprintln!("device w:    {:?}", w_cpu.as_f32_slice().unwrap_or(&[]));
             });
         }
 
@@ -3573,11 +3587,7 @@ impl Qwen35Gpu {
         let t_argmax = Instant::now();
         let layers_us = t_embed.elapsed().as_micros() as f64 - embed_us;
         let toks = b.argmax_last_dim(&logits)?;
-        step_profile_note([
-            embed_us,
-            layers_us,
-            t_argmax.elapsed().as_micros() as f64,
-        ]);
+        step_profile_note([embed_us, layers_us, t_argmax.elapsed().as_micros() as f64]);
         Ok(toks[0])
     }
 
